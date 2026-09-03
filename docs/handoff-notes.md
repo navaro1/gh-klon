@@ -49,7 +49,7 @@ Handoff §11 has the two tables. The facts that shape the first chunks:
 ## Spikes that need another host
 
 - S1 (btrfs loop volume) needs `btrfs-progs`: `sudo apt install btrfs-progs` on this laptop, or any btrfs host.
-- S2 (jetsam) needs a Mac.
+- S2 (jetsam) needs a Mac. It sits in the last milestone with the other macOS work.
 - S3 (Claude Code `EnterWorktree`) needs the C28 plugin first.
 
 ## Local artefacts, not committed
@@ -74,10 +74,11 @@ The blockers, for the record:
 
 | Milestone | Issues |
 |---|---|
-| v1.0 local worktree replacement | #3 C0, #4 C1, #5 C2, #6 C3, #7 C4, #8 C5, #9 C6, #10 C7, #11 C8, #12 C9, #13 C10, #14 C11, #15 C12, #16 C13, #17 C14, #18 S1, #19 C15 |
-| v1.1 envelope | #20 C16, #21 C17, #22 C18, #23 C19, #24 C20, #25 S2, #26 C21, #27 C22, #28 C23 |
+| v1.0 local worktree replacement | #3 C0, #4 C1, #5 C2, #6 C3, #7 C4, #8 C5, #10 C7, #11 C8, #12 C9, #13 C10, #14 C11, #15 C12, #16 C13, #17 C14, #18 S1, #19 C15 |
+| v1.1 envelope | #20 C16, #21 C17, #22 C18, #24 C20, #27 C22, #28 C23 |
 | v1.2 integration certainty | #29 C24, #30 C25, #31 C26, #32 C27, #33 C28, #34 S3, #35 C29, #36 C30 |
 | v1.3 performance goals | #37 C31, #38 G1, #39 G2, #40 G3, #41 G4 |
 | release | #42 C32 |
+| v1.4 macOS improvements (last, needs a Mac) | #9 C6, #23 C19, #25 S2, #26 C21 |
 
-Each issue body lists its dependencies as issue links. Start with #3.
+Each issue body lists its dependencies as issue links. Start with #3. The macOS items were moved to the end on 2026-09-03 by request; until they land, klon on macOS uses the `copy` backend and a degraded envelope.

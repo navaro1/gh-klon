@@ -17,7 +17,7 @@ Terms:
 
 ## 1. Objective & Non-Goals
 
-**Objective.** Build `gh klon`, a `git worktree` replacement that spawns a warm, fenced, mergeable copy of a project for each coding agent, on Linux and macOS, with zero `sudo` on the default path. The first milestone runs on the development laptop through `gh extension install .`.
+**Objective.** Build `gh klon`, a `git worktree` replacement that spawns a warm, fenced, mergeable copy of a project for each coding agent, on Linux first and macOS last, with zero `sudo` on the default path. The first milestone runs on the development laptop through `gh extension install .`. The macOS backend and envelope are the last milestone.
 
 **What NOT to build (non-goals):**
 1. **A daemon.** Background work is a detached child process that one command starts (handoff §1).
@@ -217,7 +217,7 @@ All design questions have a decision or a spike. See handoff §12. The spikes ar
 
 ## 7. Chunks and Acceptance Criteria
 
-Delivery policy: each chunk is one GitHub issue and one pull request. Each chunk includes its own acceptance tests. The milestones are v1.0, v1.1, v1.2, v1.3, and release. A size estimate follows each title. Split a chunk when it goes above 400 lines.
+Delivery policy: each chunk is one GitHub issue and one pull request. Each chunk includes its own acceptance tests. The milestones are v1.0, v1.1, v1.2, v1.3, release, and v1.4 macOS improvements. A size estimate follows each title. Split a chunk when it goes above 400 lines.
 
 ### C0 — First end-to-end path: `add` with the copy backend (~380 lines)
 **Status:** `[ ]` pending
@@ -311,17 +311,6 @@ Add `README.md` with the local install line: `cargo build --release && ln -sf ta
 - No file in the klon shares an inode with a file in golden (`stat` comparison over the manifest).
 - The reflink walk of the 100k fixture on the xfs loop takes under 10 s.
 **Depends on:** C1, C4 · **Traces to:** R4, R5, R35
-
-### C6 — `apfs-clone` backend (~200 lines)
-**Status:** `[ ]` pending
-**Build:** `src/backend/apfs.rs`: for each top-level ignored directory, one `clonefile(2)` call, in parallel; tracked files and other entries through `reflink-copy` per file; never a `clonefile` on the repository root. Probe on macOS only. Add the macOS backend tests to the `macos-14` CI job.
-**AC:**
-- On `macos-14`, `doctor --json` reports `backend: "apfs-clone"`.
-- `add` on the 10k fixture produces an ignored manifest equal to golden's, including mtimes.
-- A test that intercepts the `clonefile` call list shows no call with the repository root as the source.
-- No file in the klon shares an inode with a file in golden.
-- `add` on the 100k fixture completes in under 15 s on `macos-14`.
-**Depends on:** C5 · **Traces to:** R5, R34
 
 ### C7 — `btrfs-snapshot` backend and `init` (~250 lines)
 **Status:** `[ ]` pending
@@ -491,16 +480,6 @@ Implement `gh klon sync <branch> [--merge|--onto <base>|--fresh|--all|--check]` 
 - A unit test that builds the ruleset with a forced ABI of 2 asserts that `TRUNCATE` is absent and `WRITE_FILE` is present.
 **Depends on:** C16 · **Traces to:** R17
 
-### C19 — macOS write fence with Seatbelt (~200 lines)
-**Status:** `[ ]` pending
-**Build:** `src/envelope/fence_macos.rs`: generate a profile `(version 1) (deny default) (allow file-read*) (allow file-write* (subpath "<klon>") (subpath "<TMPDIR>") ...) (allow network*) (allow process-exec*) (allow process-fork) (allow sysctl-read) (allow mach-lookup) (allow signal)` with the same allow set as C18 (the git subdirectories, never the `<common>` root), plus `/tmp` and `/private/tmp`; run `sandbox-exec -f <profile> <cmd>`. `--no-fence`. `doctor` reports `sandbox-exec` presence.
-**AC:**
-- On `macos-14` under `run`, `touch <golden>/x` fails with `EPERM`; `touch <klon>/x` succeeds; `git -C <klon> commit --allow-empty -m x` exits 0.
-- Under `run`, `cargo build` of the Rust fixture exits 0 and `curl https://example.com` exits 0.
-- `run --no-fence` allows the write to golden.
-- The deprecation warning from `sandbox-exec` is filtered from stderr.
-**Depends on:** C16 · **Traces to:** R17
-
 ### C20 — Linux resource scope (~200 lines)
 **Status:** `[ ]` pending
 **Build:** `src/envelope/scope_linux.rs`: `run` wraps the command in `systemd-run --user --scope -p MemoryHigh=<total/(N+1)> -p TasksMax=<n> [-p CPUWeight=<w> when systemd ≥ 252]`, where N is the count of live klons from `slots.json`; a cgroupfs fallback creates `<user cgroup>/klon-<name>` and writes `memory.high`; a `nice -n 10` fallback when neither exists; `stop` uses `cgroup.kill` when present. `doctor` reports the delegated controllers.
@@ -510,25 +489,6 @@ Implement `gh klon sync <branch> [--merge|--onto <base>|--fresh|--all|--check]` 
 - `stop` on a scope ends every process, including one that called `setsid`.
 - On a host without `systemd-run` (test by `PATH` manipulation), `run` prints one line about the fallback and the command still runs.
 **Depends on:** C16 · **Traces to:** R18
-
-### S2 — Spike: macOS jetsam limit from user space (report only)
-**Status:** `[ ]` pending
-**Build:** On a Mac: a small program that spawns a child with `posix_spawnattr_setjetsam_ext` and a memory limit, then allocates past it; record whether the child is killed, what signal, and whether an entitlement is needed. Write `docs/spikes/2026-macos-jetsam.md`.
-**AC:**
-- The report states, with output, whether the limit kills the child on macOS 14 or 15 and which API call was used.
-- The report gives a decision for Q3: use jetsam, or the footprint poll only.
-**Depends on:** — · **Traces to:** R18
-
-### C21 — macOS QoS clamp, process group, and footprint poll (~200 lines)
-**Status:** `[ ]` pending
-**Build:** `src/envelope/scope_macos.rs`: spawn through `posix_spawn` with `POSIX_SPAWN_SETSID` and `posix_spawnattr_set_qos_clamp_np(UTILITY)`; a poll thread reads `proc_pid_rusage` footprint of the group every 2 s and sends SIGTERM above `total/(N+1)`; apply the S2 decision for jetsam. `stop` uses `proc_listpgrppids` and `killpg`. `gh klon lo0` prints the `ifconfig lo0 alias` command for every allocated slot and the LaunchDaemon one-liner.
-**AC:**
-- On `macos-14` under `run`, `sysctl`-visible QoS of the child is `utility` (read through `taskpolicy` or `proc_pidinfo`).
-- A child that allocates past the threshold receives SIGTERM within 5 s.
-- `curl` under `run` is not throttled (a 10 MB download under `run` takes at most 1.5x the time outside `run`).
-- `stop` ends the whole group.
-- `gh klon lo0` prints one `sudo ifconfig lo0 alias 127.0.0.N up` line per allocated slot and exits 0 without a prompt.
-**Depends on:** C16 · **Traces to:** R18, R21, R22
 
 ### C22 — Per-tree hooks and `[warm] steps` in `up` (~150 lines)
 **Status:** `[ ]` pending
@@ -691,11 +651,53 @@ Implement `gh klon sync <branch> [--merge|--onto <base>|--fresh|--all|--check]` 
 **Build:** `.github/workflows/release.yml` with `cli/gh-extension-precompile@v2` and a `build_script_override` that runs `cargo build --release` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`; assets named `gh-klon_v<ver>_<os>-<arch>`; `LICENSE-MIT` and `LICENSE-APACHE`; README install, quick start, `doctor` output, and the known limitations from the handoff, including the `core.checkStat=minimal` blind spot (an edit that keeps size and mtime is invisible to `git status`).
 **AC:**
 - A tag `v0.1.0` produces four assets with the documented names.
-- `gh extension install navaro1/gh-klon` on a clean `ubuntu-22.04` and `macos-14` runner installs and `gh klon doctor` exits 0.
+- `gh extension install navaro1/gh-klon` on a clean `ubuntu-22.04` and `macos-14` runner installs and `gh klon doctor` exits 0 (on macOS it reports `backend: copy` until v1.4).
 - A tag `v0.1.0-rc1` produces a prerelease.
-**Depends on:** C2, C4, C6, C7 · **Traces to:** R37
+**Depends on:** C2, C4, C7 · **Traces to:** R37
 
 ---
+
+The four items below need a Mac to develop and test. They form the last milestone, v1.4 macOS improvements, by request on 2026-09-03. Until they land, klon on macOS uses the `copy` backend and runs without a fence and a scope; `doctor` reports each absent part. Their identifiers keep their original numbers because the issues already use them.
+
+### C6 — `apfs-clone` backend (~200 lines)
+**Status:** `[ ]` pending
+**Build:** `src/backend/apfs.rs`: for each top-level ignored directory, one `clonefile(2)` call, in parallel; tracked files and other entries through `reflink-copy` per file; never a `clonefile` on the repository root. Probe on macOS only. Add the macOS backend tests to the `macos-14` CI job.
+**AC:**
+- On `macos-14`, `doctor --json` reports `backend: "apfs-clone"`.
+- `add` on the 10k fixture produces an ignored manifest equal to golden's, including mtimes.
+- A test that intercepts the `clonefile` call list shows no call with the repository root as the source.
+- No file in the klon shares an inode with a file in golden.
+- `add` on the 100k fixture completes in under 15 s on `macos-14`.
+**Depends on:** C5 · **Traces to:** R5, R34
+
+### C19 — macOS write fence with Seatbelt (~200 lines)
+**Status:** `[ ]` pending
+**Build:** `src/envelope/fence_macos.rs`: generate a profile `(version 1) (deny default) (allow file-read*) (allow file-write* (subpath "<klon>") (subpath "<TMPDIR>") ...) (allow network*) (allow process-exec*) (allow process-fork) (allow sysctl-read) (allow mach-lookup) (allow signal)` with the same allow set as C18 (the git subdirectories, never the `<common>` root), plus `/tmp` and `/private/tmp`; run `sandbox-exec -f <profile> <cmd>`. `--no-fence`. `doctor` reports `sandbox-exec` presence.
+**AC:**
+- On `macos-14` under `run`, `touch <golden>/x` fails with `EPERM`; `touch <klon>/x` succeeds; `git -C <klon> commit --allow-empty -m x` exits 0.
+- Under `run`, `cargo build` of the Rust fixture exits 0 and `curl https://example.com` exits 0.
+- `run --no-fence` allows the write to golden.
+- The deprecation warning from `sandbox-exec` is filtered from stderr.
+**Depends on:** C16 · **Traces to:** R17
+
+### S2 — Spike: macOS jetsam limit from user space (report only)
+**Status:** `[ ]` pending
+**Build:** On a Mac: a small program that spawns a child with `posix_spawnattr_setjetsam_ext` and a memory limit, then allocates past it; record whether the child is killed, what signal, and whether an entitlement is needed. Write `docs/spikes/2026-macos-jetsam.md`.
+**AC:**
+- The report states, with output, whether the limit kills the child on macOS 14 or 15 and which API call was used.
+- The report gives a decision for Q3: use jetsam, or the footprint poll only.
+**Depends on:** — · **Traces to:** R18
+
+### C21 — macOS QoS clamp, process group, and footprint poll (~200 lines)
+**Status:** `[ ]` pending
+**Build:** `src/envelope/scope_macos.rs`: spawn through `posix_spawn` with `POSIX_SPAWN_SETSID` and `posix_spawnattr_set_qos_clamp_np(UTILITY)`; a poll thread reads `proc_pid_rusage` footprint of the group every 2 s and sends SIGTERM above `total/(N+1)`; apply the S2 decision for jetsam. `stop` uses `proc_listpgrppids` and `killpg`. `gh klon lo0` prints the `ifconfig lo0 alias` command for every allocated slot and the LaunchDaemon one-liner.
+**AC:**
+- On `macos-14` under `run`, `sysctl`-visible QoS of the child is `utility` (read through `taskpolicy` or `proc_pidinfo`).
+- A child that allocates past the threshold receives SIGTERM within 5 s.
+- `curl` under `run` is not throttled (a 10 MB download under `run` takes at most 1.5x the time outside `run`).
+- `stop` ends the whole group.
+- `gh klon lo0` prints one `sudo ifconfig lo0 alias 127.0.0.N up` line per allocated slot and exits 0 without a prompt.
+**Depends on:** C16 · **Traces to:** R18, R21, R22
 
 ## Definition of Done
 

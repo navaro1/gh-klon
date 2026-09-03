@@ -36,7 +36,7 @@ Claims carry a label. **V** = verified with a source or a local experiment. **B*
 3. O(1) spawn from the user's view (M1). A snapshot where the filesystem gives one. A hot spare everywhere else.
 4. Light on disk. Disk per tree is about the diff. An idle tree costs kilobytes when hibernated (M5).
 5. Language-agnostic for correctness. Ecosystem knowledge only improves warmth.
-6. Linux and macOS. Fully operational on APFS, btrfs, XFS, and ext4 from the first release. Zero `sudo` prompts on the default path (M13).
+6. Linux first, macOS last. Fully operational on btrfs, XFS, and ext4 from the first release. macOS runs from the first release with the `copy` backend and a degraded envelope; the APFS backend, the Seatbelt fence, and the QoS scope land in the last milestone. Zero `sudo` prompts on the default path (M13).
 7. Certainty. An agent in one klon cannot write outside it. A klon's hooks cannot touch golden or a sibling. The developer sees conflicts before a merge (M7, M8, M11).
 
 ### Non-goals
@@ -429,6 +429,7 @@ The specification `docs/klon-spec.md` gives the requirements, the chunks, and th
 | v1.2 Integration certainty | the radar, `merge`, `check`, `claim`, the Claude Code plugin, hibernate | The developer sees conflicts before a merge |
 | v1.3 Performance goals | `/goal` sessions against `bench`: M1, M4, M12; the index byte-splice if the numbers demand it | Targets met with raw samples |
 | Release | precompiled assets, the CI matrix, docs | `gh extension install navaro1/gh-klon` |
+| v1.4 macOS improvements | the `apfs-clone` backend, the Seatbelt fence, the QoS clamp and footprint poll, the jetsam spike, `lo0` | The full envelope on macOS. Last by request: these items need a Mac. |
 
 ---
 
