@@ -11,7 +11,7 @@ This note tells a fresh session where the project stands and what to do next. Re
 | Research record | `docs/klon-research-2026-09-03.md` | Revision 2 (PR #1), verbatim. Measurements and sources. |
 | Evidence record | `docs/klon-evidence.md` | From PR #2, verbatim. Pinned competitor commits. |
 | Proposal record | `docs/proposals/2026-09-03-evidence-gated-workspaces.md` | The receipt architecture from PR #2, verbatim. Kept for v2. |
-| Tickets | GitHub issues #3 to #42 | One issue per chunk, spike, and goal. Labels `type:chunk`, `type:spike`, `type:goal`, `platform:*`. Milestones v1.0 to v1.3 and release. |
+| Tickets | GitHub issues #3 to #42 | One issue per chunk, spike, and goal. Labels `type:chunk`, `type:spike`, `type:goal`, `platform:*`. Milestones v0 to v0.3 and release. |
 
 Both design PRs are merged. No open pull request exists.
 
@@ -24,7 +24,7 @@ Handoff §2 has the full table. The short form:
 3. A journal plus `doctor --repair` protects every `add` and `rm`.
 4. Repository-supplied commands in `.klon.toml` need one approval per content hash.
 5. The envelope (Landlock or Seatbelt fence, systemd scope, jobserver, loopback address) is core. Each part degrades with a message when the host lacks it.
-6. Receipts, `verify`, and SQLite from PR #2 are deferred to v2. A light `check` receipt and `claim` ship in v1.2.
+6. Receipts, `verify`, and SQLite from PR #2 are deferred to v2. A light `check` receipt and `claim` ship in v0.2.
 7. The jobserver uses the pipe-style handshake. The fifo style is a fatal error on make 4.3.
 
 ## Facts verified on the development laptop (2026-09-03)
@@ -41,7 +41,7 @@ Handoff §11 has the two tables. The facts that shape the first chunks:
 ## How to start
 
 1. Install the toolchain: `cargo 1.92` is present. Nothing else is needed for C0.
-2. Take the first open issue in milestone v1.0 (C0). Its body holds the build line and the acceptance list. `docs/klon-spec.md` §7 has the same text.
+2. Take the first open issue in milestone v0 (C0). Its body holds the build line and the acceptance list. `docs/klon-spec.md` §7 has the same text.
 3. Work in a branch, open a pull request, and close the issue from the pull request.
 4. Run `python3 ~/.claude/skills/writing-specs/scripts/validate_spec.py docs/klon-spec.md` after any spec edit.
 5. For a goal ticket (G1 to G4), open Claude Code in the repository and run `/goal` with the condition from the issue body. The bench JSON must appear in the transcript.
@@ -74,11 +74,11 @@ The blockers, for the record:
 
 | Milestone | Issues |
 |---|---|
-| v1.0 local worktree replacement | #3 C0, #4 C1, #5 C2, #6 C3, #7 C4, #8 C5, #10 C7, #11 C8, #12 C9, #13 C10, #14 C11, #15 C12, #16 C13, #17 C14, #18 S1, #19 C15 |
-| v1.1 envelope | #20 C16, #21 C17, #22 C18, #24 C20, #27 C22, #28 C23 |
-| v1.2 integration certainty | #29 C24, #30 C25, #31 C26, #32 C27, #33 C28, #34 S3, #35 C29, #36 C30 |
-| v1.3 performance goals | #37 C31, #38 G1, #39 G2, #40 G3, #41 G4 |
+| v0 local worktree replacement | #3 C0, #4 C1, #5 C2, #6 C3, #7 C4, #8 C5, #10 C7, #11 C8, #12 C9, #13 C10, #14 C11, #15 C12, #16 C13, #17 C14, #18 S1, #19 C15 |
+| v0.1 envelope | #20 C16, #21 C17, #22 C18, #24 C20, #27 C22, #28 C23 |
+| v0.2 integration certainty | #29 C24, #30 C25, #31 C26, #32 C27, #33 C28, #34 S3, #35 C29, #36 C30 |
+| v0.3 performance goals | #37 C31, #38 G1, #39 G2, #40 G3, #41 G4 |
 | release | #42 C32 |
-| v1.4 macOS improvements (last, needs a Mac) | #9 C6, #23 C19, #25 S2, #26 C21 |
+| v0.4 macOS improvements (last, needs a Mac) | #9 C6, #23 C19, #25 S2, #26 C21 |
 
 Each issue body lists its dependencies as issue links. Start with #3. The macOS items were moved to the end on 2026-09-03 by request; until they land, klon on macOS uses the `copy` backend and a degraded envelope.

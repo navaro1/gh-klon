@@ -64,7 +64,7 @@ Terms:
 
 Functional requirements. Each uses the form WHEN / WHILE / IF / shall.
 
-**Core (v1.0)**
+**Core (v0)**
 - **R1** — WHEN the user runs `gh klon add <branch>`, klon shall create a linked worktree that `git worktree list --porcelain` reports with the path, HEAD, and branch, without a klon process.
 - **R2** — WHEN `add` completes, the tracked files of the klon shall equal the tree of `<branch>`: `git status --porcelain` prints nothing and `git diff --quiet HEAD` exits 0.
 - **R3** — WHEN `add` completes, the ignored files of the klon shall equal the manifest of golden's ignored files, minus `.git`, `.klonignore` matches, and the delete list (`.next/cache`, `.ninja_log`, `.ninja_deps`).
@@ -93,7 +93,7 @@ Functional requirements. Each uses the form WHEN / WHILE / IF / shall.
 - **R41** — WHEN the selected backend copies bytes, `add` shall refuse before any change when the free space is below 1.2 times the estimated size, shall print the shortfall, and shall print a progress line on a TTY that `--json` suppresses.
 - **R40** — WHEN `add`, `up`, or `rm` completes, klon shall start one detached low-priority process that prepares `.spare/`, and `add` shall use the spare only when its recorded HEAD equals golden's HEAD and its tear check passed.
 
-**Envelope (v1.1)**
+**Envelope (v0.1)**
 - **R17** — WHILE a process runs under `run`, `shell`, or `add -- cmd`, a write outside the klon, the git object, ref, and log directories, the klon's own worktree directory, `TMPDIR`, `/tmp`, the declared caches, and `[fence] allow` shall fail with `EACCES` on Linux or `EPERM` on macOS; a write inside shall succeed; `git commit` inside the klon shall succeed; and `<common>/hooks` and `<common>/config` shall stay read-only.
 - **R18** — WHILE a process runs under `run` on Linux with systemd ≥ 249, its cgroup shall carry `memory.high` = total / (N+1) and `pids.max`; on macOS klon shall poll the footprint and send SIGTERM above a threshold.
 - **R19** — WHILE N klons build under `run`, the count of concurrent jobserver-aware compile processes shall not exceed the token count plus N, and a build under make 4.3 shall not fail because of the jobserver.
@@ -101,7 +101,7 @@ Functional requirements. Each uses the form WHEN / WHILE / IF / shall.
 - **R21** — `run` shall export `KLON_IP=127.0.0.N` unique per live klon, and on Linux a bind to that address shall succeed; `run --netns` shall map host `127.0.0.N:<port>` into a `pasta` namespace when `pasta` is present; on macOS `gh klon lo0` shall print the alias command.
 - **R22** — `stop` shall end every process in the klon's process tree within 5 s.
 
-**Integration certainty (v1.2)**
+**Integration certainty (v0.2)**
 - **R23** — `list` shall show conflicts vs base and vs each sibling from `git merge-tree --write-tree` on git ≥ 2.38, or from the legacy `git merge-tree <base> <a> <b>` form below 2.38, within 40 ms per pair on the 100k fixture.
 - **R24** — `merge` shall stop when the `pre_merge` hook fails, shall use mergiraf when installed, shall fast-forward base, shall remove the klon, and shall NOT push.
 - **R25** — `check` shall refuse a dirty tree, shall run approved `[proof] steps` inside the envelope, and shall write a receipt bound to the commit; `merge` shall refuse without a receipt for HEAD unless `--no-check`.
@@ -217,7 +217,7 @@ All design questions have a decision or a spike. See handoff §12. The spikes ar
 
 ## 7. Chunks and Acceptance Criteria
 
-Delivery policy: each chunk is one GitHub issue and one pull request. Each chunk includes its own acceptance tests. The milestones are v1.0, v1.1, v1.2, v1.3, release, and v1.4 macOS improvements. A size estimate follows each title. Split a chunk when it goes above 400 lines.
+Delivery policy: each chunk is one GitHub issue and one pull request. Each chunk includes its own acceptance tests. The milestones are v0, v0.1, v0.2, v0.3, release, and v0.4 macOS improvements. A size estimate follows each title. Split a chunk when it goes above 400 lines.
 
 ### C0 — First end-to-end path: `add` with the copy backend (~380 lines)
 **Status:** `[ ]` pending
@@ -326,7 +326,7 @@ Add `README.md` with the local install line: `cargo build --release && ln -sf ta
 - `init --undo` after a completed `init` restores a plain directory with a byte-equal manifest.
 **Depends on:** C5 · **Traces to:** R6, R32
 
-### C8 — `bench` v1: manifest, M1, M4, M6 (~350 lines)
+### C8 — `bench` v0: manifest, M1, M4, M6 (~350 lines)
 **Status:** `[ ]` pending
 **Build:** `src/bench/`: a versioned manifest (`bench/manifests/v1.toml`) that fixes the fixture seed and shape, the cells, the run counts (10 warm, 5 cold; `--release` uses 30 and 10), the timer points, and the pass rule. Cells: `m1-add-10k`, `m1-add-100k`, `m4-status-100k` (reports `first_p50_ms` and `steady_p50_ms` separately), `m6-rm-100k`, each for the selected backend and for the `git worktree add` baseline; each cell record carries `backend` and a `spare` boolean. Cold runs drop the page cache only when `KLON_BENCH_DROP_CACHES` names a command that can do it; else they are marked `warm-only`. `gh klon bench [--cell <name>] [--json] [--release]` writes `bench/results/<date>-<host>.json` with the raw samples, p50, p95, the environment record (hardware, OS, filesystem, mount options, git version, klon commit, fixture hash), and a `correctness` field from the manifest test; a mismatch sets `timing_valid: false`.
 **AC:**
@@ -651,13 +651,13 @@ Implement `gh klon sync <branch> [--merge|--onto <base>|--fresh|--all|--check]` 
 **Build:** `.github/workflows/release.yml` with `cli/gh-extension-precompile@v2` and a `build_script_override` that runs `cargo build --release` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, and `aarch64-apple-darwin`; assets named `gh-klon_v<ver>_<os>-<arch>`; `LICENSE-MIT` and `LICENSE-APACHE`; README install, quick start, `doctor` output, and the known limitations from the handoff, including the `core.checkStat=minimal` blind spot (an edit that keeps size and mtime is invisible to `git status`).
 **AC:**
 - A tag `v0.1.0` produces four assets with the documented names.
-- `gh extension install navaro1/gh-klon` on a clean `ubuntu-22.04` and `macos-14` runner installs and `gh klon doctor` exits 0 (on macOS it reports `backend: copy` until v1.4).
+- `gh extension install navaro1/gh-klon` on a clean `ubuntu-22.04` and `macos-14` runner installs and `gh klon doctor` exits 0 (on macOS it reports `backend: copy` until v0.4).
 - A tag `v0.1.0-rc1` produces a prerelease.
 **Depends on:** C2, C4, C7 · **Traces to:** R37
 
 ---
 
-The four items below need a Mac to develop and test. They form the last milestone, v1.4 macOS improvements, by request on 2026-09-03. Until they land, klon on macOS uses the `copy` backend and runs without a fence and a scope; `doctor` reports each absent part. Their identifiers keep their original numbers because the issues already use them.
+The four items below need a Mac to develop and test. They form the last milestone, v0.4 macOS improvements, by request on 2026-09-03. Until they land, klon on macOS uses the `copy` backend and runs without a fence and a scope; `doctor` reports each absent part. Their identifiers keep their original numbers because the issues already use them.
 
 ### C6 — `apfs-clone` backend (~200 lines)
 **Status:** `[ ]` pending

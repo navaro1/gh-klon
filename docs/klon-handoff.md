@@ -60,13 +60,13 @@ They disagreed on the points below. The table gives the decision.
 | Topic | Revision 2 (PR #1) | Evidence-gated proposal (PR #2) | Decision | Why |
 |---|---|---|---|---|
 | Who writes the worktree metadata | klon writes 3 files by hand (about 1 ms) | The installed Git creates the worktree | **Git creates the admin entry.** `git worktree add --no-checkout --detach --lock` on an empty path. klon then replaces the working directory content and rewrites the `.git` file. | The cost is 10 ms. klon holds zero format knowledge. `list`, `remove`, `prune`, `repair`, reftable, and relative paths keep working when Git changes. |
-| Default clone source | golden (the main checkout), possibly dirty | An immutable, verified generation | **v1: golden through a hot spare, with a tear check. v1.2: `warm` generations as an opt-in source.** | A snapshot is atomic. A walk is not. The spare is made when golden is quiet. After a clone, `git status` plus `git checkout -- <paths>` restores each tracked file exactly. A torn ignored file costs one rebuild of that unit. |
+| Default clone source | golden (the main checkout), possibly dirty | An immutable, verified generation | **v0: golden through a hot spare, with a tear check. v0.2: `warm` generations as an opt-in source.** | A snapshot is atomic. A walk is not. The spare is made when golden is quiet. After a clone, `git status` plus `git checkout -- <paths>` restores each tracked file exactly. A torn ignored file costs one rebuild of that unit. |
 | Default copy backend | CoW clone; `copy` only on ext4 | Regular byte copy; clone adapters off until evidence | **The CoW clone is the product.** `copy` stays as the universal fallback. Every backend must pass one manifest-equality test before `doctor` selects it. | The test is adopted. The default is not. A tool that copies 4 GB in 95 s is not the product. |
 | Transactions and repair | Not covered | A marker journal for every state change; `doctor` repairs | **Adopted.** `add` and `rm` write a journal under the common git directory. A repeated command reaches the prior state or the completed state. | Crashed agents leave half-trees (pain point 8). The journal is cheap to build. |
 | Repository-supplied commands | `.klon.toml` `[warm] steps` run by `up` | A repository policy needs consent per content hash | **Adopted.** Command-bearing keys in `.klon.toml` need one approval per content hash. klon stores the approval in `~/.config/klon/approvals.toml`. | A repository can be untrusted. worktrunk uses the same pattern. |
 | Envelope (fence, scope, jobserver, loopback) | A core feature, on by default under `run` | Outside the portable core | **A core feature.** Each part degrades with a message when the host lacks it. | Pain points 3, 5, and 7 are the product reason. klon does not *require* these host features. klon *uses* them. |
-| Claims (owned paths) | v1.1, a file under `.klon/` | An atomic SQLite ledger with collision keys | **v1.2, one JSON file under the common git directory with `flock`.** | One laptop. A file lock gives the atomic overlap check. SQLite is a later option if a test shows a need. |
-| Receipts, `ready`, `verify` | `merge` with a `pre_merge` test gate | A content-bound receipt from a private proof worktree | **v1.2 light receipt.** `gh klon check` runs `[proof] steps` at a clean HEAD and records the commit, tree, steps, status, and duration. `merge` needs a fresh receipt unless the user passes `--no-check`. The private proof worktree and the execution manifest are a v2 candidate. | The test gate is the load-bearing part (CAID, Glite). The full manifest machinery has no demand evidence yet. |
+| Claims (owned paths) | v0.1, a file under `.klon/` | An atomic SQLite ledger with collision keys | **v0.2, one JSON file under the common git directory with `flock`.** | One laptop. A file lock gives the atomic overlap check. SQLite is a later option if a test shows a need. |
+| Receipts, `ready`, `verify` | `merge` with a `pre_merge` test gate | A content-bound receipt from a private proof worktree | **v0.2 light receipt.** `gh klon check` runs `[proof] steps` at a clean HEAD and records the commit, tree, steps, status, and duration. `merge` needs a fresh receipt unless the user passes `--no-check`. The private proof worktree and the execution manifest are a v2 candidate. | The test gate is the load-bearing part (CAID, Glite). The full manifest machinery has no demand evidence yet. |
 | Benchmark rigor | `gh klon bench` prints a table | 100 warm and 100 cold runs per cell, bootstrap intervals | **Adopted at a smaller scale.** A versioned manifest, seeded fixtures, raw samples, p50 and p95, an environment record. 10 warm and 5 cold runs for development. 30 and 10 for a release claim. A correctness mismatch voids the timing. | The rigor is what a `/goal` session needs as its verifier. The counts fit a laptop. |
 | Path fixup | A generic text rewrite of golden's path in ignored directories | Never rewrite an unknown artifact | **A generic rewrite with rails.** Text files only, at most 1 MB, valid UTF-8, not in a skip list (`.db`, `.sqlite*`, `.pack`, `.bin`, `.o`, `.a`, `.so`, `.dylib`, `.class`, `.pyc`, `.wasm`). klon logs each rewrite. `--no-fixup` and `[fixup] skip` exist. | Language-agnostic relocation is a goal. The rails remove the known hazards. |
 | Support floor | git ≥ 2.38 for `merge-tree --write-tree` | git ≥ 2.34.1, macOS 13+, kernel 5.15+ | **Core: git ≥ 2.34.1, macOS 13+, Linux kernel ≥ 5.15. The radar uses `merge-tree --write-tree` on git ≥ 2.38 and the legacy three-argument form below it (**V**, §11).** | Ubuntu 22.04 ships git 2.34.1 and is the development laptop. |
@@ -91,8 +91,8 @@ They disagreed on the points below. The table gives the decision.
 | `gh klon pr <branch>` | `gh pr create` from that tree. |
 | `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. |
 | `gh klon merge <branch>` | Fetch, `pre_merge` hook, structured merge, fast-forward base, remove. Never pushes. |
-| `gh klon check <branch>` | v1.2. Run `[proof] steps` at a clean HEAD and record a receipt. |
-| `gh klon claim <branch> <paths...>` | v1.2. Record owned paths. `list` flags overlaps. |
+| `gh klon check <branch>` | v0.2. Run `[proof] steps` at a clean HEAD and record a receipt. |
+| `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. |
 | `gh klon shell <branch>` | An interactive shell inside the envelope. |
 | `gh klon stop <branch>` | Kill the whole process tree of that klon. |
@@ -125,7 +125,7 @@ spare = 1                           # hot-spare pool depth; 0 disables
 [warm]                              # run by `gh klon up` after the fast-forward; needs approval
 steps = ["cargo build", "pnpm install --frozen-lockfile"]
 
-[proof]                             # v1.2: run by `gh klon check`; needs approval
+[proof]                             # v0.2: run by `gh klon check`; needs approval
 steps = ["cargo nextest run"]
 
 [fence]                             # extra writable paths under `run`
@@ -237,8 +237,8 @@ The literature says that coordination, not parallelism, carries the gain (resear
 
 - **Radar** in `gh klon list`, through `git merge-tree --write-tree --quiet` on git ≥ 2.38 (10-40 ms per pair on 100k files, **V**), or the legacy `git merge-tree <merge-base> <a> <b>` form below 2.38 (0.01 s per pair; conflict paths from the `changed in both` lines, **V**). Columns: vs base (clean or N conflicts), vs siblings (pairwise), behind (commits behind base). Cached in `<common>/klon/radar` keyed by the tuple of HEADs.
 - **`gh klon merge <branch>`**: fetch, `pre_merge` hook, a structured merge with mergiraf when installed (GPLv3, a separate process, `merge.mergiraf.driver` plus `.gitattributes`), fast-forward base, `rm`. Never pushes. Refuses on a dirty golden. LLM conflict resolution is out of scope: the best models resolve under 60 % of real hunks.
-- **`gh klon check <branch>`** (v1.2): refuses a dirty tree. Runs the approved `[proof] steps` in the klon inside the envelope. Writes a receipt `{version, commit, tree, steps_hash, results[], duration, created}` to `<common>/klon/receipts/<commit>.json`. `merge` needs a receipt for the exact HEAD unless the user passes `--no-check`. A receipt for another commit is stale.
-- **`gh klon claim <branch> <paths...>`** (v1.2): records owned paths in `<common>/klon/claims.json` under `flock`. A claim names an exact file or a directory prefix. The overlap check runs inside the lock. `list` flags overlaps. `check` reports changed paths outside the klon's claims.
+- **`gh klon check <branch>`** (v0.2): refuses a dirty tree. Runs the approved `[proof] steps` in the klon inside the envelope. Writes a receipt `{version, commit, tree, steps_hash, results[], duration, created}` to `<common>/klon/receipts/<commit>.json`. `merge` needs a receipt for the exact HEAD unless the user passes `--no-check`. A receipt for another commit is stale.
+- **`gh klon claim <branch> <paths...>`** (v0.2): records owned paths in `<common>/klon/claims.json` under `flock`. A claim names an exact file or a directory prefix. The overlap check runs inside the lock. `list` flags overlaps. `check` reports changed paths outside the klon's claims.
 - `merge.conflictStyle=zdiff3` and `rerere` are on in the shared config.
 
 ---
@@ -259,7 +259,7 @@ The literature says that coordination, not parallelism, carries the gain (resear
 
 | # | Metric | git worktree | git-sprout | worktrunk | klon target |
 |---|---|---|---|---|---|
-| M1 | Spawn to editable tree, p50 | 2-5 s | 0.5-1 s | 2-5 s | ≤ 1 s v1 (snapshot or spare plus `checkout`); ≤ 100 ms v1.3 (index byte-splice) |
+| M1 | Spawn to editable tree, p50 | 2-5 s | 0.5-1 s | 2-5 s | ≤ 1 s v0 (snapshot or spare plus `checkout`); ≤ 100 ms v0.3 (index byte-splice) |
 | M2 | Spawn to warm build state | never | never | +20 s (14 GB reflink walk); minutes on ext4 | 0 s (snapshot or spare); background on a cold ext4 copy |
 | M3 | Build units compiled on the first build | all | all | 0 if listed | 0 for cargo, npm and pnpm, Vite, TS, Go; documented exceptions in §9 |
 | M4 | `git status` in a fresh klon | n/a | fast after a re-hash | normal | first call ≤ 500 ms; later calls ≤ 150 ms (100k files, warm) |
@@ -323,7 +323,7 @@ Do not re-open one of these without new data.
 | A full copy as the routine ext4 path | 95 s per `node_modules` (**V**). |
 | A hardlink copy of mutable directories | cargo, MSBuild, pnpm, npm, and ninja open outputs with truncate and corrupt golden. |
 | A regular byte copy as the default backend | The CoW clone is the product. The copy is the fallback. |
-| An immutable generation as the only clone source in v1 | It doubles the disk and delays warmth. The spare plus the tear check gives most of the safety. Generations return in v1.2 as an option. |
+| An immutable generation as the only clone source in v1 | It doubles the disk and delays warmth. The spare plus the tear check gives most of the safety. Generations return in v0.2 as an option. |
 | A SQLite state store in v1 | One laptop. A file under `flock` gives the same atomic check. |
 | Full proof receipts with execution manifests in v1 | No demand evidence. The test gate is the load-bearing part. |
 | overlayfs as the default Linux backend | The mount is invisible outside the namespace. Editors cannot open the tree. |
@@ -374,7 +374,7 @@ Consequences:
 - The jobserver uses the pipe style (§5). The fifo file stays the token store.
 - The daily local path is the `copy` backend plus the hot spare, until the user installs `btrfs-progs`. Then `init --volume` applies.
 - The `init --volume` image seeds a user-owned `klon/` directory through `--rootdir`. Golden and the klons live below it.
-- Zero-compile tests in v1.0 use Rust and pnpm fixtures. .NET runs in CI only.
+- Zero-compile tests in v0 use Rust and pnpm fixtures. .NET runs in CI only.
 
 ### Git 2.34.1 pipeline check, 2026-09-03 (development laptop, ext4, warm cache)
 
@@ -424,12 +424,12 @@ The specification `docs/klon-spec.md` gives the requirements, the chunks, and th
 
 | Milestone | Content | Result |
 |---|---|---|
-| v1.0 Local worktree replacement | `add`, `rm`, `list`, `prune`, `doctor`, the backends, the spare, `bench`, path fixup, the branch forms, `up`, `sync` | A usable, measured replacement, installed locally through `gh extension install .` |
-| v1.1 Envelope | the env file, `run`, `shell`, `stop`, the jobserver, the fence, the scope, per-tree hooks, approvals, pasta | Guarantees instead of hope |
-| v1.2 Integration certainty | the radar, `merge`, `check`, `claim`, the Claude Code plugin, hibernate | The developer sees conflicts before a merge |
-| v1.3 Performance goals | `/goal` sessions against `bench`: M1, M4, M12; the index byte-splice if the numbers demand it | Targets met with raw samples |
+| v0 Local worktree replacement | `add`, `rm`, `list`, `prune`, `doctor`, the backends, the spare, `bench`, path fixup, the branch forms, `up`, `sync` | A usable, measured replacement, installed locally through `gh extension install .` |
+| v0.1 Envelope | the env file, `run`, `shell`, `stop`, the jobserver, the fence, the scope, per-tree hooks, approvals, pasta | Guarantees instead of hope |
+| v0.2 Integration certainty | the radar, `merge`, `check`, `claim`, the Claude Code plugin, hibernate | The developer sees conflicts before a merge |
+| v0.3 Performance goals | `/goal` sessions against `bench`: M1, M4, M12; the index byte-splice if the numbers demand it | Targets met with raw samples |
 | Release | precompiled assets, the CI matrix, docs | `gh extension install navaro1/gh-klon` |
-| v1.4 macOS improvements | the `apfs-clone` backend, the Seatbelt fence, the QoS clamp and footprint poll, the jetsam spike, `lo0` | The full envelope on macOS. Last by request: these items need a Mac. |
+| v0.4 macOS improvements | the `apfs-clone` backend, the Seatbelt fence, the QoS clamp and footprint poll, the jetsam spike, `lo0` | The full envelope on macOS. Last by request: these items need a Mac. |
 
 ---
 
