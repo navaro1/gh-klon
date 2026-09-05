@@ -70,3 +70,12 @@ pub fn local_branch_exists(cwd: &Path, branch: &str) -> bool {
     let rev = format!("refs/heads/{branch}");
     run(cwd, &["show-ref", "--verify", "--quiet", &rev]).is_ok()
 }
+
+/// The absolute path of the main worktree: the first `worktree list` entry.
+pub fn main_worktree(cwd: &Path) -> Result<PathBuf> {
+    let first = worktree_list(cwd)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::klon("not inside a git repository"))?;
+    crate::paths::absolute(&first.path)
+}

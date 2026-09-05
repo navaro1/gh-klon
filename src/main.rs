@@ -2,6 +2,7 @@
 
 mod backend;
 mod cli;
+mod config;
 mod git;
 mod paths;
 
@@ -56,6 +57,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Parser)]
 #[command(name = "gh-klon", version, about, long_about = None)]
 struct Cli {
+    /// Approve the commands in `.klon.toml` and skip every prompt.
+    #[arg(long, global = true)]
+    yes: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -64,12 +68,15 @@ struct Cli {
 enum Command {
     /// Create a linked worktree with a warm copy of golden's ignored files.
     Add(cli::add::Args),
+    /// Run the approved `[warm] steps` in golden.
+    Up,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let result = match cli.command {
+    let Cli { yes, command } = Cli::parse();
+    let result = match command {
         Command::Add(args) => cli::add::run(args),
+        Command::Up => cli::up::run(yes),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
