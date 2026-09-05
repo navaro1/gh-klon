@@ -405,8 +405,8 @@ Still open. Each has a spike ticket or a decision point in a chunk.
 
 | # | Question | Resolution path |
 |---|---|---|
-| Q1 | Does `mkfs.btrfs --rootdir` keep the owner of a seeded user directory, as `mkfs.ext4 -d` does? Does udisks accept `user_subvol_rm_allowed`? Can the user create and snapshot subvolumes below that directory? | Spike S1: run the volume spike on a host with `btrfs-progs`. |
-| Q2 | Bundle a static `mkfs.btrfs` (GPLv2, 1-2 MB) in the release asset, or print the install line? | Decide after S1. |
+| Q1 | Does `mkfs.btrfs --rootdir` keep the owner of a seeded user directory, as `mkfs.ext4 -d` does? Does udisks accept `user_subvol_rm_allowed`? Can the user create and snapshot subvolumes below that directory? | **Resolved (V):** `--rootdir` keeps the owner. udisks refuses `user_subvol_rm_allowed`. The user creates and snapshots subvolumes, but cannot run `btrfs subvolume delete`, `list`, or `show`. klon deletes a klon with a background `rm -rf`. See `docs/spikes/2026-btrfs-loop-volume.md`. |
+| Q2 | Bundle a static `mkfs.btrfs` (GPLv2, 1-2 MB) in the release asset, or print the install line? | **Resolved:** print the install line. Add an opt-in `--fetch-tools` that extracts the distribution package into `~/.local/share/klon/tools/` without root. See `docs/spikes/2026-btrfs-loop-volume.md` §12. |
 | Q3 | Does a jetsam limit through `posix_spawnattr_setjetsam_ext` kill on a consumer Mac? | Spike S2: macOS spike. |
 | Q4 | The spare plus a dirty golden: revert at spare creation or at claim? | Proposal: record the dirty paths at creation, revert at claim. Decide in the spare chunk. |
 | Q5 | `add -- <cmd>` in tmux: exec only, or open a pane? | Proposal: exec. `--json` gives orchestrators what they need. |
