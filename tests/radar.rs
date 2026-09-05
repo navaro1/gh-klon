@@ -82,6 +82,16 @@ fn columns(line: &str) -> (String, String, String) {
     (vs_base, vs_siblings, behind)
 }
 
+/// The `doctor` line whose first word is `name`, with the column padding
+/// squeezed to one space so the assertion does not depend on the widest row.
+fn line_for_name(text: &str, name: &str) -> String {
+    let line = text
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(name))
+        .unwrap_or_else(|| panic!("no doctor line for {name} in:\n{text}"));
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Run `list` and return its stdout, failing the test on a non-zero exit.
 fn list(golden: &Path) -> String {
     let out = klon(golden, &["list"]);
@@ -180,8 +190,39 @@ fn the_legacy_form_finds_the_same_conflict() {
         "1 conflict with right",
         "the legacy merge-tree form must find the conflict too:\n{text}"
     );
-    // `doctor` prints `radar: legacy merge-tree` from `radar::doctor_row`. The
-    // command itself arrives with C4; the label has a unit test in `src/radar.rs`.
+}
+
+#[test]
+fn doctor_names_the_merge_tree_form_in_use() {
+    let fx = Fixture::generate(SEED, 20, 4, 4, 0);
+    let expected = if has_write_tree() {
+        "merge-tree --write-tree"
+    } else {
+        "legacy merge-tree"
+    };
+
+    let out = klon(&fx.golden, &["doctor"]);
+    assert!(out.status.success(), "doctor failed: {}", stderr(&out));
+    let row = line_for_name(&stdout(&out), "radar");
+    assert_eq!(
+        row,
+        format!("radar present: {expected}"),
+        "doctor must name the form the radar uses"
+    );
+
+    let out = klon(&fx.golden, &["--json", "doctor"]);
+    assert!(
+        out.status.success(),
+        "doctor --json failed: {}",
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains(&format!(
+            "\"radar\":{{\"status\":\"present\",\"detail\":\"{expected}\"}}"
+        )),
+        "the radar row belongs in klon.doctor/1: {text}"
+    );
 }
 
 #[test]

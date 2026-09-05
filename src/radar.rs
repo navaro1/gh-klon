@@ -37,11 +37,11 @@ pub enum Form {
 }
 
 impl Form {
-    /// The `doctor` label for this form.
-    pub fn label(self) -> &'static str {
+    /// The name `doctor` prints as the detail of its `radar` row.
+    pub fn name(self) -> &'static str {
         match self {
-            Form::WriteTree { .. } => "radar: merge-tree --write-tree",
-            Form::Legacy => "radar: legacy merge-tree",
+            Form::WriteTree { .. } => "merge-tree --write-tree",
+            Form::Legacy => "legacy merge-tree",
         }
     }
 
@@ -62,13 +62,6 @@ pub fn form(cwd: &Path) -> Form {
         Ok(text) => from_version(&text),
         Err(_) => Form::Legacy,
     })
-}
-
-/// The line `doctor` prints for the radar.
-// TODO(C4): `doctor` calls this once C4 lands the command.
-#[allow(dead_code)]
-pub fn doctor_row(cwd: &Path) -> String {
-    form(cwd).label().to_string()
 }
 
 /// Read `git version 2.34.1` and pick the form. A line klon cannot read counts as
@@ -803,10 +796,10 @@ mod tests {
 
     #[test]
     fn doctor_names_each_form() {
-        assert_eq!(Form::Legacy.label(), "radar: legacy merge-tree");
+        assert_eq!(Form::Legacy.name(), "legacy merge-tree");
         assert_eq!(
-            Form::WriteTree { batch: true }.label(),
-            "radar: merge-tree --write-tree"
+            Form::WriteTree { batch: true }.name(),
+            "merge-tree --write-tree"
         );
     }
 
