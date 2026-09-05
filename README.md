@@ -100,8 +100,16 @@ stops a command.
 | `add` `registered` or `cloned` | Unlock the worktree, remove it with force, delete the entry. |
 | `add` `checked-out` | Unlock the worktree, delete the entry. The klon stays. |
 | `add` `ready` | Delete the entry. The klon is complete. |
-| `rm` `removing` | Delete the `.git` file in the trash copy, run `git worktree prune`, delete the entry. |
+| `rm` `removing` | Delete the `.git` file in the trash copy, start the background delete, run `git worktree prune`, delete the entry. |
 | `rm` in any earlier state | Delete the entry. The klon stays. |
+
+A repeated command repairs its own entry too. `add` closes the entry of its
+destination before it validates the path, so a second `add` after an interrupted
+one completes without a `doctor` run. It prints one `klon: recovery:` line per
+action.
+
+A repair that cannot finish keeps the entry. `doctor --repair` then prints the
+report, names the reason, and exits non-zero, so the next run tries again.
 
 An entry with an unknown `version` fails closed: `doctor` exits non-zero with
 `unknown journal version` and changes nothing. Upgrade klon in that case.
@@ -120,6 +128,8 @@ gh klon add --json feature
 
 A new field may appear in a later version. A removed or retyped field bumps the
 version suffix. `tests/schema.rs` holds the documented field set of each schema.
+
+`up` and `prune` print no document. They refuse `--json` instead of ignoring it.
 
 ## Known blind spot
 

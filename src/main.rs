@@ -8,6 +8,7 @@ mod journal;
 mod paths;
 mod probe;
 mod process;
+mod repair;
 mod time;
 
 use clap::{Parser, Subcommand};
@@ -90,6 +91,16 @@ enum Command {
 
 fn main() -> ExitCode {
     let Cli { yes, json, command } = Cli::parse();
+    // `--json` is global, like `--yes`. `up` and `prune` print no document, so
+    // the flag would promise one that never arrives. A later chunk that gives a
+    // command a document deletes its name from this list.
+    if json && matches!(command, Command::Up | Command::Prune) {
+        eprintln!(
+            "{}",
+            Error::klon("--json is not available for up and prune")
+        );
+        return ExitCode::from(1);
+    }
     let result = match command {
         Command::Add(args) => cli::add::run(args, json),
         Command::Up => cli::up::run(yes),

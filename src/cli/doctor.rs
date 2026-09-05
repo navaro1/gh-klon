@@ -3,7 +3,7 @@
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
 use crate::journal::{self, Entry, Op, State};
-use crate::{git, paths, probe, time, Error, Result};
+use crate::{git, probe, repair, time, Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -49,11 +49,13 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // The journal is read first. An unknown version fails here, before any
     // probe runs and before `--repair` touches anything.
     let found = journal::list(&common)?;
-    let repaired = if args.repair {
+    let (repaired, failure) = if args.repair {
         repair_all(&golden, &common, &found)?
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
+    // The array always shows the state after the repair, and `repaired` shows
+    // what changed. An entry that the repair could not close is still listed.
     let entries = if args.repair {
         journal::list(&common)?
     } else {
@@ -89,7 +91,44 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         print_human(&report, &features);
     }
-    Ok(())
+    // The report prints first, so the user sees what the repair did. The exit
+    // code then reports the entry that stayed open.
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Repair every entry and collect one row per action. The answer holds the
+/// first reason an entry stayed open; the other entries are still repaired.
+fn repair_all(
+    golden: &Path,
+    common: &Path,
+    entries: &[Entry],
+) -> Result<(Vec<RepairRow>, Option<Error>)> {
+    let mut rows = Vec::new();
+    let mut failure = None;
+    for entry in entries {
+        let outcome = repair::entry(golden, common, entry)?;
+        for action in outcome.actions {
+            rows.push(RepairRow {
+                name: entry.name.clone(),
+                state: entry.state,
+                path: entry.path.clone(),
+                action,
+            });
+        }
+        if let Some(why) = outcome.failure {
+            rows.push(RepairRow {
+                name: entry.name.clone(),
+                state: entry.state,
+                path: entry.path.clone(),
+                action: format!("the entry stays: {why}"),
+            });
+            failure.get_or_insert(why);
+        }
+    }
+    Ok((rows, failure))
 }
 
 // --- The report --------------------------------------------------------------
@@ -287,142 +326,4 @@ fn statfs(path: &Path) -> Option<libc::statfs> {
     // SAFETY: `c_path` is NUL-terminated and `stat` is a live, owned buffer.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
     (rc == 0).then_some(stat)
-}
-
-// --- Repair ------------------------------------------------------------------
-
-/// Move every entry to the prior valid state and collect one row per action.
-fn repair_all(golden: &Path, common: &Path, entries: &[Entry]) -> Result<Vec<RepairRow>> {
-    let mut rows = Vec::new();
-    for entry in entries {
-        for action in repair_entry(golden, common, entry)? {
-            rows.push(RepairRow {
-                name: entry.name.clone(),
-                state: entry.state,
-                path: entry.path.clone(),
-                action,
-            });
-        }
-    }
-    Ok(rows)
-}
-
-/// The repair of one entry. The operation picks the tail: `add` undoes the
-/// steps that ran or finishes the steps that remain, and `rm` finishes its own
-/// tail. An interrupted `rm` that changed nothing leaves the klon in place.
-fn repair_entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Vec<String>> {
-    let mut actions = Vec::new();
-    match entry.op {
-        Op::Add => match entry.state {
-            // Nothing was registered, unless the kill landed inside `git
-            // worktree add`. Check the register list before the entry goes.
-            State::Planned => {
-                if git::is_registered(golden, &entry.path) {
-                    actions.extend(unregister(golden, &entry.path));
-                } else {
-                    actions.push("no worktree was registered".to_string());
-                }
-            }
-            // The worktree exists and the working directory is partial.
-            State::Registered | State::Cloned => actions.extend(unregister(golden, &entry.path)),
-            // The tree is correct and the lock is still on: finish the tail.
-            State::CheckedOut => {
-                git::run_quiet(
-                    golden,
-                    &["worktree", "unlock", &entry.path.to_string_lossy()],
-                );
-                actions.push(format!("unlocked {}", entry.path.display()));
-            }
-            // `add` wrote `ready` and stopped before it deleted the entry.
-            State::Ready => actions.push("the klon is complete".to_string()),
-            // `add` never writes `removing`.
-            State::Removing => actions.push("add never reaches this state".to_string()),
-        },
-        Op::Rm => match entry.state {
-            // Finish the `rm` tail. A trash copy that still holds a `.git` file
-            // would otherwise keep the dead worktree alive for git.
-            State::Removing => {
-                for dropped in drop_trash_git_files(golden, &entry.path)? {
-                    actions.push(format!("deleted the .git file in {}", dropped.display()));
-                }
-                git::run(golden, &["worktree", "prune"])?;
-                actions.push("pruned the worktree list".to_string());
-            }
-            // `rm` stopped before the rename, so the klon is untouched.
-            _ => actions.push("rm changed nothing; the klon stays".to_string()),
-        },
-        // C7 and C15 add the `init` tails. Until then the entry stays, so a
-        // later klon can still finish or revert the move.
-        Op::Init => {
-            return Ok(vec![
-                "init has no repair rule yet; the entry stays".to_string()
-            ])
-        }
-    }
-    journal::remove(common, &entry.name)?;
-    actions.push("deleted the journal entry".to_string());
-    Ok(actions)
-}
-
-/// Unlock and remove a registered worktree, then prune. `git worktree remove`
-/// refuses a locked worktree, so the unlock comes first (handoff §7).
-fn unregister(golden: &Path, path: &Path) -> Vec<String> {
-    let mut actions = Vec::new();
-    let text = path.to_string_lossy().into_owned();
-    if path.exists() {
-        if let Err(err) = crate::backend::copy::make_removable(path) {
-            eprintln!("klon: repair: {err}");
-        }
-    }
-    git::run_quiet(golden, &["worktree", "unlock", &text]);
-    actions.push(format!("unlocked {}", path.display()));
-    match git::run(golden, &["worktree", "remove", "--force", &text]) {
-        Ok(_) => actions.push(format!("removed the worktree {}", path.display())),
-        Err(err) => {
-            // A path that git no longer knows only needs a prune.
-            git::run_quiet(golden, &["worktree", "prune"]);
-            actions.push(format!(
-                "pruned {} because the remove failed: {}",
-                path.display(),
-                err.to_string().trim().replace('\n', "; ")
-            ));
-        }
-    }
-    actions
-}
-
-/// Delete the `.git` file of every `.trash` copy of `path` that still has one.
-/// `rm` renames the klon to `<wt root>/.trash/<name>-<seconds>` and drops that
-/// file next; a crash between the two steps leaves the file behind.
-fn drop_trash_git_files(golden: &Path, path: &Path) -> Result<Vec<PathBuf>> {
-    let name = match path.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => return Ok(Vec::new()),
-    };
-    let trash = paths::default_wt_root(golden).join(".trash");
-    let read = match fs::read_dir(&trash) {
-        Ok(read) => read,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(Error::io(format!("read {}", trash.display()))(err)),
-    };
-    let prefix = format!("{name}-");
-    let mut dropped = Vec::new();
-    for item in read {
-        let item = item.map_err(Error::io(format!("read {}", trash.display())))?;
-        if !item.file_name().to_string_lossy().starts_with(&prefix) {
-            continue;
-        }
-        let file = item.path().join(".git");
-        // Only a `.git` file, never a `.git` directory: a directory would be a
-        // whole repository that somebody moved into the trash by hand.
-        if fs::symlink_metadata(&file)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-        {
-            fs::remove_file(&file).map_err(Error::io(format!("delete {}", file.display())))?;
-            dropped.push(item.path());
-        }
-    }
-    dropped.sort();
-    Ok(dropped)
 }

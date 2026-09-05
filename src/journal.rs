@@ -218,6 +218,16 @@ pub fn list(common: &Path) -> Result<Vec<Entry>> {
     names.iter().map(|name| read_entry(&dir, name)).collect()
 }
 
+/// The entry named `name`, or None when no such file exists. An entry with an
+/// unknown `version` fails closed, as it does in `list`.
+pub fn read(common: &Path, name: &str) -> Result<Option<Entry>> {
+    let dir = dir(common);
+    if !dir.join(format!("{name}.json")).exists() {
+        return Ok(None);
+    }
+    read_entry(&dir, name).map(Some)
+}
+
 /// Read one entry. The version is checked before the rest is parsed, so a
 /// future format with another shape still gives the version error.
 fn read_entry(dir: &Path, name: &str) -> Result<Entry> {

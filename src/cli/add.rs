@@ -2,7 +2,7 @@
 
 use crate::backend::copy;
 use crate::journal::{self, State};
-use crate::{config, git, paths, Error, Result};
+use crate::{config, git, paths, repair, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,14 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             "the destination is inside the git common directory",
         ));
     }
+    // R6: a repeated `add` finishes the recovery of an interrupted one. This
+    // runs before `check_path`, because an interrupted `add` leaves a `.git`
+    // file in the destination and the check would refuse with `path not empty`.
+    let worktrees = match recover_stale(&golden, &common, &path)? {
+        // The recovery changed the register list, so read it again.
+        true => git::worktree_list(&cwd)?,
+        false => worktrees,
+    };
     check_path(&golden, &path)?;
     check_branch(&golden, &worktrees, &args.branch)?;
 
@@ -121,6 +129,23 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         println!("{}", path.display());
     }
     Ok(())
+}
+
+/// Close an open journal entry for this destination (R6, handoff §7). The
+/// answer says whether the recovery changed anything. `add` reads only the
+/// entry of its own path, so a future entry of another klon cannot block it.
+fn recover_stale(golden: &Path, common: &Path, path: &Path) -> Result<bool> {
+    let Some(entry) = journal::read(common, &journal::name_for(path))? else {
+        return Ok(false);
+    };
+    let outcome = repair::entry(golden, common, &entry)?;
+    for action in &outcome.actions {
+        eprintln!("klon: recovery: {action}");
+    }
+    match outcome.failure {
+        Some(err) => Err(err),
+        None => Ok(true),
+    }
 }
 
 /// Step 11: leave no half-registered worktree. True when the rollback finished

@@ -138,8 +138,53 @@ fn a_killed_add_is_repaired_and_the_next_add_completes() {
     );
 }
 
-/// A repeated `add` alone, with no `doctor` in between, also completes: the
-/// stale entry names the same path and `add` refuses nothing that git allows.
+/// The AC: a repeated `add` after the kill completes the klon, with no
+/// `doctor --repair` in between. `add` closes the entry of its own destination
+/// first (R6), so the leftover `.git` file cannot refuse it with `path not
+/// empty`.
+#[test]
+fn a_repeated_add_recovers_without_doctor() {
+    let fx = Fixture::generate(SEED, 60, 5, 10, 3);
+    let path = fx.default_klon_path();
+
+    let mut child = spawn_paused_add(&fx.golden, "registered");
+    let reached = wait_until(
+        || open_state(&fx.golden).as_deref() == Some("registered"),
+        Duration::from_secs(30),
+    );
+    sigkill(&child);
+    let _ = child.wait();
+    assert!(reached, "add never reached the registered state");
+    assert!(path.join(".git").exists(), "the kill leaves a .git file");
+
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(
+        out.status.success(),
+        "the repeated add failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        stderr(&out).contains("klon: recovery:"),
+        "the recovery must print what it did: {}",
+        stderr(&out)
+    );
+    assert_clean(&path);
+    assert!(
+        entries(&fx.golden).is_empty(),
+        "a completed add leaves no entry"
+    );
+    let list = worktree_list(&fx.golden);
+    assert!(
+        list.contains(path.to_str().unwrap()),
+        "the klon must be registered: {list}"
+    );
+    assert!(
+        !list.contains("locked"),
+        "the completed klon must be unlocked: {list}"
+    );
+}
+
+/// A command that completes leaves no entry behind.
 #[test]
 fn a_completed_add_leaves_no_entry() {
     let fx = Fixture::generate(SEED, 40, 4, 5, 3);
@@ -297,6 +342,34 @@ fn a_killed_rm_is_repaired() {
         "prune must drop the klon: {list}"
     );
     assert!(entries(&fx.golden).is_empty(), "the entry must be gone");
+    // The repair also starts the background delete that the killed `rm` never
+    // reached, so the trash copy does not wait for the next `prune`.
+    assert!(
+        wait_until(|| !victim.exists(), Duration::from_secs(30)),
+        "the trash copy must be deleted in the background"
+    );
+}
+
+/// `--json` is global, so clap accepts it everywhere. A command with no JSON
+/// document refuses the flag instead of ignoring it.
+#[test]
+fn json_is_refused_where_no_document_exists() {
+    let fx = Fixture::generate(SEED, 20, 2, 2, 2);
+    for command in ["up", "prune"] {
+        let out = klon(&fx.golden, &[command, "--json"]);
+        assert!(!out.status.success(), "{command} --json must fail");
+        assert!(
+            stderr(&out).contains("--json is not available"),
+            "{command} --json must say why: {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "{command} --json must print no document");
+    }
+    // The same commands still work without the flag.
+    for command in ["up", "prune"] {
+        let out = klon(&fx.golden, &[command]);
+        assert!(out.status.success(), "{command} failed: {}", stderr(&out));
+    }
 }
 
 /// An interrupted `rm` that changed nothing leaves the klon in place.
