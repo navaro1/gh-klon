@@ -57,7 +57,8 @@ pub struct Hardlink {
 /// The whole `.klon.toml`. Every key is optional (handoff §3).
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
-    /// The golden branch. The radar measures every klon against it.
+    /// The golden branch, read by the radar and the branch forms in `add`
+    /// and `rm --merged`.
     pub base: Option<String>,
     /// The path template for new klons.
     pub path: Option<String>,

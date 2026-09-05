@@ -147,15 +147,14 @@ fn add_refuses_a_branch_that_golden_has_checked_out() {
 }
 
 #[test]
-fn add_refuses_an_unknown_branch_and_a_path_inside_golden() {
+fn add_creates_an_unknown_branch_and_refuses_bad_paths() {
     let fx = Fixture::generate(SEED, 50, 5, 5, 20);
+    // C13: an unknown name is a new branch from base, and add exits 0.
     let out = klon(&fx.golden, &["add", "nope"]);
-    assert!(!out.status.success());
-    assert!(
-        stderr(&out).contains("branch not found"),
-        "stderr: {}",
-        stderr(&out)
-    );
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let head = git_ok(&fx.golden, &["rev-parse", "nope"]);
+    let main = git_ok(&fx.golden, &["rev-parse", "main"]);
+    assert_eq!(head.trim(), main.trim());
 
     let inside = fx.golden.join("sub").join("x");
     let out = klon(
@@ -169,6 +168,22 @@ fn add_refuses_an_unknown_branch_and_a_path_inside_golden() {
         stderr(&out)
     );
     assert!(!inside.exists());
+
+    // A non-empty destination is refused too.
+    let busy = fx.golden.parent().unwrap().join("busy");
+    fs::create_dir(&busy).unwrap();
+    fs::write(busy.join("x"), "x").unwrap();
+    let out = klon(
+        &fx.golden,
+        &["add", "--path", busy.to_str().unwrap(), "nope2"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("path not empty"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(!git_ok(&fx.golden, &["worktree", "list", "--porcelain"]).contains("busy"));
 }
 
 #[test]
@@ -271,7 +286,8 @@ fn add_refuses_revision_expressions() {
         !out.status.success(),
         "a revision expression is not a branch"
     );
-    assert!(stderr(&out).contains("branch not found"));
+    // The DWIM falls through to `git branch`, which rejects the name.
+    assert!(stderr(&out).contains("not a valid branch name"));
     assert_eq!(
         git_ok(&fx.golden, &["worktree", "list", "--porcelain"]),
         before

@@ -1,6 +1,8 @@
-//! `gh klon add <branch> [--path <p>]`: the `add` transaction from handoff §4, copy backend only.
+//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>]`: the `add`
+//! transaction from handoff §4, copy backend only.
 
 use crate::backend::copy;
+use crate::branch;
 use crate::journal::{self, State};
 use crate::{config, git, paths, repair, Error, Result};
 use serde::Serialize;
@@ -16,8 +18,15 @@ const BACKEND: &str = "copy";
 
 #[derive(clap::Args)]
 pub struct Args {
-    /// An existing local branch.
-    pub branch: String,
+    /// A local branch, an `origin/<name>` remote branch, or the name of a
+    /// new branch that klon creates from `base`.
+    pub branch: Option<String>,
+    /// Check out the head of pull request `<n>` as the branch `pr/<n>`.
+    #[arg(long, conflicts_with_all = ["branch", "issue"])]
+    pub pr: Option<u64>,
+    /// Create the branch `<n>-<slug>` from the title of issue `<n>`.
+    #[arg(long, conflicts_with = "branch")]
+    pub issue: Option<u64>,
     /// The klon path. Default: the `path` template from `.klon.toml`, else
     /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}` and `{branch}`.
     #[arg(long)]
@@ -48,9 +57,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         .first()
         .map(|w| paths::absolute(&w.path))
         .ok_or_else(|| Error::klon("not inside a git repository"))??;
+    // The branch form is resolved first: it names the default klon path and
+    // may create the branch (handoff §4, git DWIM).
+    let branch = resolve_branch(&golden, &args)?;
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
-        None => config::load(&golden)?.resolve_path(&golden, &args.branch)?,
+        None => config::load(&golden)?.resolve_path(&golden, &branch)?,
     };
     // Refuse unsupported paths before any repository mutation.
     for p in [&golden, &common, &path] {
@@ -70,10 +82,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         false => worktrees,
     };
     check_path(&golden, &path)?;
-    check_branch(&golden, &worktrees, &args.branch)?;
+    // The refusal waits for the recovery above: an interrupted `add` may have
+    // left the branch registered at the destination of this very run.
+    refuse_checked_out(&worktrees, &branch)?;
 
     // Step 0: the journal entry precedes the first repository change.
-    let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&args.branch))?;
+    let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&branch))?;
 
     // Step 2: git owns the admin entry. The path is empty or absent.
     if let Err(err) = git::run(
@@ -95,14 +109,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     }
     record.reach(State::Registered)?;
 
-    let result = fill(
-        &golden,
-        &common,
-        &worktrees,
-        &path,
-        &args.branch,
-        &mut record,
-    );
+    let result = fill(&golden, &common, &worktrees, &path, &branch, &mut record);
     if result.is_err() && cleanup(&golden, &path) {
         // The rollback finished, so the entry has no work left either.
         record.close()?;
@@ -115,7 +122,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         let report = Report {
             schema: SCHEMA,
             path: &path,
-            branch: &args.branch,
+            branch: &branch,
             head: git::run(&path, &["rev-parse", "HEAD"])?.trim().to_string(),
             backend: BACKEND,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -194,11 +201,26 @@ fn check_path(golden: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The branch must exist locally and must not be checked out anywhere.
-fn check_branch(golden: &Path, worktrees: &[git::Worktree], branch: &str) -> Result<()> {
-    if !git::local_branch_exists(golden, branch) {
-        return Err(Error::klon(format!("branch not found: {branch}")));
+/// Resolve the branch form to a local branch name (handoff §4). The
+/// resolution may create the branch: a tracking branch for `origin/<name>`,
+/// `pr/<n>` for `--pr`, or a new branch from `base` for `--issue` and unknown
+/// names.
+fn resolve_branch(golden: &Path, args: &Args) -> Result<String> {
+    if let Some(n) = args.pr {
+        branch::resolve_pr(golden, n)
+    } else if let Some(n) = args.issue {
+        branch::resolve_issue(golden, n)
+    } else {
+        let name = args
+            .branch
+            .as_deref()
+            .ok_or_else(|| Error::klon("name a branch, or use --pr or --issue"))?;
+        branch::resolve(golden, name)
     }
+}
+
+/// Refuse a branch that another worktree has checked out.
+fn refuse_checked_out(worktrees: &[git::Worktree], branch: &str) -> Result<()> {
     let full = format!("refs/heads/{branch}");
     if let Some(w) = worktrees
         .iter()
