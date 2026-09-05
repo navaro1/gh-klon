@@ -1,7 +1,7 @@
 //! `gh klon add <branch> [--path <p>]`: the `add` transaction from handoff §4, copy backend only.
 
 use crate::backend::copy;
-use crate::{git, paths, Error, Result};
+use crate::{config, git, paths, Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -10,7 +10,8 @@ use std::time::SystemTime;
 pub struct Args {
     /// An existing local branch.
     pub branch: String,
-    /// The klon path. Default: `../<repo>.wt/<branch>` next to golden.
+    /// The klon path. Default: the `path` template from `.klon.toml`, else
+    /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}` and `{branch}`.
     #[arg(long)]
     pub path: Option<PathBuf>,
 }
@@ -29,7 +30,7 @@ pub fn run(args: Args) -> Result<()> {
         .ok_or_else(|| Error::klon("not inside a git repository"))??;
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
-        None => paths::absolute(&paths::default_klon_path(&golden, &args.branch))?,
+        None => config::load(&golden)?.resolve_path(&golden, &args.branch)?,
     };
     // Refuse unsupported paths before any repository mutation.
     for p in [&golden, &common, &path] {

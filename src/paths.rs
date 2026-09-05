@@ -36,16 +36,6 @@ pub fn absolute(path: &Path) -> crate::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// The default klon path: `../<repo>.wt/<branch>` next to golden.
-pub fn default_klon_path(golden: &Path, branch: &str) -> PathBuf {
-    let repo = golden
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".to_string());
-    let parent = golden.parent().unwrap_or(golden);
-    parent.join(format!("{repo}.wt")).join(branch)
-}
-
 /// True when `dir` exists and holds at least one entry.
 pub fn is_non_empty_dir(dir: &Path) -> bool {
     match std::fs::read_dir(dir) {
