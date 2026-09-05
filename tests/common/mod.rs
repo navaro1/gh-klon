@@ -161,7 +161,12 @@ impl Fixture {
         diff_paths: usize,
     ) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let golden = tmp.path().join("golden");
+        // Canonical: on macOS /var is a symlink to /private/var and klon prints resolved paths.
+        let golden = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("golden");
         fs::create_dir(&golden).unwrap();
         for i in 0..tracked_files {
             let dir = golden.join(format!("d{:03}", i % dirs));
