@@ -17,6 +17,7 @@ This report answers Q1 and Q2 of the handoff §12. It records each command and i
 | Can the user remove a klon another way? | Yes. `rm -rf` removes a populated subvolume. It took 941 ms for 10,000 files. |
 | Does the volume survive a detach and a re-attach? | Yes. All files and all subvolumes survive. |
 | How long does the re-attach take? | About 0.57 s. |
+| Did the spike reboot the host? | No. It used a detach as the substitute. §9.4 lists the limits of that substitute. |
 | Did a password prompt appear? | Only for `udisksctl loop-delete` on a loop device that the user does not own. See §8. |
 
 **Verdict: the `btrfs-volume` backend works.** klon must not depend on
@@ -304,7 +305,10 @@ EXIT=0
 
 ## 9. Detach and re-attach
 
-A reboot removes the loop device and the mount. `udisksctl unmount` is the substitute.
+**The spike did not reboot the host.** A reboot of a shared development laptop is a
+destructive act, so the spike used `udisksctl unmount` plus `udisksctl loop-delete` as
+the substitute. Section 9.4 lists what the substitute covers and what stays unverified.
+Read every claim in this section as a claim about the substitute.
 
 ```
 $ SUDO_ASKPASS=/bin/false udisksctl unmount -b /dev/loop57
@@ -383,16 +387,49 @@ $ find .../klon/s1/src -type f | wc -l
 10000
 ```
 
-### What a real reboot needs
+### 9.4 What a real reboot needs, and what stays unverified
 
-1. Run `udisksctl loop-setup -f <image>`. This needs about 0.35 s and no password.
-2. Wait for the mount. The desktop automounter usually does it.
-3. Run `udisksctl mount -b <device>` when no mount appears. Treat `AlreadyMounted`
+The first `add` after a reboot must run these steps:
+
+1. Find the loop device for the image with `losetup -j <image>`. **Do not reuse a
+   stored device number.** The number is not stable.
+2. Run `udisksctl loop-setup -f <image>` when no device exists. This needs about
+   0.35 s and no password.
+3. Wait for the mount. The desktop automounter usually does it.
+4. Run `udisksctl mount -b <device>` when no mount appears. Treat `AlreadyMounted`
    as success.
-4. Read the mount path from `findmnt`, or from the `Mounted` reply of udisks.
+5. Read the mount path from `findmnt`, or from the `Mounted` reply of udisks.
    Do not guess it.
 
-klon must run these steps on the first `add` after a reboot.
+A reboot changes five things. The substitute reproduced four of them:
+
+| Reboot effect | Reproduced? | Evidence |
+|---|---|---|
+| The `btrfs` module is unloaded | Yes | `lsmod` showed no `btrfs` before the first mount. The kernel loaded it for that mount. |
+| The loop device is gone | Yes | `losetup -l` listed nothing after the unmount. |
+| The mount is gone | Yes | `mount` listed nothing after the unmount. |
+| udisks forgets the loop owner | Yes | `SetupByUID` fell back to 0 after the unmount. |
+| The loop device **number** changes | **No** | Every re-attach in this spike reused `/dev/loop57`. |
+
+**The unverified item is the loop device number.** `loop-setup -f` takes the first
+free number. This host already holds about 40 snap loop devices, and snapd claims
+them at boot. The order is not guaranteed. The spike did not measure the number
+across a reboot, so treat the stability of `/dev/loop57` as an accident of one
+session. C15 must never store a device path in `volume.json`. It must store the image
+path only, and resolve the device with `losetup -j <image>` at each start. A test for
+C15 must cover the case where a stored device number points at a foreign snap loop
+device.
+
+Two further items stay unverified because the substitute cannot reach them:
+
+- Whether the desktop automounter runs before the user session is ready. klon must
+  not depend on the automounter. Step 4 covers this.
+- Whether a stale `/media/<user>/<label>` directory blocks the mount. udisks removes
+  its own mount points on a clean shutdown. An unclean shutdown may leave one.
+
+C15 must carry an integration test for the re-attach path. That test can use the
+substitute in this report. A real reboot test belongs in the release checklist, not
+in the automated suite.
 
 ### The mount path
 
@@ -488,6 +525,8 @@ Decision:
    `findmnt`.
 8. C15 treats `AlreadyMounted` as success.
 9. C15 reads `SetupByUID` before `loop-delete`, or skips `loop-delete` altogether.
+10. C15 stores the image path in `volume.json`, never a loop device path. It resolves
+    the device with `losetup -j <image>` at each start.
 
 Residual risk: the polkit rules give `allow_active=yes` only. A session that is not
 active and local, such as ssh or a headless runner, gets `auth_admin` and a password
@@ -540,6 +579,7 @@ klon looks for the tools in this order:
 | Binaries there | `btrfs`, `mkfs.btrfs` (symlinks to `bin/` and `sbin/`) |
 | Version | btrfs-progs v5.16.2 |
 | mkfs call | `mkfs.btrfs -L klon-<repo> --rootdir <seed> <image>` |
+| Find the device | `losetup -j <image>`. Never store a device path. |
 | Attach | `udisksctl loop-setup -f <image>` |
 | Mount | `udisksctl mount -b <device>`; `AlreadyMounted` means success |
 | Mount path | Read it from `findmnt`. Do not compute it. |
