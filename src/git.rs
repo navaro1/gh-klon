@@ -83,6 +83,16 @@ pub fn common_dir(cwd: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out.strip_suffix('\n').unwrap_or(&out)))
 }
 
+/// True when git still lists `path` as a worktree of the repository at `cwd`.
+/// Both paths are made absolute first, so a symlinked parent still matches.
+pub fn is_registered(cwd: &Path, path: &Path) -> bool {
+    let Ok(list) = worktree_list(cwd) else {
+        return false;
+    };
+    list.iter()
+        .any(|w| w.path == path || crate::paths::absolute(&w.path).is_ok_and(|p| p == path))
+}
+
 /// True when `refs/heads/<branch>` exists.
 pub fn local_branch_exists(cwd: &Path, branch: &str) -> bool {
     let rev = format!("refs/heads/{branch}");
