@@ -19,12 +19,18 @@ fn klon(cwd: &Path, home: &Path, args: &[&str]) -> Output {
     )
 }
 
-/// The first token of `sha256sum <file>`.
+/// The first token of `sha256sum <file>`, or of `shasum -a 256 <file>` on macOS.
 fn sha256_of(file: &Path) -> String {
     let out = Command::new("sha256sum")
         .arg(file)
         .output()
-        .expect("run sha256sum");
+        .or_else(|_| {
+            Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(file)
+                .output()
+        })
+        .expect("run sha256sum or shasum");
     assert!(out.status.success(), "sha256sum failed");
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
@@ -43,9 +49,11 @@ struct Fixture {
 impl Fixture {
     fn generate() -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let home = tmp.path().join("home");
+        // Canonical: on macOS /var is a symlink to /private/var and klon prints resolved paths.
+        let root = tmp.path().canonicalize().expect("canonical tempdir");
+        let home = root.join("home");
         fs::create_dir(&home).unwrap();
-        let golden = tmp.path().join("golden");
+        let golden = root.join("golden");
         fs::create_dir(&golden).unwrap();
         fs::write(golden.join("readme.txt"), "readme\n").unwrap();
         git_ok(&golden, &["init", "-q", "-b", "main"]);
