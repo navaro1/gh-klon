@@ -62,6 +62,8 @@ const DOCTOR: Fields = &[
     ("timestamp", Ty::Str),
     ("git_version", Ty::Str),
     ("filesystem", Ty::Str),
+    ("backend", Ty::Str),
+    ("backend_reason", Ty::Str),
     ("features", Ty::Obj),
     ("journal", Ty::Arr),
     ("repaired", Ty::Arr),

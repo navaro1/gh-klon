@@ -153,6 +153,7 @@ pub struct Fixture {
 impl Fixture {
     /// `tracked_files` files spread over `dirs` directories, `ignored_files`
     /// files in `build/`, and `diff_paths` paths that `feature` changes or adds.
+    /// The fixture lands in the system temporary directory.
     pub fn generate(
         seed: u64,
         tracked_files: usize,
@@ -160,7 +161,28 @@ impl Fixture {
         ignored_files: usize,
         diff_paths: usize,
     ) -> Fixture {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        Fixture::generate_in(
+            &std::env::temp_dir(),
+            seed,
+            tracked_files,
+            dirs,
+            ignored_files,
+            diff_paths,
+        )
+    }
+
+    /// `generate` on a chosen filesystem. The backend tests use it to build a
+    /// fixture on the loop filesystem that `KLON_TEST_REFLINK_DIR` names, so
+    /// the clone runs where copy-on-write works (C5).
+    pub fn generate_in(
+        base: &Path,
+        seed: u64,
+        tracked_files: usize,
+        dirs: usize,
+        ignored_files: usize,
+        diff_paths: usize,
+    ) -> Fixture {
+        let tmp = tempfile::TempDir::new_in(base).expect("tempdir");
         // Canonical: on macOS /var is a symlink to /private/var and klon prints resolved paths.
         let golden = tmp
             .path()

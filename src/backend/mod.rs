@@ -238,6 +238,10 @@ pub fn select(golden: &Path, common: &Path, over: Option<&str>) -> Result<Choice
 }
 
 /// Probe every backend in order and take the first that passes.
+///
+/// The reason is the rejection text of every backend that klon preferred, in
+/// preference order, so `doctor` on ext4 says exactly `reflink unsupported`.
+/// A backend that wins without a rejection above it reports its own detail.
 fn run_probes(golden: &Path) -> Result<Choice> {
     let mut rejected: Vec<String> = Vec::new();
     for backend in probe_order() {
@@ -250,7 +254,7 @@ fn run_probes(golden: &Path) -> Result<Choice> {
                 };
                 return Ok(Choice { backend, reason });
             }
-            other => rejected.push(format!("{}: {}", backend.name(), other.detail())),
+            other => rejected.push(other.detail().to_string()),
         }
     }
     Err(Error::klon(format!(
