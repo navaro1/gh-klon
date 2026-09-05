@@ -33,6 +33,8 @@ pub struct Worktree {
     pub path: PathBuf,
     /// `refs/heads/<name>` when the worktree has a branch checked out.
     pub branch: Option<String>,
+    /// True when the entry is locked (`locked` or `locked <reason>`).
+    pub locked: bool,
 }
 
 /// Parse `git worktree list --porcelain`. The first entry is the main worktree.
@@ -42,18 +44,34 @@ pub fn worktree_list(cwd: &Path) -> Result<Vec<Worktree>> {
     for block in text.split("\n\n") {
         let mut path = None;
         let mut branch = None;
+        let mut locked = false;
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(p));
             } else if let Some(b) = line.strip_prefix("branch ") {
                 branch = Some(b.to_string());
+            } else if line == "locked" || line.starts_with("locked ") {
+                locked = true;
             }
         }
         if let Some(path) = path {
-            list.push(Worktree { path, branch });
+            list.push(Worktree {
+                path,
+                branch,
+                locked,
+            });
         }
     }
     Ok(list)
+}
+
+/// The absolute path of the main worktree: the first `git worktree list` entry.
+pub fn main_worktree(cwd: &Path) -> Result<PathBuf> {
+    let path = worktree_list(cwd)?
+        .first()
+        .map(|w| w.path.clone())
+        .ok_or_else(|| Error::klon("not inside a git repository"))?;
+    crate::paths::absolute(&path)
 }
 
 /// The absolute common directory: the output of `git rev-parse --git-common-dir`.
@@ -69,13 +87,4 @@ pub fn common_dir(cwd: &Path) -> Result<PathBuf> {
 pub fn local_branch_exists(cwd: &Path, branch: &str) -> bool {
     let rev = format!("refs/heads/{branch}");
     run(cwd, &["show-ref", "--verify", "--quiet", &rev]).is_ok()
-}
-
-/// The absolute path of the main worktree: the first `worktree list` entry.
-pub fn main_worktree(cwd: &Path) -> Result<PathBuf> {
-    let first = worktree_list(cwd)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::klon("not inside a git repository"))?;
-    crate::paths::absolute(&first.path)
 }
