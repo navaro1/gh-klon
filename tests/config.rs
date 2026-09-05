@@ -1,56 +1,22 @@
 //! C10 acceptance tests: the `.klon.toml` loader, the approval gate, and the path template.
 
+mod common;
+
+use common::{git_ok, klon_env, stderr, stdout};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_gh-klon");
-
-/// Run `git -C <cwd> <args>` with an isolated identity and config.
-fn git(cwd: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "klon")
-        .env("GIT_AUTHOR_EMAIL", "klon@example.com")
-        .env("GIT_COMMITTER_NAME", "klon")
-        .env("GIT_COMMITTER_EMAIL", "klon@example.com")
-        .output()
-        .expect("run git")
-}
-
-fn git_ok(cwd: &Path, args: &[&str]) -> String {
-    let out = git(cwd, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 /// Run `gh-klon <args>` in `cwd`. `KLON_CONFIG_HOME` and `HOME` stay inside the test.
 fn klon(cwd: &Path, home: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
-        .current_dir(cwd)
-        .env("KLON_CONFIG_HOME", home)
-        .env("HOME", home)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("run gh-klon")
-}
-
-fn stderr(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stderr).into_owned()
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    klon_env(
+        cwd,
+        &[
+            ("KLON_CONFIG_HOME", home.as_os_str()),
+            ("HOME", home.as_os_str()),
+        ],
+        args,
+    )
 }
 
 /// The first token of `sha256sum <file>`.

@@ -1,8 +1,12 @@
 //! Shared test harness (spec §7 C1): a deterministic fixture generator, a manifest
 //! walker, and a plain `git worktree add` oracle. Every test file starts with
 //! `mod common;` and reuses these helpers instead of private copies.
+// Every integration-test target includes this module and uses a different
+// subset of the helpers, so the unused ones are fine here.
+#![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -45,17 +49,31 @@ pub fn git_ok(cwd: &Path, args: &[&str]) -> String {
 }
 
 pub fn klon(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+    klon_env(cwd, &[], args)
+}
+
+/// Run `gh-klon <args>` in `cwd` with extra environment variables. The git
+/// config stays isolated. Tests that need an isolated `HOME` or config
+/// directory use this.
+pub fn klon_env(cwd: &Path, envs: &[(&str, &OsStr)], args: &[&str]) -> Output {
+    let mut command = Command::new(BIN);
+    command
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("run gh-klon")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.output().expect("run gh-klon")
 }
 
 pub fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+pub fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 // --- Deterministic content ---------------------------------------------------
