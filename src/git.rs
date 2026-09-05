@@ -13,7 +13,7 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
         .output()
         .map_err(Error::io("run git"))?;
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
     } else {
         Err(Error::Git {
             code: output.status.code().unwrap_or(1),
@@ -62,11 +62,11 @@ pub fn common_dir(cwd: &Path) -> Result<PathBuf> {
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
-    Ok(PathBuf::from(out.trim_end()))
+    Ok(PathBuf::from(out.strip_suffix('\n').unwrap_or(&out)))
 }
 
 /// True when `refs/heads/<branch>` exists.
 pub fn local_branch_exists(cwd: &Path, branch: &str) -> bool {
     let rev = format!("refs/heads/{branch}");
-    run(cwd, &["rev-parse", "--verify", "--quiet", &rev]).is_ok()
+    run(cwd, &["show-ref", "--verify", "--quiet", &rev]).is_ok()
 }

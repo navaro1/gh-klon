@@ -4,38 +4,36 @@ use std::path::{Component, Path, PathBuf};
 
 /// Make `path` absolute and resolve symlinks in the deepest ancestor that exists.
 /// The tail that does not exist yet is appended unchanged. `..` and `.` are folded.
-pub fn absolute(path: &Path) -> PathBuf {
+pub fn absolute(path: &Path) -> crate::Result<PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        std::env::current_dir()
+            .map_err(crate::Error::io("read the current directory"))?
+            .join(path)
     };
-    let mut normalized = PathBuf::new();
+    let mut resolved = PathBuf::new();
     for component in joined.components() {
         match component {
             Component::ParentDir => {
-                normalized.pop();
+                resolved.pop();
             }
             Component::CurDir => {}
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    let mut existing = normalized.as_path();
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    while !existing.exists() {
-        match (existing.parent(), existing.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name);
-                existing = parent;
+            other => {
+                resolved.push(other.as_os_str());
+                match std::fs::canonicalize(&resolved) {
+                    Ok(path) => resolved = path,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(crate::Error::io(format!("resolve {}", resolved.display()))(
+                            err,
+                        ))
+                    }
+                }
             }
-            _ => return normalized,
         }
     }
-    let mut out = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
-    for name in tail.iter().rev() {
-        out.push(name);
-    }
-    out
+    Ok(resolved)
 }
 
 /// The default klon path: `../<repo>.wt/<branch>` next to golden.

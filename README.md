@@ -34,7 +34,13 @@ gh klon add feature --path /some/empty/dir
 4. Copies golden's index and sets `core.checkStat=minimal`, `core.untrackedCache=true`, and `index.version=4` in the shared config.
 5. Runs `git checkout -q --force <branch>` and `git clean -fdq`, then unlocks the worktree.
 
-A failure after step 2 removes the registered worktree and prints the git error.
+The copy preserves read-only directories. If Git uses a split index, the copy includes its shared index file.
+A failure after step 2 removes the registered worktree and prints the original error.
+If cleanup fails, the command also prints the cleanup error.
+
+Repository and destination paths must use UTF-8, a text encoding. They cannot contain newline characters.
+Git 2.34 does not provide an unambiguous list format for paths with newline characters.
+The destination cannot be inside the Git common directory, which holds shared repository data.
 
 ## Known blind spot
 

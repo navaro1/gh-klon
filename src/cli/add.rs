@@ -20,17 +20,26 @@ const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
 
 pub fn run(args: Args) -> Result<()> {
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    let common = git::common_dir(&cwd)?;
+    check_git_path(&common)?;
     let worktrees = git::worktree_list(&cwd)?;
     let golden = worktrees
         .first()
         .map(|w| paths::absolute(&w.path))
-        .ok_or_else(|| Error::klon("not inside a git repository"))?;
-    let common = git::common_dir(&cwd)?;
-
+        .ok_or_else(|| Error::klon("not inside a git repository"))??;
     let path = match &args.path {
-        Some(p) => paths::absolute(p),
-        None => paths::default_klon_path(&golden, &args.branch),
+        Some(p) => paths::absolute(p)?,
+        None => paths::absolute(&paths::default_klon_path(&golden, &args.branch))?,
     };
+    // Refuse unsupported paths before any repository mutation.
+    for p in [&golden, &common, &path] {
+        check_git_path(p)?;
+    }
+    if path.starts_with(&common) {
+        return Err(Error::klon(
+            "the destination is inside the git common directory",
+        ));
+    }
     check_path(&golden, &path)?;
     check_branch(&golden, &worktrees, &args.branch)?;
 
@@ -50,12 +59,27 @@ pub fn run(args: Args) -> Result<()> {
     if result.is_err() {
         // Step 11: leave no half-registered worktree, then report the original error.
         let p = path.to_str().unwrap_or_default();
+        if let Err(err) = copy::make_removable(&path) {
+            eprintln!("klon: cleanup: {err}");
+        }
         git::run_quiet(&golden, &["worktree", "unlock", p]);
-        git::run_quiet(&golden, &["worktree", "remove", "--force", p]);
+        if let Err(err) = git::run(&golden, &["worktree", "remove", "--force", p]) {
+            eprintln!("klon: cleanup: {err}");
+        }
     }
     result?;
     println!("{}", path.display());
     Ok(())
+}
+
+/// Git 2.34 has no NUL-delimited worktree list; reject ambiguous path names.
+fn check_git_path(path: &Path) -> Result<()> {
+    match path.to_str() {
+        Some(text) if !text.contains(['\n', '\r']) => Ok(()),
+        _ => Err(Error::klon(
+            "repository and destination paths must be valid UTF-8 without newlines",
+        )),
+    }
 }
 
 /// Step 1: refuse a non-empty path and a path inside golden outside the allowed places.
@@ -109,6 +133,8 @@ fn fill(
     let others = worktrees
         .iter()
         .map(|w| paths::absolute(&w.path))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .filter(|p| p != golden);
     let exclude = copy::Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
     copy::clone_tree(golden, path, &exclude)?;
@@ -123,6 +149,19 @@ fn fill(
     // Step 6: golden's index with a fresh mtime. `--no-checkout` wrote no index.
     let index = admin_dir.join("index");
     fs::copy(common.join("index"), &index).map_err(Error::io("copy the index"))?;
+    // A split index refers to a shared file beside the original index.
+    let shared = git::run(
+        golden,
+        &["rev-parse", "--path-format=absolute", "--shared-index-path"],
+    )?;
+    let shared = shared.strip_suffix('\n').unwrap_or(&shared);
+    if !shared.is_empty() {
+        let shared = Path::new(shared);
+        let name = shared
+            .file_name()
+            .ok_or_else(|| Error::klon("invalid shared index path"))?;
+        fs::copy(shared, admin_dir.join(name)).map_err(Error::io("copy the shared index"))?;
+    }
     fs::File::open(&index)
         .and_then(|f| f.set_modified(SystemTime::now()))
         .map_err(Error::io("touch the index"))?;
@@ -149,25 +188,31 @@ fn fill(
 /// Read `<path>/.git` and return `<common>/worktrees/<name>`.
 fn read_admin_dir(path: &Path) -> Result<PathBuf> {
     let text = fs::read_to_string(path.join(".git")).map_err(Error::io("read .git"))?;
-    text.trim()
-        .strip_prefix("gitdir:")
-        .map(|p| PathBuf::from(p.trim()))
+    text.strip_suffix('\n')
+        .unwrap_or(&text)
+        .strip_prefix("gitdir: ")
+        .map(PathBuf::from)
         .ok_or_else(|| Error::klon(format!("unexpected .git file in {}", path.display())))
 }
 
 /// Step 3: append `/.klon/` to `<common>/info/exclude` once.
 fn exclude_klon_dir(common: &Path) -> Result<()> {
     let file = common.join("info").join("exclude");
-    let current = fs::read_to_string(&file).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == "/.klon/") {
+    let mut current = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(Error::io("read info/exclude")(err)),
+    };
+    if current
+        .split(|b| *b == b'\n')
+        .any(|line| line == b"/.klon/" || line == b"/.klon/\r")
+    {
         return Ok(());
     }
     fs::create_dir_all(common.join("info")).map_err(Error::io("create info/"))?;
-    let newline = if current.is_empty() || current.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    fs::write(&file, format!("{current}{newline}/.klon/\n"))
-        .map_err(Error::io("write info/exclude"))
+    if !current.is_empty() && !current.ends_with(b"\n") {
+        current.push(b'\n');
+    }
+    current.extend_from_slice(b"/.klon/\n");
+    fs::write(&file, current).map_err(Error::io("write info/exclude"))
 }

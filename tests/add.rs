@@ -387,3 +387,179 @@ fn version_prints_the_crate_version() {
         format!("gh-klon {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn add_copies_read_only_ignored_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::generate(50, 5, 5);
+    let cache = fx.golden.join("build/cache");
+    fs::create_dir(&cache).unwrap();
+    fs::write(cache.join("artifact"), "cached output").unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = klon(&fx.golden, &["add", "feature"]);
+    // Restore permissions even if the assertion fails, so the fixture can be removed.
+    let actual = if out.status.success() {
+        Some(manifest(&fx.default_klon_path().join("build")))
+    } else {
+        None
+    };
+    let expected = manifest(&fx.golden.join("build"));
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+    if let Some(actual) = actual {
+        fs::set_permissions(
+            fx.default_klon_path().join("build/cache"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+}
+
+#[test]
+fn add_refuses_revision_expressions() {
+    let fx = Fixture::generate(50, 5, 5);
+    let before = git_ok(&fx.golden, &["worktree", "list", "--porcelain"]);
+    let out = klon(&fx.golden, &["add", "feature~0"]);
+    assert!(
+        !out.status.success(),
+        "a revision expression is not a branch"
+    );
+    assert!(stderr(&out).contains("branch not found"));
+    assert_eq!(
+        git_ok(&fx.golden, &["worktree", "list", "--porcelain"]),
+        before
+    );
+}
+
+#[test]
+fn add_refuses_a_golden_path_with_a_newline_before_registration() {
+    let fx = Fixture::generate(50, 5, 5);
+    let renamed = fx.golden.with_file_name("golden\nname");
+    fs::rename(&fx.golden, &renamed).unwrap();
+    let destination = renamed.parent().unwrap().join("copy");
+    let out = klon(
+        &renamed,
+        &["add", "feature", "--path", destination.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("without newlines"));
+    assert!(!destination.exists());
+    assert!(!renamed.join(".git/worktrees").exists());
+}
+
+#[test]
+fn add_resolves_symlinks_before_parent_components() {
+    let fx = Fixture::generate(50, 5, 5);
+    let parent = fx.golden.parent().unwrap();
+    fs::create_dir(fx.golden.join("sub")).unwrap();
+    std::os::unix::fs::symlink(fx.golden.join("sub"), parent.join("alias")).unwrap();
+    let path = parent.join("alias/../escape");
+    let out = klon(
+        &fx.golden,
+        &["add", "feature", "--path", path.to_str().unwrap()],
+    );
+    assert!(
+        !out.status.success(),
+        "the actual destination is inside golden"
+    );
+    assert!(stderr(&out).contains("inside the repository"));
+    assert!(!parent.join("escape").exists());
+    assert!(!fx.golden.join("escape").exists());
+}
+
+#[test]
+fn add_does_not_reuse_staged_deletions_as_untracked_files() {
+    let fx = Fixture::generate(200, 10, 20);
+    git_ok(&fx.golden, &["rm", "--cached", "d001/f1.txt"]);
+    fs::write(fx.golden.join("d001/f1.txt"), "dirty replacement").unwrap();
+    let before = git_ok(&fx.golden, &["status", "--porcelain"]);
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_clean(&fx.default_klon_path());
+    assert_eq!(
+        fs::read_to_string(fx.default_klon_path().join("d001/f1.txt")).unwrap(),
+        "tracked file 1\n"
+    );
+    assert_eq!(git_ok(&fx.golden, &["status", "--porcelain"]), before);
+}
+
+#[test]
+fn add_uses_the_branch_when_a_tag_has_the_same_name() {
+    let fx = Fixture::generate(50, 5, 5);
+    git_ok(&fx.golden, &["tag", "feature", "main"]);
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(
+        git_ok(&fx.default_klon_path(), &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/feature"
+    );
+    assert_eq!(
+        git_ok(&fx.default_klon_path(), &["rev-parse", "HEAD"]),
+        git_ok(&fx.golden, &["rev-parse", "refs/heads/feature"])
+    );
+}
+
+#[test]
+fn add_with_a_split_index() {
+    let fx = Fixture::generate(50, 5, 5);
+    git_ok(&fx.golden, &["update-index", "--split-index"]);
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_clean(&fx.default_klon_path());
+}
+
+#[test]
+fn failed_fill_removes_read_only_copied_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::generate(50, 5, 5);
+    let cache = fx.golden.join("build/cache");
+    fs::create_dir(&cache).unwrap();
+    fs::write(cache.join("artifact"), "cached output").unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::remove_file(fx.golden.join(".git/index")).unwrap();
+    let before = git_ok(&fx.golden, &["worktree", "list", "--porcelain"]);
+    let out = klon(&fx.golden, &["add", "feature"]);
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("copy the index"));
+    assert_eq!(
+        git_ok(&fx.golden, &["worktree", "list", "--porcelain"]),
+        before
+    );
+    assert!(!fx.default_klon_path().exists());
+}
+
+#[test]
+fn add_preserves_non_utf8_exclude_patterns() {
+    let fx = Fixture::generate(50, 5, 5);
+    let exclude = fx.golden.join(".git/info/exclude");
+    fs::write(&exclude, b"/local-\xff").unwrap();
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(fs::read(exclude).unwrap(), b"/local-\xff\n/.klon/\n");
+}
+
+#[test]
+fn add_checks_a_default_path_through_a_symlink() {
+    let fx = Fixture::generate(50, 5, 5);
+    std::os::unix::fs::symlink(&fx.golden, fx.golden.parent().unwrap().join("golden.wt")).unwrap();
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("inside the repository"));
+    assert!(!fx.golden.join("feature").exists());
+}
+
+#[test]
+fn add_refuses_the_git_common_directory_even_if_ignored() {
+    let fx = Fixture::generate(50, 5, 5);
+    fs::write(fx.golden.join(".klonignore"), "/.git/\n").unwrap();
+    let destination = fx.golden.join(".git/copy");
+    let out = klon(
+        &fx.golden,
+        &["add", "feature", "--path", destination.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("inside the git common directory"));
+    assert!(!destination.exists());
+}

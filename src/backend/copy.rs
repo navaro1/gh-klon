@@ -80,10 +80,11 @@ fn copy_children(src: &Path, dst: &Path, exclude: &Exclusions) -> Result<()> {
             set_symlink_times(&to, &meta)?;
         } else if kind.is_dir() {
             fs::create_dir(&to).map_err(Error::io(format!("mkdir {}", to.display())))?;
-            fs::set_permissions(&to, meta.permissions())
-                .map_err(Error::io(format!("chmod {}", to.display())))?;
+            // Keep the new directory writable until its children are complete.
             copy_children(&from, &to, exclude)?;
             set_times(&to, &meta)?;
+            fs::set_permissions(&to, meta.permissions())
+                .map_err(Error::io(format!("chmod {}", to.display())))?;
         } else if kind.is_file() {
             fs::copy(&from, &to).map_err(Error::io(format!("copy {}", from.display())))?;
             set_times(&to, &meta)?;
@@ -137,6 +138,26 @@ fn set_symlink_times(path: &Path, meta: &fs::Metadata) -> Result<()> {
         return Err(Error::io(format!("set symlink mtime {}", path.display()))(
             std::io::Error::last_os_error(),
         ));
+    }
+    Ok(())
+}
+
+/// Restore owner access only in the newly copied tree so rollback can delete it.
+/// Do not follow symlinks: their targets may belong to golden or another tree.
+pub fn make_removable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(path).map_err(Error::io("stat the failed copy"))?;
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
+    )
+    .map_err(Error::io("restore directory access for cleanup"))?;
+    for entry in fs::read_dir(path).map_err(Error::io("read the failed copy"))? {
+        let entry = entry.map_err(Error::io("read the failed copy"))?;
+        make_removable(&entry.path())?;
     }
     Ok(())
 }
