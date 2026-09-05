@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod git;
 mod paths;
+mod process;
 
 use clap::{Parser, Subcommand};
 use std::fmt;
@@ -70,6 +71,12 @@ enum Command {
     Add(cli::add::Args),
     /// Run the approved `[warm] steps` in golden.
     Up,
+    /// Remove a klon: rename it to .trash and delete it in the background.
+    Rm(cli::rm::Args),
+    /// Drop stale worktree admin entries and drain the .trash directory.
+    Prune,
+    /// List every klon with its branch, HEAD, and a dirty flag.
+    List,
 }
 
 fn main() -> ExitCode {
@@ -77,6 +84,9 @@ fn main() -> ExitCode {
     let result = match command {
         Command::Add(args) => cli::add::run(args),
         Command::Up => cli::up::run(yes),
+        Command::Rm(args) => cli::rm::run(args),
+        Command::Prune => cli::prune::run(),
+        Command::List => cli::list::run(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
