@@ -21,6 +21,8 @@ enum Ty {
     Arr,
     /// A string that is null when the value does not apply.
     StrOrNull,
+    /// A number that is null when the value does not apply.
+    NumOrNull,
 }
 
 type Fields = &'static [(&'static str, Ty)];
@@ -42,6 +44,10 @@ const LIST_ROW: Fields = &[
     ("head", Ty::Str),
     ("dirty", Ty::Bool),
     ("locked", Ty::Bool),
+    // The C24 radar. `behind` is null when klon could not measure the klon.
+    ("vs_base", Ty::Str),
+    ("vs_siblings", Ty::Str),
+    ("behind", Ty::NumOrNull),
 ];
 
 const RM: Fields = &[
@@ -89,6 +95,7 @@ fn matches(value: &Value, ty: Ty) -> bool {
         Ty::Obj => value.is_object(),
         Ty::Arr => value.is_array(),
         Ty::StrOrNull => value.is_string() || value.is_null(),
+        Ty::NumOrNull => value.is_number() || value.is_null(),
     }
 }
 
@@ -262,8 +269,38 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "vs_base": "clean",
+        "vs_siblings": "clean",
+        "behind": 0,
     });
     check_ok(&row, LIST_ROW);
+
+    // The radar reports a null `behind` for a klon it could not measure, and a
+    // string in the other two columns whatever happened.
+    let unmeasured = json!({
+        "path": "/tmp/x",
+        "branch": "feature",
+        "head": "0f0f",
+        "dirty": false,
+        "locked": false,
+        "vs_base": "-",
+        "vs_siblings": "-",
+        "behind": Value::Null,
+    });
+    check_ok(&unmeasured, LIST_ROW);
+
+    let bad_behind = json!({
+        "path": "/tmp/x",
+        "branch": "feature",
+        "head": "0f0f",
+        "dirty": false,
+        "locked": false,
+        "vs_base": Value::Null,
+        "vs_siblings": "clean",
+        "behind": 0,
+    });
+    let why = check(&bad_behind, LIST_ROW).expect_err("a null vs_base must fail");
+    assert!(why.contains("vs_base"), "unexpected reason: {why}");
 
     let bad = json!({
         "path": Value::Null,
@@ -271,6 +308,9 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "vs_base": "clean",
+        "vs_siblings": "clean",
+        "behind": 0,
     });
     let why = check(&bad, LIST_ROW).expect_err("a null path must fail");
     assert!(why.contains("path"), "unexpected reason: {why}");

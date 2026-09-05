@@ -39,22 +39,25 @@ fn list_shows_every_klon_with_a_dirty_flag() {
     let out = klon(&fx.golden, &["list"]);
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     let feature = fx.default_klon_path();
-    let other = fx.golden.parent().unwrap().join("golden.wt").join("other");
+    let other = fx.klon_path("other");
     let head = |path: &Path| {
         git_ok(path, &["rev-parse", "--short", "HEAD"])
             .trim()
             .to_string()
     };
+    // C24 appends the three radar columns after the existing ones. Neither klon
+    // touches a file the other touches, so both read `clean`.
+    const RADAR: &str = "| clean | clean | behind 0";
     assert_eq!(
         stdout(&out).trim(),
         format!(
-            "{} feature {}\n{} other {}",
+            "{} feature {} {RADAR}\n{} other {} {RADAR}",
             feature.display(),
             head(&feature),
             other.display(),
             head(&other)
         ),
-        "one line per klon: path, branch, short HEAD"
+        "one line per klon: path, branch, short HEAD, then the radar columns"
     );
 
     // A modified file puts a `*` on that klon's line and on no other.
@@ -64,7 +67,7 @@ fn list_shows_every_klon_with_a_dirty_flag() {
     assert_eq!(
         stdout(&out).trim(),
         format!(
-            "{} feature {} *\n{} other {}",
+            "{} feature {} * {RADAR}\n{} other {} {RADAR}",
             feature.display(),
             head(&feature),
             other.display(),

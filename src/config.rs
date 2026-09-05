@@ -57,8 +57,7 @@ pub struct Hardlink {
 /// The whole `.klon.toml`. Every key is optional (handoff §3).
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
-    /// The golden branch. Read by the branch-forms chunk.
-    #[allow(dead_code)]
+    /// The golden branch. The radar measures every klon against it.
     pub base: Option<String>,
     /// The path template for new klons.
     pub path: Option<String>,
@@ -344,7 +343,8 @@ fn write_approvals(approvals: &Approvals) -> Result<()> {
     fs::write(&file, text).map_err(Error::io(format!("write {}", file.display())))
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Lower-case hexadecimal. The config hash and the radar cache key share it.
+pub fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));

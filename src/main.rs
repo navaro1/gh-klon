@@ -8,6 +8,7 @@ mod journal;
 mod paths;
 mod probe;
 mod process;
+mod radar;
 mod repair;
 mod time;
 
@@ -83,10 +84,12 @@ enum Command {
     Rm(cli::rm::Args),
     /// Drop stale worktree admin entries and drain the .trash directory.
     Prune,
-    /// List every klon with its branch, HEAD, and a dirty flag.
+    /// List every klon with its branch, HEAD, a dirty flag, and the radar columns.
     List,
     /// Report the host features and the open journal entries.
     Doctor(cli::doctor::Args),
+    /// Bring a klon up to date. C24 ships the `--check` dry run only.
+    Sync(cli::sync::Args),
 }
 
 fn main() -> ExitCode {
@@ -108,6 +111,7 @@ fn main() -> ExitCode {
         Command::Prune => cli::prune::run(),
         Command::List => cli::list::run(json),
         Command::Doctor(args) => cli::doctor::run(args, json),
+        Command::Sync(args) => cli::sync::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

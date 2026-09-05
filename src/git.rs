@@ -1,8 +1,9 @@
 //! Subprocess wrapper around the installed `git`. klon never reimplements plumbing.
 
 use crate::{Error, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Run `git -C <cwd> <args>` and return its stdout. A non-zero exit becomes `Error::Git`.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -22,6 +23,42 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Run `git -C <cwd> <args>` with `input` on stdin and return the exit code and the
+/// raw stdout. An exit code outside `ok` becomes `Error::Git`.
+///
+/// The radar needs all three parts: raw bytes because `merge-tree` prints file
+/// content that is not always UTF-8, `-z` output that is NUL separated, and exit
+/// code 1 because that is how `merge-tree --write-tree` reports a conflict.
+pub fn run_input(cwd: &Path, args: &[&str], input: &[u8], ok: &[i32]) -> Result<(i32, Vec<u8>)> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(Error::io("run git"))?;
+    // Write stdin from a second thread. git can fill the stdout pipe while klon
+    // still writes, and a single-threaded write-then-read would deadlock there.
+    let mut sink = child.stdin.take().expect("stdin is piped");
+    let payload = input.to_vec();
+    let writer = std::thread::spawn(move || sink.write_all(&payload));
+    let output = child
+        .wait_with_output()
+        .map_err(Error::io("read the git output"))?;
+    let _ = writer.join();
+    let code = output.status.code().unwrap_or(1);
+    if ok.contains(&code) {
+        Ok((code, output.stdout))
+    } else {
+        Err(Error::Git {
+            code,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 /// Run `git` and ignore the result. Used on the cleanup path only.
 pub fn run_quiet(cwd: &Path, args: &[&str]) {
     let _ = run(cwd, args);
@@ -33,6 +70,8 @@ pub struct Worktree {
     pub path: PathBuf,
     /// `refs/heads/<name>` when the worktree has a branch checked out.
     pub branch: Option<String>,
+    /// The full object id of HEAD. Absent while the worktree has no commit.
+    pub head: Option<String>,
     /// True when the entry is locked (`locked` or `locked <reason>`).
     pub locked: bool,
 }
@@ -44,12 +83,15 @@ pub fn worktree_list(cwd: &Path) -> Result<Vec<Worktree>> {
     for block in text.split("\n\n") {
         let mut path = None;
         let mut branch = None;
+        let mut head = None;
         let mut locked = false;
         for line in block.lines() {
             if let Some(p) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(p));
             } else if let Some(b) = line.strip_prefix("branch ") {
                 branch = Some(b.to_string());
+            } else if let Some(h) = line.strip_prefix("HEAD ") {
+                head = Some(h.to_string());
             } else if line == "locked" || line.starts_with("locked ") {
                 locked = true;
             }
@@ -58,6 +100,7 @@ pub fn worktree_list(cwd: &Path) -> Result<Vec<Worktree>> {
             list.push(Worktree {
                 path,
                 branch,
+                head,
                 locked,
             });
         }

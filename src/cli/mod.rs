@@ -5,4 +5,5 @@ pub mod doctor;
 pub mod list;
 pub mod prune;
 pub mod rm;
+pub mod sync;
 pub mod up;

@@ -3,7 +3,7 @@
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
 use crate::journal::{self, Entry, Op, State};
-use crate::{git, probe, repair, time, Error, Result};
+use crate::{git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,7 +31,7 @@ pub struct Host<'a> {
 type Probe = fn(&Host) -> probe::Status;
 
 /// The `doctor` rows. C5 adds `backend`, C18 the fence ABI, C20 the cgroup
-/// delegation, C17 the jobserver, and C24 the radar form. Each is one line.
+/// delegation, and C17 the jobserver. Each is one line.
 const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("inotify.max_user_instances", inotify_instances),
@@ -39,6 +39,7 @@ const FEATURES: &[(&str, Probe)] = &[
     ("make", make_version),
     ("ninja", ninja_version),
     ("pasta", pasta_version),
+    ("radar", radar_form),
 ];
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -274,6 +275,13 @@ fn ninja_version(_host: &Host) -> probe::Status {
 
 fn pasta_version(_host: &Host) -> probe::Status {
     probe::version_of("pasta", &["--version"])
+}
+
+/// Which `merge-tree` form the conflict radar uses (C24). Both forms work, so
+/// the row is always present and the detail names the one in use: `merge-tree
+/// --write-tree` on git 2.38 and above, else `legacy merge-tree`.
+fn radar_form(host: &Host) -> probe::Status {
+    probe::Status::Present(radar::form(host.golden).name().to_string())
 }
 
 /// The filesystem of golden, from the `statfs` magic on Linux and from

@@ -1,8 +1,10 @@
-//! `gh klon list`: one line per klon with path, branch, short HEAD, and a
-//! dirty flag: `<path> <branch> <head>[ *]`. The main worktree is not a klon
-//! and never appears. `--json` prints the same rows with the full HEAD.
+//! `gh klon list`: one line per klon with path, branch, short HEAD, a dirty flag,
+//! and the three C24 radar columns: `<path> <branch> <head>[ *] | <vs-base> |
+//! <vs-siblings> | behind <n>`. The main worktree is not a klon and never appears.
+//! `--json` prints the same rows with the full HEAD.
 
 use crate::paths;
+use crate::radar;
 use crate::{git, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -17,7 +19,8 @@ struct Report {
     klons: Vec<Row>,
 }
 
-/// One klon. `branch` is null for a klon with a detached HEAD.
+/// One klon. `branch` is null for a klon with a detached HEAD. The radar fields
+/// `vs_base`, `vs_siblings`, and `behind` sit beside the others in the document.
 #[derive(Serialize)]
 struct Row {
     path: PathBuf,
@@ -25,13 +28,24 @@ struct Row {
     head: String,
     dirty: bool,
     locked: bool,
+    #[serde(flatten)]
+    radar: radar::Row,
 }
 
 pub fn run(json: bool) -> Result<()> {
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     let worktrees = git::worktree_list(&cwd)?;
+    let golden = paths::absolute(
+        &worktrees
+            .first()
+            .ok_or_else(|| Error::klon("not inside a git repository"))?
+            .path,
+    )?;
+    let common = git::common_dir(&cwd)?;
+    let targets = radar::targets(&worktrees);
+    let radar_rows = radar::scan(&golden, &common, &targets);
     let mut rows = Vec::new();
-    for worktree in worktrees.iter().skip(1) {
+    for (worktree, radar) in worktrees.iter().skip(1).zip(radar_rows) {
         let path = paths::absolute(&worktree.path)?;
         let branch = worktree
             .branch
@@ -44,6 +58,7 @@ pub fn run(json: bool) -> Result<()> {
             branch,
             locked: worktree.locked,
             path,
+            radar,
         });
     }
     if json {
@@ -60,7 +75,12 @@ pub fn run(json: bool) -> Result<()> {
         for row in &rows {
             let branch = row.branch.as_deref().unwrap_or("(detached)");
             let flag = if row.dirty { " *" } else { "" };
-            println!("{} {branch} {}{flag}", row.path.display(), row.head);
+            println!(
+                "{} {branch} {}{flag} {}",
+                row.path.display(),
+                row.head,
+                row.radar.columns()
+            );
         }
     }
     Ok(())
