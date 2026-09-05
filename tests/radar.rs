@@ -387,26 +387,32 @@ fn a_second_list_with_unchanged_heads_makes_no_merge_tree_call() {
 
 #[test]
 fn sync_check_takes_only_the_pairs_that_reach_its_klon() {
-    // Four klons make six sibling pairs, but one klon sits in only three of them.
+    // Four klons make four base pairs and six sibling pairs. One klon sits in its
+    // own base pair and in three of the sibling pairs.
     let fx = Fixture::generate(SEED, 20, 4, 4, 0);
     for branch in ["one", "two", "three", "four"] {
         branch_with(&fx.golden, branch, &[("f2.txt", &format!("{branch}\n"))]);
         add_klon(&fx.golden, branch);
     }
-    let tmp = tempfile::tempdir().unwrap();
-    let log = tmp.path().join("git.log");
-    let bin = git_shim(tmp.path(), &log);
+    // Every computed pair leaves one cache file. Counting the files counts the
+    // pairs whichever merge-tree form the host offers, and the batch form on git
+    // 2.40 and above answers many pairs in a single process.
+    let radar_dir = fx.golden.join(".git").join("klon").join("radar");
+    let cached = || fs::read_dir(&radar_dir).map(Iterator::count).unwrap_or(0);
+    assert_eq!(cached(), 0, "the radar cache starts empty");
 
-    let focused = merge_tree_calls_of(&fx.golden, &bin, &log, &["sync", "one", "--check"]);
-    assert_eq!(
-        focused.len(),
-        4,
-        "one pair against base and one per sibling: {focused:?}"
+    let out = klon(&fx.golden, &["sync", "one", "--check"]);
+    assert!(
+        out.status.success(),
+        "sync --check failed: {}",
+        stderr(&out)
     );
-    // `list` needs every klon's row, so it takes all four base pairs and all six
-    // sibling pairs. The cache already holds the four that `sync --check` ran.
-    let full = merge_tree_calls(&fx.golden, &bin, &log);
-    assert_eq!(full.len(), 6, "the rest of the pairs: {full:?}");
+    assert_eq!(cached(), 4, "one pair against base and one per sibling");
+
+    // `list` needs every row, so it adds the three other base pairs and the three
+    // sibling pairs that leave `one` out.
+    let _ = list(&fx.golden);
+    assert_eq!(cached(), 10, "four base pairs and six sibling pairs");
 }
 
 // --- Speed ---------------------------------------------------------------------
