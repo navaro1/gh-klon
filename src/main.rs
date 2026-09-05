@@ -80,6 +80,7 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    let canary_unused_binding = 1;
     let Cli { yes, command } = Cli::parse();
     let result = match command {
         Command::Add(args) => cli::add::run(args),
