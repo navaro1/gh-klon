@@ -185,6 +185,44 @@ fn the_legacy_form_finds_the_same_conflict() {
 }
 
 #[test]
+fn a_klon_toml_klon_cannot_read_leaves_the_columns_empty() {
+    let fx = Fixture::generate(SEED, 20, 4, 4, 0);
+    branch_with(&fx.golden, "solo", &[("solo.txt", "solo\n")]);
+    add_klon(&fx.golden, "solo");
+    // A broken file must not silently fall back to golden's HEAD and call the
+    // result clean: the klon may measure against another base entirely.
+    fs::write(fx.golden.join(".klon.toml"), "base = [oops\n").unwrap();
+
+    let out = klon(&fx.golden, &["list"]);
+    assert!(out.status.success(), "list must still list the klons");
+    let (vs_base, vs_siblings, behind) = columns(&line_for(&stdout(&out), "solo"));
+    assert_eq!((vs_base.as_str(), behind.as_str()), ("-", "-"));
+    assert_eq!(vs_siblings, "-");
+    assert!(
+        stderr(&out).contains("the radar has no base"),
+        "the reason belongs on stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_klon_measures_against_the_base_from_klon_toml() {
+    let fx = Fixture::generate(SEED, 20, 4, 4, 0);
+    // `trunk` is the real base and it already edits the line the klon edits.
+    branch_with(&fx.golden, "trunk", &[("f2.txt", "trunk edit\n")]);
+    branch_with(&fx.golden, "solo", &[("f2.txt", "solo edit\n")]);
+    add_klon(&fx.golden, "solo");
+    fs::write(fx.golden.join(".klon.toml"), "base = \"trunk\"\n").unwrap();
+
+    let (vs_base, _, behind) = columns(&line_for(&list(&fx.golden), "solo"));
+    assert_eq!(
+        vs_base, "1 conflict",
+        "the radar reads `base` from .klon.toml"
+    );
+    assert_eq!(behind, "behind 1");
+}
+
+#[test]
 fn a_klon_that_conflicts_with_base_reports_the_count() {
     let fx = Fixture::generate(SEED, 20, 4, 4, 0);
     branch_with(&fx.golden, "left", &[("f2.txt", "left edit\n")]);
@@ -292,23 +330,24 @@ fn git_shim(dir: &Path, log: &Path) -> PathBuf {
     bin
 }
 
-/// Run `list` through the shim and return every logged `merge-tree` call.
-fn merge_tree_calls(golden: &Path, bin: &Path, log: &Path) -> Vec<String> {
+/// Run a klon command through the shim and return every logged `merge-tree` call.
+fn merge_tree_calls_of(golden: &Path, bin: &Path, log: &Path, args: &[&str]) -> Vec<String> {
     let _ = fs::remove_file(log);
     let path = std::env::var("PATH").unwrap_or_default();
     let joined = format!("{}:{path}", bin.display());
-    let out = klon_env(
-        golden,
-        &[("PATH", std::ffi::OsStr::new(&joined))],
-        &["list"],
-    );
-    assert!(out.status.success(), "list failed: {}", stderr(&out));
+    let out = klon_env(golden, &[("PATH", std::ffi::OsStr::new(&joined))], args);
+    assert!(out.status.success(), "{args:?} failed: {}", stderr(&out));
     fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
         .filter(|line| line.contains("merge-tree"))
         .map(str::to_string)
         .collect()
+}
+
+/// Run `list` through the shim and return every logged `merge-tree` call.
+fn merge_tree_calls(golden: &Path, bin: &Path, log: &Path) -> Vec<String> {
+    merge_tree_calls_of(golden, bin, log, &["list"])
 }
 
 #[test]
@@ -344,6 +383,30 @@ fn a_second_list_with_unchanged_heads_makes_no_merge_tree_call() {
         !third.is_empty(),
         "a moved HEAD must invalidate the cached pair"
     );
+}
+
+#[test]
+fn sync_check_takes_only_the_pairs_that_reach_its_klon() {
+    // Four klons make six sibling pairs, but one klon sits in only three of them.
+    let fx = Fixture::generate(SEED, 20, 4, 4, 0);
+    for branch in ["one", "two", "three", "four"] {
+        branch_with(&fx.golden, branch, &[("f2.txt", &format!("{branch}\n"))]);
+        add_klon(&fx.golden, branch);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("git.log");
+    let bin = git_shim(tmp.path(), &log);
+
+    let focused = merge_tree_calls_of(&fx.golden, &bin, &log, &["sync", "one", "--check"]);
+    assert_eq!(
+        focused.len(),
+        4,
+        "one pair against base and one per sibling: {focused:?}"
+    );
+    // `list` needs every klon's row, so it takes all four base pairs and all six
+    // sibling pairs. The cache already holds the four that `sync --check` ran.
+    let full = merge_tree_calls(&fx.golden, &bin, &log);
+    assert_eq!(full.len(), 6, "the rest of the pairs: {full:?}");
 }
 
 // --- Speed ---------------------------------------------------------------------

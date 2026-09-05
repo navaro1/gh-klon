@@ -165,8 +165,12 @@ pub fn targets(worktrees: &[git::Worktree]) -> Vec<Target> {
 
 /// The commit every klon measures against: `base` from `.klon.toml`, else the commit
 /// the main worktree has checked out.
+///
+/// A `.klon.toml` klon cannot read is an error, not an empty config. Falling back to
+/// golden's HEAD would measure every klon against the wrong commit and call the
+/// result `clean`, which is worse than saying nothing.
 fn base_oid(golden: &Path) -> Result<String> {
-    let named = config::load(golden).ok().and_then(|cfg| cfg.base);
+    let named = config::load(golden)?.base;
     let rev = match &named {
         Some(name) => format!("{name}^{{commit}}"),
         None => "HEAD^{commit}".to_string(),
@@ -181,24 +185,43 @@ fn base_oid(golden: &Path) -> Result<String> {
 
 // --- The scan -----------------------------------------------------------------
 
-/// The radar row of every target, in the same order.
+/// The radar row of every klon, in the same order as `targets`.
 ///
 /// klon never fails a command because the radar failed. A base it cannot resolve, a
 /// git that refuses the merge preview, or a cache it cannot write each cost one
 /// stderr line and leave a `-` in the affected column.
 pub fn scan(golden: &Path, common: &Path, targets: &[Target]) -> Vec<Row> {
+    scan_inner(golden, common, targets, None)
+}
+
+/// The radar row of one klon, for `sync --check`.
+pub fn scan_one(golden: &Path, common: &Path, targets: &[Target], which: usize) -> Row {
+    scan_inner(golden, common, targets, Some(which))
+        .into_iter()
+        .nth(which)
+        .unwrap_or_else(Row::unknown)
+}
+
+/// The scan behind both entry points. With a `focus`, klon builds only the pairs
+/// that reach that klon: its own pair against base and one pair per sibling. Every
+/// other row comes back unknown, which `scan_one` drops. `list` passes no focus and
+/// gets all of them. The difference matters on a cold cache, where a focused scan
+/// starts n pairs and a full one starts n squared over two.
+fn scan_inner(golden: &Path, common: &Path, targets: &[Target], focus: Option<usize>) -> Vec<Row> {
+    let mut rows = vec![Row::unknown(); targets.len()];
     if targets.is_empty() {
-        return Vec::new();
+        return rows;
     }
     let base = match base_oid(golden) {
         Ok(base) => base,
         Err(err) => {
             eprintln!("klon: the radar has no base: {err}; the columns show -");
-            return vec![Row::unknown(); targets.len()];
+            return rows;
         }
     };
     let form = form(golden);
     let dir = common.join("klon").join("radar");
+    let wanted = |target: usize| focus.is_none_or(|only| only == target);
 
     // A klon without a HEAD has no commit to merge. It keeps its place in the
     // output and takes no pair.
@@ -207,26 +230,33 @@ pub fn scan(golden: &Path, common: &Path, targets: &[Target]) -> Vec<Row> {
         .enumerate()
         .filter_map(|(i, t)| t.head.as_deref().map(|head| (i, head)))
         .collect();
-    let mut rows = vec![Row::unknown(); targets.len()];
 
-    // One request per pair: every klon against base, then every pair of klons.
-    let mut requests: Vec<Request> = heads
-        .iter()
-        .map(|(_, head)| Request::new(form, Kind::Base, &base, head))
-        .collect();
-    let mut sibling_index = Vec::new();
+    // One request per pair: each klon against base, then each pair of klons. The
+    // index of every request is recorded, so a skipped pair shifts nothing.
+    let mut requests: Vec<Request> = Vec::new();
+    let mut base_pairs: Vec<(usize, usize)> = Vec::new();
+    for (target, head) in &heads {
+        if wanted(*target) {
+            base_pairs.push((*target, requests.len()));
+            requests.push(Request::new(form, Kind::Base, &base, head));
+        }
+    }
+    let mut sibling_pairs: Vec<(usize, usize, usize)> = Vec::new();
     for a in 0..heads.len() {
         for b in (a + 1)..heads.len() {
-            sibling_index.push((a, b));
+            if !wanted(heads[a].0) && !wanted(heads[b].0) {
+                continue;
+            }
+            sibling_pairs.push((heads[a].0, heads[b].0, requests.len()));
             requests.push(Request::new(form, Kind::Sibling, heads[a].1, heads[b].1));
         }
     }
     resolve(golden, &dir, form, &mut requests);
 
     // The `behind` count travels with the vs-base entry, so the cache covers it too.
-    // Every column stands alone: one pair klon could not run leaves a `-` in its
-    // own column and nowhere else.
-    for (slot, (target, _)) in heads.iter().enumerate() {
+    // Every column stands alone: one pair klon could not run leaves a `-` in its own
+    // column and nowhere else.
+    for (target, slot) in base_pairs {
         let (vs_base, behind) = match &requests[slot].result {
             Some(result) if result.conflicts > 0 => {
                 (conflicts(result.conflicts), Some(result.behind))
@@ -237,7 +267,7 @@ pub fn scan(golden: &Path, common: &Path, targets: &[Target]) -> Vec<Row> {
             Some(result) => ("clean".to_string(), Some(result.behind)),
             None => ("-".to_string(), None),
         };
-        rows[*target] = Row {
+        rows[target] = Row {
             vs_base,
             vs_siblings: "clean".to_string(),
             behind,
@@ -245,9 +275,8 @@ pub fn scan(golden: &Path, common: &Path, targets: &[Target]) -> Vec<Row> {
     }
     // Each sibling pair reports into both of its klons.
     let mut against: Vec<Vec<(String, usize)>> = vec![Vec::new(); targets.len()];
-    for (pair, (a, b)) in sibling_index.iter().enumerate() {
-        let (left, right) = (heads[*a].0, heads[*b].0);
-        let count = match &requests[heads.len() + pair].result {
+    for (left, right, slot) in sibling_pairs {
+        let count = match &requests[slot].result {
             Some(result) if result.conflicts > 0 => result.conflicts,
             Some(_) => continue,
             None => {
@@ -272,14 +301,6 @@ pub fn scan(golden: &Path, common: &Path, targets: &[Target]) -> Vec<Row> {
             .join(", ");
     }
     rows
-}
-
-/// The radar row of one klon, for `sync --check`.
-pub fn scan_one(golden: &Path, common: &Path, targets: &[Target], which: usize) -> Row {
-    scan(golden, common, targets)
-        .into_iter()
-        .nth(which)
-        .unwrap_or_else(Row::unknown)
 }
 
 // --- Pair requests and the cache ----------------------------------------------
@@ -568,11 +589,14 @@ fn batch_write_tree(
     for index in missing {
         input.push_str(&format!("{} {}\n", requests[*index].a, requests[*index].b));
     }
+    // git documents `--stdin` as implying `-z`. klon passes `-z` anyway: the parser
+    // reads NUL records only, and the flag costs nothing if git already set it.
     let args = [
         "merge-tree",
         "--write-tree",
         "--name-only",
         "--no-messages",
+        "-z",
         "--stdin",
     ];
     // `--stdin` exits 0 for a clean and for a conflicted merge alike.
@@ -654,12 +678,19 @@ struct LegacySection<'a> {
 /// Indented `  <side> <mode> <oid> <path>` lines follow, then a unified diff of the
 /// merged content. klon calls a section a conflict when one of three things holds:
 ///
-/// * the diff adds a `<<<<<<<` line and a `>>>>>>>` line, the markers git writes into
-///   a text merge it could not finish;
+/// * the diff adds a `<<<<<<< .our` line and a `>>>>>>> .their` line, the markers git
+///   writes into a text merge it could not finish;
 /// * both sides changed the file, they disagree, and git printed no diff at all,
 ///   which is what a binary file gives (git also warns on stderr);
 /// * one side deleted the file while the other changed it, which a real merge reports
 ///   as a modify/delete conflict but this form resolves silently.
+///
+/// What this form cannot see: it does no rename detection, so a rename/rename or a
+/// rename/delete conflict reads here as an unrelated add and delete, and the radar
+/// calls it clean. `merge-tree --write-tree` on git 2.38 and above reports it. klon
+/// does not rebuild rename detection: rule 5 of the specification says klon shells to
+/// git and never reimplements plumbing, and asking git for it would double the
+/// process count that R23 budgets for the whole radar.
 fn parse_legacy(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     let mut section = LegacySection::default();
@@ -676,12 +707,24 @@ fn parse_legacy(text: &str) -> Vec<String> {
         } else if line.starts_with("@@ ") {
             section.hunk = true;
         } else if let Some(added) = line.strip_prefix('+') {
-            section.open_marker |= added.starts_with("<<<<<<<");
-            section.close_marker |= added.starts_with(">>>>>>>");
+            section.open_marker |= is_marker(added, '<', ".our");
+            section.close_marker |= is_marker(added, '>', ".their");
         }
     }
     flush_legacy(&section, &mut paths);
     paths
+}
+
+/// True when an added diff line is a conflict marker this form wrote: seven or more
+/// of `sign`, then the fixed label. The `conflict-marker-size` attribute changes the
+/// length but never the label, and demanding the label keeps a file that merged
+/// cleanly while carrying marker-shaped text out of the conflict count.
+fn is_marker(added: &str, sign: char, label: &str) -> bool {
+    let rest = added.trim_start_matches(sign);
+    added.len() - rest.len() >= 7
+        && rest
+            .strip_prefix(' ')
+            .is_some_and(|tail| tail.trim_end() == label)
 }
 
 /// Read `  base   100644 <oid> <path>`. git writes the side name left-padded and the
@@ -937,6 +980,36 @@ merged
 ";
         assert!(parse_legacy(text).is_empty());
         assert_eq!(parse_legacy(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn legacy_ignores_marker_shaped_text_that_git_did_not_write() {
+        // A file that documents conflict markers merges cleanly. git writes its own
+        // markers with a `.our` and a `.their` label, so the labels tell them apart.
+        let text = "\
+changed in both
+  base   100644 0ff3bbb9c8bba2291654cd64067fa417ff54c508 howto.md
+  our    100644 f5dc1abfb45014e3b9bc0c27b9ad8e711d42cc21 howto.md
+  their  100644 5d5d869e755cd2634b4d4cfaf1d64038cdfb77d5 howto.md
+@@ -1,2 +1,6 @@
+ A conflict looks like this:
++<<<<<<<
++one side
++=======
++>>>>>>>
+";
+        assert!(
+            parse_legacy(text).is_empty(),
+            "text without git's labels is not a conflict"
+        );
+        assert!(is_marker("<<<<<<< .our", '<', ".our"));
+        assert!(is_marker(">>>>>>>>>>> .their", '>', ".their"));
+        assert!(!is_marker("<<<<<<< .ours", '<', ".our"));
+        assert!(!is_marker("<<<<<< .our", '<', ".our"), "six is too few");
+        assert!(
+            !is_marker("<<<<<<<", '<', ".our"),
+            "a bare marker has no label"
+        );
     }
 
     // --- The modern parsers -------------------------------------------------
