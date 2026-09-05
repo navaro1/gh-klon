@@ -232,13 +232,6 @@ fn git_version() -> String {
 
 /// `btrfs-progs` on PATH, or under `$KLON_BTRFS_TOOLS` for a host that keeps it
 /// outside PATH.
-/// Which `merge-tree` form the conflict radar uses (C24). Both forms work, so
-/// the row is always present and the detail names the one in use: `merge-tree
-/// --write-tree` on git 2.38 and above, else `legacy merge-tree`.
-fn radar_form(host: &Host) -> probe::Status {
-    probe::Status::Present(radar::form(host.golden).name().to_string())
-}
-
 fn btrfs_progs(_host: &Host) -> probe::Status {
     if let Some(dir) = std::env::var_os("KLON_BTRFS_TOOLS") {
         let candidate = Path::new(&dir).join("btrfs");
@@ -282,6 +275,13 @@ fn ninja_version(_host: &Host) -> probe::Status {
 
 fn pasta_version(_host: &Host) -> probe::Status {
     probe::version_of("pasta", &["--version"])
+}
+
+/// Which `merge-tree` form the conflict radar uses (C24). Both forms work, so
+/// the row is always present and the detail names the one in use: `merge-tree
+/// --write-tree` on git 2.38 and above, else `legacy merge-tree`.
+fn radar_form(host: &Host) -> probe::Status {
+    probe::Status::Present(radar::form(host.golden).name().to_string())
 }
 
 /// The filesystem of golden, from the `statfs` magic on Linux and from
