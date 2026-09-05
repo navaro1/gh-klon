@@ -398,10 +398,42 @@ fn worktree_state(dir: &Path) -> WorktreeState {
     );
 }
 
+/// The tracked files of a worktree, from `git ls-files -z`.
+fn tracked_files(dir: &Path) -> Vec<PathBuf> {
+    let out = git_ok(dir, &["ls-files", "-z"]);
+    out.split('\0')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Assert that every tracked file holds the same bytes in both worktrees.
+/// `git status` can miss a same-size change while the cached mtime still
+/// matches, and `core.checkStat=minimal` narrows the stat check to size and
+/// whole seconds. This reads the bytes, so it cannot miss them.
+fn assert_same_tracked_bytes(klon: &Path, oracle: &Path) {
+    let left = tracked_files(klon);
+    let right = tracked_files(oracle);
+    assert_eq!(left, right, "the worktrees track different file sets");
+    for rel in &left {
+        let left_bytes = fs::read(klon.join(rel))
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", rel.display()));
+        let right_bytes = fs::read(oracle.join(rel))
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", rel.display()));
+        assert_eq!(
+            left_bytes,
+            right_bytes,
+            "tracked file {} must hold the same bytes in both worktrees",
+            rel.display()
+        );
+    }
+}
+
 /// Assert that two worktrees agree: the same `git worktree list --porcelain`
-/// shape, the same HEAD and branch, the same tracked tree hash, and two clean
-/// trees. The trees may live in two repositories built from the same seed.
-/// A one-byte difference between a worktree and its branch tree fails here.
+/// shape, the same HEAD and branch, the same tracked tree hash, byte-equal
+/// tracked files, and two clean trees. The trees may live in two repositories
+/// built from the same seed. A one-byte difference between a worktree and its
+/// branch tree fails here, even when git's stat cache would hide it.
 pub fn assert_worktree_parity(klon: &Path, oracle: &Path) {
     let left = worktree_state(klon);
     let right = worktree_state(oracle);
@@ -425,6 +457,7 @@ pub fn assert_worktree_parity(klon: &Path, oracle: &Path) {
         git_ok(oracle, &["rev-parse", "HEAD^{tree}"]),
         "tracked tree hash differs"
     );
+    assert_same_tracked_bytes(klon, oracle);
     for dir in [klon, oracle] {
         let status = git_ok(dir, &["status", "--porcelain"]);
         assert_eq!(status, "", "worktree {} must be clean", dir.display());

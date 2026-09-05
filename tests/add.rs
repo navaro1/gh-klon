@@ -516,7 +516,7 @@ fn add_matches_the_plain_git_oracle() {
 }
 
 #[test]
-#[should_panic(expected = "must be clean")]
+#[should_panic(expected = "must hold the same bytes")]
 fn parity_fails_on_a_one_byte_difference() {
     let klon_fx = Fixture::generate(11, 2_000, 50, 200, 20);
     let oracle_fx = Fixture::generate(11, 2_000, 50, 200, 20);
@@ -525,15 +525,12 @@ fn parity_fails_on_a_one_byte_difference() {
     let klon_path = klon_fx.default_klon_path();
     let oracle = oracle_fx.oracle_worktree_add("feature");
     // Flip one byte of a file that `feature` did not touch. The length stays.
+    // No mtime change: the parity helper reads the tracked bytes, so it fails
+    // even when `core.checkStat=minimal` would hide the change from git.
     let victim = klon_path.join(klon_fx.tracked_rel(3));
     let mut bytes = fs::read(&victim).unwrap();
     bytes[0] = bytes[0].wrapping_add(1);
     fs::write(&victim, &bytes).unwrap();
-    // checkStat=minimal compares size and whole seconds; move the mtime past the index.
-    fs::File::open(&victim)
-        .unwrap()
-        .set_modified(SystemTime::now() + Duration::from_secs(5))
-        .unwrap();
     assert_worktree_parity(&klon_path, &oracle);
 }
 
