@@ -83,6 +83,45 @@ pub fn common_dir(cwd: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out.strip_suffix('\n').unwrap_or(&out)))
 }
 
+/// The common directory of the repository whose main worktree is `golden`,
+/// without a subprocess where the layout allows one. `rm` must return inside
+/// 100 ms (R8), and one `git` process costs 10 to 50 ms while other builds run.
+///
+/// The main worktree holds either a `.git` directory, which is the common
+/// directory itself, or a `.git` file that names it. The file form comes from
+/// `git init --separate-git-dir` and from a submodule. Every other shape falls
+/// back to `git rev-parse`, so the answer is never a guess.
+pub fn common_dir_of_main(golden: &Path) -> Result<PathBuf> {
+    let dot_git = golden.join(".git");
+    match std::fs::symlink_metadata(&dot_git) {
+        Ok(meta) if meta.is_dir() => return Ok(dot_git),
+        Ok(meta) if meta.is_file() => {
+            if let Some(dir) = read_gitdir_file(&dot_git, golden) {
+                return Ok(dir);
+            }
+        }
+        _ => {}
+    }
+    common_dir(golden)
+}
+
+/// The path in a `gitdir: <path>` file, made absolute against `base`.
+fn read_gitdir_file(file: &Path, base: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let target = text
+        .trim_end_matches(['\n', '\r'])
+        .strip_prefix("gitdir: ")?;
+    if target.is_empty() {
+        return None;
+    }
+    let path = Path::new(target);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    })
+}
+
 /// True when git still lists `path` as a worktree of the repository at `cwd`.
 /// Both paths are made absolute first, so a symlinked parent still matches.
 pub fn is_registered(cwd: &Path, path: &Path) -> bool {

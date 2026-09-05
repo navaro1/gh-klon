@@ -41,7 +41,6 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         return Err(Error::klon("name a branch or a path with --path"));
     }
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
-    let common = git::common_dir(&cwd)?;
     let worktrees = git::worktree_list(&cwd)?;
     let golden = paths::absolute(
         &worktrees
@@ -49,6 +48,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             .ok_or_else(|| Error::klon("not inside a git repository"))?
             .path,
     )?;
+    // The journal lives under the common directory. `rm` derives it from
+    // golden instead of a second `git` process, because of the 100 ms budget.
+    let common = git::common_dir_of_main(&golden)?;
     let target = resolve(&worktrees, &golden, &args)?;
     let branch = worktrees
         .iter()

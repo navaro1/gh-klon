@@ -125,9 +125,14 @@ impl Record {
     }
 }
 
-/// `<common>/klon/journal`.
+/// `<common>/klon/journal`. The common directory is resolved first, so a caller
+/// that derived it from golden and one that asked `git rev-parse` always name
+/// the same directory. An unresolvable path is used unchanged.
 pub fn dir(common: &Path) -> PathBuf {
-    common.join("klon").join("journal")
+    crate::paths::absolute(common)
+        .unwrap_or_else(|_| common.to_path_buf())
+        .join("klon")
+        .join("journal")
 }
 
 /// The file stem for a klon path: the last component with every character

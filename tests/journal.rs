@@ -59,8 +59,13 @@ fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
 
 /// Start `gh-klon add feature` with the test-only pause at `state`.
 fn spawn_paused_add(golden: &Path, state: &str) -> Child {
+    spawn_paused(golden, state, &["add", "feature"])
+}
+
+/// Start `gh-klon <args>` with the test-only pause at `state`.
+fn spawn_paused(golden: &Path, state: &str, args: &[&str]) -> Child {
     Command::new(BIN)
-        .args(["add", "feature"])
+        .args(args)
         .current_dir(golden)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -68,7 +73,7 @@ fn spawn_paused_add(golden: &Path, state: &str) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("start gh-klon add")
+        .expect("start gh-klon")
 }
 
 fn sigkill(child: &Child) {
@@ -348,6 +353,73 @@ fn a_killed_rm_is_repaired() {
         wait_until(|| !victim.exists(), Duration::from_secs(30)),
         "the trash copy must be deleted in the background"
     );
+}
+
+/// `rm` derives the common directory from golden instead of asking `git` a
+/// second time, because one more process costs 10 to 50 ms of its 100 ms budget
+/// (R8). The derived directory must be the one `doctor` reads. Both layouts of
+/// the main worktree are checked: a `.git` directory and a `.git` file that
+/// names a repository directory elsewhere.
+#[test]
+fn rm_writes_its_entry_where_doctor_reads_it() {
+    for separate_git_dir in [false, true] {
+        let fx = Fixture::generate(SEED, 30, 3, 3, 2);
+        if separate_git_dir {
+            let elsewhere = fx.golden.parent().unwrap().join("repository");
+            fs::rename(fx.golden.join(".git"), &elsewhere).unwrap();
+            fs::write(
+                fx.golden.join(".git"),
+                format!("gitdir: {}\n", elsewhere.display()),
+            )
+            .unwrap();
+        }
+        let common = PathBuf::from(
+            git_ok(
+                &fx.golden,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .trim(),
+        );
+        let out = klon(&fx.golden, &["add", "feature"]);
+        assert!(out.status.success(), "add failed: {}", stderr(&out));
+
+        // Pause `rm` after it wrote `removing` and before the rename.
+        let mut child = spawn_paused(&fx.golden, "removing", &["rm", "feature"]);
+        let inbox = common.join("klon").join("journal");
+        let reached = wait_until(
+            || {
+                fs::read_dir(&inbox)
+                    .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(30),
+        );
+        sigkill(&child);
+        let _ = child.wait();
+        assert!(
+            reached,
+            "rm must write its entry under {} (separate git dir: {separate_git_dir})",
+            inbox.display()
+        );
+
+        // `doctor` reads the same directory, so it sees the entry and closes it.
+        let out = klon(&fx.golden, &["doctor", "--json"]);
+        assert!(out.status.success(), "doctor failed: {}", stderr(&out));
+        let report: Value = serde_json::from_str(&stdout(&out)).expect("one JSON document");
+        let rows = report["journal"].as_array().expect("an array");
+        assert_eq!(rows.len(), 1, "doctor must see the entry: {rows:?}");
+        assert_eq!(rows[0]["op"], "rm");
+        assert_eq!(rows[0]["state"], "removing");
+
+        let out = klon(&fx.golden, &["doctor", "--repair"]);
+        assert!(out.status.success(), "repair failed: {}", stderr(&out));
+        assert!(
+            !fs::read_dir(&inbox)
+                .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
+                .unwrap_or(false),
+            "the repair must close the entry"
+        );
+    }
 }
 
 /// `--json` is global, so clap accepts it everywhere. A command with no JSON
