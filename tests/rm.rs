@@ -346,3 +346,53 @@ fn prune_drops_a_stale_worktree_and_drains_the_trash() {
         "the trash directory must drain within 30 s"
     );
 }
+
+#[test]
+fn rm_deletes_the_trash_when_priority_tools_are_missing() {
+    // A PATH without setsid and ionice must not leave the delete undone:
+    // klon checks every optional tool before it composes the command.
+    let fx = Fixture::generate(50, 5, 5);
+    let fake_bin = fx.golden.parent().unwrap().join("fakebin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let mut looked_up = 0;
+    for tool in ["git", "rm", "nice"] {
+        if let Some(real) = tool_in_path(tool) {
+            std::os::unix::fs::symlink(&real, fake_bin.join(tool)).unwrap();
+            looked_up += 1;
+        }
+    }
+    if looked_up < 3 {
+        println!("skip: git, rm, or nice is not on PATH");
+        return;
+    }
+
+    let klon_path = add_feature(&fx);
+    let out = Command::new(BIN)
+        .args(["rm", "feature"])
+        .current_dir(&fx.golden)
+        .env("PATH", &fake_bin)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run gh-klon");
+    assert!(out.status.success(), "rm failed: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("missing"),
+        "stderr must name the missing tools: {}",
+        stderr(&out)
+    );
+    assert!(!klon_path.exists(), "the tree must be gone");
+    let trash = fx.trash();
+    assert!(
+        wait_until(|| trash_is_empty(&trash), Duration::from_secs(30)),
+        "the trash directory must drain without setsid and ionice"
+    );
+}
+
+/// The first real path of `tool` on the current PATH, or None.
+fn tool_in_path(tool: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(tool))
+        .find(|path| path.is_file())
+}

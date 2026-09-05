@@ -11,7 +11,7 @@ pub fn dirty(dir: &Path) -> Result<bool> {
     Ok(!git::run(dir, &["status", "--porcelain"])?.trim().is_empty())
 }
 
-/// The lowest process id whose current directory is `dir` or inside it.
+/// A process id whose current directory is `dir` or inside it, or None.
 /// Our own process is skipped, so `rm` works from inside its own klon.
 pub fn live_process(dir: &Path) -> Option<u32> {
     live_process_os(dir)
@@ -73,40 +73,53 @@ fn live_process_os(dir: &Path) -> Option<u32> {
 
 /// Start a detached `rm -rf` of `target` at the lowest disk and cpu priority.
 /// The call returns at once; the delete continues after `klon` exits.
-/// Each step drops one optional host tool and says so on one stderr line.
+/// Every optional tool is checked on PATH before the command uses it, so a
+/// missing tool can never leave the delete silently undone. Each absence
+/// costs one stderr line.
 pub fn spawn_background_delete(target: &Path) -> Result<()> {
-    if try_spawn(target, "setsid", &["nice", "-n", "19", "ionice", "-c", "3"]).is_ok() {
-        return Ok(());
+    let mut missing: Vec<&'static str> = Vec::new();
+    let mut words: Vec<&str> = Vec::new();
+    if tool_on_path("setsid") {
+        words.push("setsid");
+    } else {
+        missing.push("setsid");
     }
-    if try_spawn(target, "nice", &["-n", "19", "ionice", "-c", "3"]).is_ok() {
-        eprintln!("klon: setsid is missing; the delete stays in this process group");
-        return Ok(());
+    if tool_on_path("nice") {
+        words.extend(["nice", "-n", "19"]);
+    } else {
+        missing.push("nice");
     }
-    if try_spawn(target, "rm", &[]).is_ok() {
-        eprintln!("klon: nice or ionice is missing; the delete runs at normal priority");
-        return Ok(());
+    if tool_on_path("ionice") {
+        words.extend(["ionice", "-c", "3"]);
+    } else {
+        missing.push("ionice");
     }
-    Err(Error::io(format!(
-        "start the background delete of {}",
-        target.display()
-    ))(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no rm, nice, or setsid on PATH",
-    )))
-}
-
-/// Spawn `program <pre> rm -rf -- <target>` with every stream at `/dev/null`.
-/// The child is never waited on: `klon` exits at once and init reaps it.
-fn try_spawn(target: &Path, program: &str, pre: &[&str]) -> std::io::Result<()> {
+    if !missing.is_empty() {
+        eprintln!(
+            "klon: {} missing from PATH; the delete runs without it",
+            missing.join(" and ")
+        );
+    }
+    words.extend(["rm", "-rf", "--"]);
+    let (program, prefix) = words.split_first().expect("rm is always appended");
     Command::new(program)
-        .args(pre)
-        .args(["rm", "-rf", "--"])
+        .args(prefix)
         .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
+        .map_err(Error::io(format!(
+            "start the background delete of {}",
+            target.display()
+        )))
+}
+
+/// True when an executable `name` sits in a PATH directory.
+fn tool_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 /// Start a detached delete for every entry of the `.trash` directory.
