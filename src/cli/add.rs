@@ -10,7 +10,8 @@ use std::time::SystemTime;
 pub struct Args {
     /// An existing local branch.
     pub branch: String,
-    /// The klon path. Default: `../<repo>.wt/<branch>` next to golden.
+    /// The klon path. Default: the `path` template from `.klon.toml`, else
+    /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}` and `{branch}`.
     #[arg(long)]
     pub path: Option<PathBuf>,
 }

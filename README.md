@@ -7,6 +7,7 @@ The design is in `docs/klon-handoff.md`. The build order is in `docs/klon-spec.m
 ## Status
 
 C0 is done: `gh klon add <branch> [--path <p>]` with the `copy` backend for an existing local branch.
+C10 is done: the `.klon.toml` loader, the command approval gate, and `gh klon up [--yes]`.
 
 ## Install for local development
 
@@ -24,6 +25,7 @@ Check the install with `gh klon --version`.
 ```sh
 gh klon add feature                       # creates ../<repo>.wt/feature
 gh klon add feature --path /some/empty/dir
+gh klon up --yes                          # runs the approved [warm] steps in golden
 ```
 
 `add` does these steps:
@@ -41,6 +43,35 @@ If cleanup fails, the command also prints the cleanup error.
 Repository and destination paths must use UTF-8, a text encoding. They cannot contain newline characters.
 Git 2.34 does not provide an unambiguous list format for paths with newline characters.
 The destination cannot be inside the Git common directory, which holds shared repository data.
+
+## Configuration
+
+`add` reads `.klon.toml` from the golden root. All keys are optional.
+The `path` key is a path template with two placeholders: `{repo}` is the golden
+directory name and `{branch}` is the new branch. A relative template resolves
+against the golden root.
+
+```toml
+path = "../{repo}.wt/{branch}"   # the default
+```
+
+Klon refuses a template that resolves to `/`, the home directory, or the
+repository root. It refuses an unknown placeholder.
+
+`up` runs the `[warm] steps` in golden with `sh -c`, in order, and stops at the
+first failure. The first `up` asks before it runs any step from `.klon.toml`:
+
+```
+klon: .klon.toml asks to run:
+  warm.steps: cargo build
+Approve? [y/N]
+```
+
+The answer stores the SHA-256 of `.klon.toml` in `<config home>/klon/approvals.toml`.
+`--yes` approves without a prompt. A run without a terminal and without `--yes`
+refuses with `needs approval` and runs nothing. A one-byte change to `.klon.toml`
+asks again. The config home is `KLON_CONFIG_HOME`, else `XDG_CONFIG_HOME`, else
+`~/.config`. Unknown keys draw one warning and never fail the load.
 
 ## Known blind spot
 
