@@ -1,0 +1,65 @@
+# CI for gh-klon (spec section 7, C2).
+#
+# The `test` job runs on every push and pull request. It checks the format,
+# runs clippy with warnings as errors, and runs the whole test suite on both
+# supported operating systems. Tests that need an absent host feature print a
+# skip reason and pass.
+#
+# The `nightly` job runs the 100k-fixture timing test. It runs on a schedule
+# and through `workflow_dispatch` only, so pull requests stay fast.
+#
+# Later chunks extend this file: C5 adds an ubuntu-24.04 loop-filesystem job,
+# C32 adds a release workflow beside it.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Every day at 03:17 UTC. An off-minute avoids the top-of-hour load peak.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel the superseded run of the same ref. Leave runs of other refs alone.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt, clippy, test (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      # --locked fails a pull request that changes Cargo.toml without a
+      # matching Cargo.lock update, before clippy can rewrite the lock.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  nightly:
+    name: nightly, 100k fixture (ubuntu-22.04)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the 100k-fixture test
+        run: KLON_FIXTURE=100k cargo test --release add_100k -- --nocapture
