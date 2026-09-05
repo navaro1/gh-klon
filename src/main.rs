@@ -4,8 +4,12 @@ mod backend;
 mod cli;
 mod config;
 mod git;
+mod journal;
 mod paths;
+mod probe;
 mod process;
+mod repair;
+mod time;
 
 use clap::{Parser, Subcommand};
 use std::fmt;
@@ -61,6 +65,10 @@ struct Cli {
     /// Approve the commands in `.klon.toml` and skip every prompt.
     #[arg(long, global = true)]
     yes: bool,
+    /// Print one JSON document on stdout instead of the human report. An error
+    /// still goes to stderr as text and keeps the same exit code.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -77,16 +85,29 @@ enum Command {
     Prune,
     /// List every klon with its branch, HEAD, and a dirty flag.
     List,
+    /// Report the host features and the open journal entries.
+    Doctor(cli::doctor::Args),
 }
 
 fn main() -> ExitCode {
-    let Cli { yes, command } = Cli::parse();
+    let Cli { yes, json, command } = Cli::parse();
+    // `--json` is global, like `--yes`. `up` and `prune` print no document, so
+    // the flag would promise one that never arrives. A later chunk that gives a
+    // command a document deletes its name from this list.
+    if json && matches!(command, Command::Up | Command::Prune) {
+        eprintln!(
+            "{}",
+            Error::klon("--json is not available for up and prune")
+        );
+        return ExitCode::from(1);
+    }
     let result = match command {
-        Command::Add(args) => cli::add::run(args),
+        Command::Add(args) => cli::add::run(args, json),
         Command::Up => cli::up::run(yes),
-        Command::Rm(args) => cli::rm::run(args),
+        Command::Rm(args) => cli::rm::run(args, json),
         Command::Prune => cli::prune::run(),
-        Command::List => cli::list::run(),
+        Command::List => cli::list::run(json),
+        Command::Doctor(args) => cli::doctor::run(args, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

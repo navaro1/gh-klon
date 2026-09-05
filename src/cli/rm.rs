@@ -2,12 +2,27 @@
 //! The klon is renamed into `.trash` and deleted in the background, so the
 //! command returns at once. The branch is never deleted.
 
+use crate::journal::{self, State};
 use crate::paths;
 use crate::process;
 use crate::{git, Error, Result};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The JSON schema name. A field removal or a type change bumps the suffix.
+pub const SCHEMA: &str = "klon.rm/1";
+
+/// The `rm --json` document. `trash` is null when the klon did not reach the
+/// trash directory: the cross-filesystem fallback deletes it in place.
+#[derive(Serialize)]
+struct Report<'a> {
+    schema: &'static str,
+    path: &'a Path,
+    branch: Option<&'a str>,
+    trash: Option<PathBuf>,
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -21,7 +36,7 @@ pub struct Args {
     pub force: bool,
 }
 
-pub fn run(args: Args) -> Result<()> {
+pub fn run(args: Args, json: bool) -> Result<()> {
     if args.branch.is_none() && args.path.is_none() {
         return Err(Error::klon("name a branch or a path with --path"));
     }
@@ -33,7 +48,16 @@ pub fn run(args: Args) -> Result<()> {
             .ok_or_else(|| Error::klon("not inside a git repository"))?
             .path,
     )?;
+    // The journal lives under the common directory. `rm` derives it from
+    // golden instead of a second `git` process, because of the 100 ms budget.
+    let common = git::common_dir_of_main(&golden)?;
     let target = resolve(&worktrees, &golden, &args)?;
+    let branch = worktrees
+        .iter()
+        .find(|w| same_dir(&w.path, &target))
+        .and_then(|w| w.branch.as_deref())
+        .and_then(|b| b.strip_prefix("refs/heads/"))
+        .map(str::to_string);
 
     // Step 1: refuse protected places before anything else.
     refuse_reserved(&target, &golden)?;
@@ -65,7 +89,27 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     // Steps 4 to 6: rename into .trash, drop the git file, prune, delete later.
-    remove_worktree(&golden, &target)
+    // The journal entry precedes the rename, so `doctor --repair` can finish
+    // the tail after a crash.
+    let mut record = journal::Record::start(&common, journal::Op::Rm, &target, branch.as_deref())?;
+    record.reach(State::Removing)?;
+    let trash = remove_worktree(&golden, &target)?;
+    record.close()?;
+
+    if json {
+        let report = Report {
+            schema: SCHEMA,
+            path: &target,
+            branch: branch.as_deref(),
+            trash,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&report)
+                .map_err(|err| Error::klon(format!("serialize the report: {err}")))?
+        );
+    }
+    Ok(())
 }
 
 /// Step 1: find the registered worktree for the branch or the path.
@@ -120,10 +164,12 @@ fn refuse_reserved(target: &Path, golden: &Path) -> Result<()> {
 
 /// Steps 4 to 6. Rename the klon into `.trash` when that stays on one
 /// filesystem, then let git forget it and delete the copy in the background.
-fn remove_worktree(golden: &Path, target: &Path) -> Result<()> {
+/// The answer is the trash path, or None when the klon never reached the trash.
+fn remove_worktree(golden: &Path, target: &Path) -> Result<Option<PathBuf>> {
     if !target.exists() {
         // A stale registration with no directory on disk: prune drops it.
-        return git::run(golden, &["worktree", "prune"]).map(|_| ());
+        git::run(golden, &["worktree", "prune"])?;
+        return Ok(None);
     }
     let trash = paths::default_wt_root(golden).join(".trash");
     fs::create_dir_all(&trash).map_err(Error::io("create the trash directory"))?;
@@ -132,7 +178,8 @@ fn remove_worktree(golden: &Path, target: &Path) -> Result<()> {
         Ok(()) => {
             drop_git_file(&victim)?;
             git::run(golden, &["worktree", "prune"])?;
-            process::spawn_background_delete(&victim)
+            process::spawn_background_delete(&victim)?;
+            Ok(Some(victim))
         }
         // Step 4: `.trash` on another filesystem; delete in place instead.
         Err(err) if err.raw_os_error() == Some(libc::EXDEV) => {
@@ -141,7 +188,8 @@ fn remove_worktree(golden: &Path, target: &Path) -> Result<()> {
                  git worktree remove --force deletes it in place",
                 target.display()
             );
-            git::run(golden, &["worktree", "remove", "--force", path_str(target)]).map(|_| ())
+            git::run(golden, &["worktree", "remove", "--force", path_str(target)])?;
+            Ok(None)
         }
         Err(err) => Err(Error::io(format!("rename {}", target.display()))(err)),
     }

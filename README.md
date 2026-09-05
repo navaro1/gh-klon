@@ -8,6 +8,8 @@ The design is in `docs/klon-handoff.md`. The build order is in `docs/klon-spec.m
 
 C0 is done: `gh klon add <branch> [--path <p>]` with the `copy` backend for an existing local branch.
 C10 is done: the `.klon.toml` loader, the command approval gate, and `gh klon up [--yes]`.
+C3 is done: `gh klon rm`, `gh klon prune`, and `gh klon list`.
+C4 is done: the journal, `gh klon doctor [--json] [--repair]`, and `--json` on four commands.
 
 ## Install for local development
 
@@ -72,6 +74,62 @@ The answer stores the SHA-256 of `.klon.toml` in `<config home>/klon/approvals.t
 refuses with `needs approval` and runs nothing. A one-byte change to `.klon.toml`
 asks again. The config home is `KLON_CONFIG_HOME`, else `XDG_CONFIG_HOME`, else
 `~/.config`. Unknown keys draw one warning and never fail the load.
+
+## The journal and `doctor`
+
+`add` and `rm` write one journal entry per klon to `<common>/klon/journal/<name>.json`
+before each step. The entry holds the operation, the state, the path, the branch,
+and the start time. It holds no repository content. A completed command deletes
+its entry, so every entry that survives marks an interrupted command.
+
+```sh
+gh klon doctor              # the host report and the open entries
+gh klon doctor --repair     # close every open entry, one printed line per action
+```
+
+`doctor` reports the git version, the filesystem of golden, `btrfs-progs`, the two
+inotify limits, `make`, `ninja`, and `pasta`. Each host feature reports `present`,
+`absent`, or `broken` with a reason. A feature that this host does not have never
+stops a command.
+
+`--repair` moves each entry to the prior valid state:
+
+| Operation and state | Action |
+|---|---|
+| `add` `planned` | Delete the entry. Unregister the worktree when git already registered one. |
+| `add` `registered` or `cloned` | Unlock the worktree, remove it with force, delete the entry. |
+| `add` `checked-out` | Unlock the worktree, delete the entry. The klon stays. |
+| `add` `ready` | Delete the entry. The klon is complete. |
+| `rm` `removing` | Delete the `.git` file in the trash copy, start the background delete, run `git worktree prune`, delete the entry. |
+| `rm` in any earlier state | Delete the entry. The klon stays. |
+
+A repeated command repairs its own entry too. `add` closes the entry of its
+destination before it validates the path, so a second `add` after an interrupted
+one completes without a `doctor` run. It prints one `klon: recovery:` line per
+action.
+
+A repair that cannot finish keeps the entry. `doctor --repair` then prints the
+report, names the reason, and exits non-zero, so the next run tries again.
+
+An entry with an unknown `version` fails closed: `doctor` exits non-zero with
+`unknown journal version` and changes nothing. Upgrade klon in that case.
+
+## JSON output
+
+`--json` makes `add`, `list`, `rm`, and `doctor` print one JSON document on stdout
+instead of the human report. Each document carries a `schema` field:
+`klon.add/1`, `klon.list/1`, `klon.rm/1`, and `klon.doctor/1`. An error still goes
+to stderr as text and keeps the same exit code.
+
+```sh
+gh klon add --json feature
+{"schema":"klon.add/1","path":"/w/repo.wt/feature","branch":"feature","head":"1a2b...","backend":"copy","duration_ms":812}
+```
+
+A new field may appear in a later version. A removed or retyped field bumps the
+version suffix. `tests/schema.rs` holds the documented field set of each schema.
+
+`up` and `prune` print no document. They refuse `--json` instead of ignoring it.
 
 ## Known blind spot
 

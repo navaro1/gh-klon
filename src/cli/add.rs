@@ -1,10 +1,18 @@
 //! `gh klon add <branch> [--path <p>]`: the `add` transaction from handoff §4, copy backend only.
 
 use crate::backend::copy;
-use crate::{config, git, paths, Error, Result};
+use crate::journal::{self, State};
+use crate::{config, git, paths, repair, Error, Result};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
+
+/// The JSON schema name. A field removal or a type change bumps the suffix.
+pub const SCHEMA: &str = "klon.add/1";
+
+/// The only backend in v0. C5 replaces this with the probed backend name.
+const BACKEND: &str = "copy";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -16,10 +24,22 @@ pub struct Args {
     pub path: Option<PathBuf>,
 }
 
+/// The `add --json` document.
+#[derive(Serialize)]
+struct Report<'a> {
+    schema: &'static str,
+    path: &'a Path,
+    branch: &'a str,
+    head: String,
+    backend: &'static str,
+    duration_ms: u64,
+}
+
 /// Directories inside golden where a klon may live.
 const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
 
-pub fn run(args: Args) -> Result<()> {
+pub fn run(args: Args, json: bool) -> Result<()> {
+    let started = Instant::now();
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     let common = git::common_dir(&cwd)?;
     check_git_path(&common)?;
@@ -41,11 +61,22 @@ pub fn run(args: Args) -> Result<()> {
             "the destination is inside the git common directory",
         ));
     }
+    // R6: a repeated `add` finishes the recovery of an interrupted one. This
+    // runs before `check_path`, because an interrupted `add` leaves a `.git`
+    // file in the destination and the check would refuse with `path not empty`.
+    let worktrees = match recover_stale(&golden, &common, &path)? {
+        // The recovery changed the register list, so read it again.
+        true => git::worktree_list(&cwd)?,
+        false => worktrees,
+    };
     check_path(&golden, &path)?;
     check_branch(&golden, &worktrees, &args.branch)?;
 
+    // Step 0: the journal entry precedes the first repository change.
+    let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&args.branch))?;
+
     // Step 2: git owns the admin entry. The path is empty or absent.
-    git::run(
+    if let Err(err) = git::run(
         &golden,
         &[
             "worktree",
@@ -55,22 +86,84 @@ pub fn run(args: Args) -> Result<()> {
             "--lock",
             path.to_str().unwrap_or_default(),
         ],
-    )?;
-    let result = fill(&golden, &common, &worktrees, &path, &args.branch);
-    if result.is_err() {
-        // Step 11: leave no half-registered worktree, then report the original error.
-        let p = path.to_str().unwrap_or_default();
-        if let Err(err) = copy::make_removable(&path) {
-            eprintln!("klon: cleanup: {err}");
+    ) {
+        // git registered nothing, so the entry has no work for `doctor`.
+        if !git::is_registered(&golden, &path) {
+            record.close()?;
         }
-        git::run_quiet(&golden, &["worktree", "unlock", p]);
-        if let Err(err) = git::run(&golden, &["worktree", "remove", "--force", p]) {
-            eprintln!("klon: cleanup: {err}");
-        }
+        return Err(err);
+    }
+    record.reach(State::Registered)?;
+
+    let result = fill(
+        &golden,
+        &common,
+        &worktrees,
+        &path,
+        &args.branch,
+        &mut record,
+    );
+    if result.is_err() && cleanup(&golden, &path) {
+        // The rollback finished, so the entry has no work left either.
+        record.close()?;
     }
     result?;
-    println!("{}", path.display());
+    record.reach(State::Ready)?;
+    record.close()?;
+
+    if json {
+        let report = Report {
+            schema: SCHEMA,
+            path: &path,
+            branch: &args.branch,
+            head: git::run(&path, &["rev-parse", "HEAD"])?.trim().to_string(),
+            backend: BACKEND,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&report)
+                .map_err(|err| Error::klon(format!("serialize the report: {err}")))?
+        );
+    } else {
+        println!("{}", path.display());
+    }
     Ok(())
+}
+
+/// Close an open journal entry for this destination (R6, handoff §7). The
+/// answer says whether the recovery changed anything. `add` reads only the
+/// entry of its own path, so a future entry of another klon cannot block it.
+fn recover_stale(golden: &Path, common: &Path, path: &Path) -> Result<bool> {
+    let Some(entry) = journal::read(common, &journal::name_for(path))? else {
+        return Ok(false);
+    };
+    let outcome = repair::entry(golden, common, &entry)?;
+    for action in &outcome.actions {
+        eprintln!("klon: recovery: {action}");
+    }
+    match outcome.failure {
+        Some(err) => Err(err),
+        None => Ok(true),
+    }
+}
+
+/// Step 11: leave no half-registered worktree. True when the rollback finished
+/// and the repository is back to the state before `add`.
+fn cleanup(golden: &Path, path: &Path) -> bool {
+    let text = path.to_str().unwrap_or_default();
+    if let Err(err) = copy::make_removable(path) {
+        eprintln!("klon: cleanup: {err}");
+    }
+    git::run_quiet(golden, &["worktree", "unlock", text]);
+    match git::run(golden, &["worktree", "remove", "--force", text]) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("klon: cleanup: {err}");
+            eprintln!("klon: run gh klon doctor --repair to finish the cleanup");
+            false
+        }
+    }
 }
 
 /// Git 2.34 has no NUL-delimited worktree list; reject ambiguous path names.
@@ -126,6 +219,7 @@ fn fill(
     worktrees: &[git::Worktree],
     path: &Path,
     branch: &str,
+    record: &mut journal::Record,
 ) -> Result<()> {
     let admin_dir = read_admin_dir(path)?;
     exclude_klon_dir(common)?;
@@ -146,6 +240,7 @@ fn fill(
         format!("gitdir: {}\n", admin_dir.display()),
     )
     .map_err(Error::io("write .git"))?;
+    record.reach(State::Cloned)?;
 
     // Step 6: golden's index with a fresh mtime. `--no-checkout` wrote no index.
     let index = admin_dir.join("index");
@@ -179,6 +274,7 @@ fn fill(
     // Steps 8 to 10.
     git::run(path, &["checkout", "-q", "--force", branch])?;
     git::run(path, &["clean", "-fdq"])?;
+    record.reach(State::CheckedOut)?;
     // One status builds the untracked cache in the fresh index. Without it,
     // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
     git::run(path, &["status", "--porcelain"])?;
