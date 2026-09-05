@@ -536,3 +536,47 @@ fn parity_fails_on_a_one_byte_difference() {
         .unwrap();
     assert_worktree_parity(&klon_path, &oracle);
 }
+
+#[test]
+fn add_100k() {
+    if std::env::var("KLON_FIXTURE").as_deref() != Ok("100k") {
+        println!("skipped: add_100k generates 100,000 files; set KLON_FIXTURE=100k to run it");
+        return;
+    }
+    let generation_start = Instant::now();
+    let fx = Fixture::generate(100, 100_000, 1_000, 10_000, 20);
+    let generation = generation_start.elapsed();
+
+    let klon_path = fx.default_klon_path();
+    let add_start = Instant::now();
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let add = add_start.elapsed();
+
+    // R11: the first status re-checks 100k files, the second uses the cache.
+    let first_start = Instant::now();
+    let first = git_ok(&klon_path, &["status", "--porcelain"]);
+    let first_status = first_start.elapsed();
+    let second_start = Instant::now();
+    let second = git_ok(&klon_path, &["status", "--porcelain"]);
+    let second_status = second_start.elapsed();
+
+    println!("fixture generation: {generation:?}");
+    println!("klon add:           {add:?}");
+    println!("first git status:  {first_status:?} (limit 500 ms)");
+    println!("second git status: {second_status:?} (limit 150 ms)");
+    assert_eq!(first, "", "the klon must be clean after add");
+    assert_eq!(second, "", "the klon must stay clean");
+    assert!(
+        first_status <= Duration::from_millis(500),
+        "the first status took {first_status:?}; the limit is 500 ms"
+    );
+    assert!(
+        second_status <= Duration::from_millis(150),
+        "the second status took {second_status:?}; the limit is 150 ms"
+    );
+    assert_eq!(
+        git_ok(&klon_path, &["rev-parse", "HEAD^{tree}"]),
+        git_ok(&fx.golden, &["rev-parse", "feature^{tree}"])
+    );
+}
