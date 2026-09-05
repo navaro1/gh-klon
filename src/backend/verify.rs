@@ -93,10 +93,12 @@ fn build_fixture(root: &Path) -> Result<()> {
         set_mode(&file, mode)?;
         set_mtime(&file, BASE_MTIME + i as i64, (i * 1_000_000) as u32)?;
     }
-    // One relative symlink into the first directory.
+    // One relative symlink into the first directory. Its own mtime is fixed
+    // too, so a backend that follows the link instead of recreating it fails.
     let link = root.join("link");
     std::os::unix::fs::symlink("d0/f000.bin", &link)
         .map_err(Error::io(format!("symlink {}", link.display())))?;
+    set_symlink_mtime(&link, BASE_MTIME, 0)?;
     // Give the directories their mode and mtime after their children exist.
     for (dir, mode) in &dirs {
         set_mode(dir, *mode)?;
@@ -139,6 +141,12 @@ fn set_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
         .map_err(Error::io(format!("set mtime {}", path.display())))
 }
 
+fn set_symlink_mtime(path: &Path, secs: i64, nanos: u32) -> Result<()> {
+    let time = filetime::FileTime::from_unix_time(secs, nanos);
+    filetime::set_symlink_file_times(path, time, time)
+        .map_err(Error::io(format!("set symlink mtime {}", path.display())))
+}
+
 // --- The manifest ---------------------------------------------------------------
 
 /// One entry of the probe manifest.
@@ -171,8 +179,8 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Item>) -> Result<()> {
     for entry in entries {
         let entry = entry.map_err(Error::io(format!("read {}", dir.display())))?;
         let path = entry.path();
-        let meta = fs::symlink_metadata(&path)
-            .map_err(Error::io(format!("stat {}", path.display())))?;
+        let meta =
+            fs::symlink_metadata(&path).map_err(Error::io(format!("stat {}", path.display())))?;
         let file_type = meta.file_type();
         let (kind, target, hash) = if file_type.is_symlink() {
             let target =
@@ -278,9 +286,7 @@ impl Scratch {
             match fs::create_dir(&candidate) {
                 Ok(()) => return Ok(Scratch(candidate)),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(Error::io(format!("create {}", candidate.display()))(err))
-                }
+                Err(err) => return Err(Error::io(format!("create {}", candidate.display()))(err)),
             }
         }
         Err(Error::klon(
@@ -339,8 +345,8 @@ fn first_file(dir: &Path) -> Result<Option<PathBuf>> {
         .collect();
     entries.sort();
     for path in entries {
-        let meta = fs::symlink_metadata(&path)
-            .map_err(Error::io(format!("stat {}", path.display())))?;
+        let meta =
+            fs::symlink_metadata(&path).map_err(Error::io(format!("stat {}", path.display())))?;
         if meta.is_file() {
             return Ok(Some(path));
         }
@@ -374,7 +380,9 @@ mod tests {
             "the fixture needs one read-only file"
         );
         assert!(
-            items.iter().any(|i| i.kind == "dir" && i.mode & 0o777 == 0o750),
+            items
+                .iter()
+                .any(|i| i.kind == "dir" && i.mode & 0o777 == 0o750),
             "the fixture needs one directory with a distinct mode"
         );
         let distinct: std::collections::HashSet<i64> = items
@@ -392,7 +400,10 @@ mod tests {
         let b = tmp.path().join("b");
         build_fixture(&a).unwrap();
         build_fixture(&b).unwrap();
-        assert_eq!(difference(&manifest(&a).unwrap(), &manifest(&b).unwrap()), None);
+        assert_eq!(
+            difference(&manifest(&a).unwrap(), &manifest(&b).unwrap()),
+            None
+        );
 
         // A changed byte shows as a content difference; the size stays equal.
         let mut bytes = fs::read(b.join("d0/f000.bin")).unwrap();

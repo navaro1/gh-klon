@@ -54,6 +54,11 @@ pub trait Backend: Send + Sync {
     /// Remove a finished klon. The byte backends delete in the background at
     /// low priority (R8); C7's btrfs backend replaces this with one subvolume
     /// delete.
+    ///
+    /// `rm` still calls `process::spawn_background_delete` itself, because in
+    /// v0 every backend deletes the same way. C7 gives btrfs an O(1) delete and
+    /// routes `rm` through this method.
+    #[allow(dead_code)]
     fn delete(&self, dst: &Path) -> Result<()> {
         crate::process::spawn_background_delete(dst)
     }
@@ -354,7 +359,9 @@ mod tests {
         let golden = golden_in(&tmp);
         let status = verify::DropOne.probe(&golden);
         assert!(
-            status.detail().starts_with("probe failed: manifest mismatch"),
+            status
+                .detail()
+                .starts_with("probe failed: manifest mismatch"),
             "expected a manifest mismatch, found {status:?}"
         );
         assert!(!status.present(), "a broken backend must not pass");
@@ -397,18 +404,24 @@ mod tests {
         );
     }
 
+    /// `find` answers a boxed trait object, which has no `Debug`, so the tests
+    /// below read the error through this helper instead of `unwrap_err`.
+    fn find_error(name: &str) -> Option<String> {
+        match find(name) {
+            Ok(_) => None,
+            Err(err) => Some(err.to_string()),
+        }
+    }
+
     #[test]
     fn an_unknown_backend_name_is_refused() {
-        let err = find("no-such-backend").unwrap_err();
-        assert!(
-            err.to_string().contains("unknown backend"),
-            "unexpected error {err}"
-        );
+        let err = find_error("no-such-backend").expect("an unknown name must fail");
+        assert!(err.contains("unknown backend"), "unexpected error {err}");
     }
 
     #[test]
     fn the_test_only_backend_is_not_reachable_through_the_override() {
-        assert!(find("drop-one").is_err());
+        assert!(find_error("drop-one").is_some());
     }
 
     #[test]
