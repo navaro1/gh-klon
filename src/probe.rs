@@ -103,3 +103,56 @@ pub fn run_version(program: &Path, args: &[&str]) -> Status {
         None => Status::Broken(format!("{} printed no version", program.display())),
     }
 }
+
+/// The filesystem of `path`, from the `statfs` magic on Linux and from
+/// `f_fstypename` elsewhere. An unmapped magic prints as hexadecimal, so a new
+/// filesystem still gives a stable, comparable answer. `doctor` prints it and
+/// the backend probe cache stores it, so a moved repository re-probes (C5).
+#[cfg(target_os = "linux")]
+pub fn filesystem(path: &Path) -> String {
+    /// The magic numbers of the filesystems klon has a backend rule for.
+    const NAMES: &[(u32, &str)] = &[
+        (0x0102_1994, "tmpfs"),
+        (0x5846_5342, "xfs"),
+        (0x794c_7630, "overlay"),
+        (0x9123_683e, "btrfs"),
+        (0xef53, "ext4"),
+    ];
+    match statfs(path) {
+        Some(stat) => {
+            let magic = stat.f_type as u32;
+            match NAMES.iter().find(|(m, _)| *m == magic) {
+                Some((_, name)) => (*name).to_string(),
+                None => format!("{magic:#x}"),
+            }
+        }
+        None => "unknown".to_string(),
+    }
+}
+
+/// macOS and the other BSD systems name the filesystem in the `statfs` result.
+#[cfg(not(target_os = "linux"))]
+pub fn filesystem(path: &Path) -> String {
+    let stat = match statfs(path) {
+        Some(stat) => stat,
+        None => return "unknown".to_string(),
+    };
+    let bytes: Vec<u8> = stat
+        .f_fstypename
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// The raw `statfs` result for `path`, or None when the call fails.
+fn statfs(path: &Path) -> Option<libc::statfs> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is NUL-terminated and `stat` is a live, owned buffer.
+    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+    (rc == 0).then_some(stat)
+}
