@@ -47,7 +47,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # --locked fails a pull request that changes Cargo.toml without a
+      # matching Cargo.lock update, before clippy can rewrite the lock.
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
   nightly:
