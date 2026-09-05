@@ -179,6 +179,9 @@ fn fill(
     // Steps 8 to 10.
     git::run(path, &["checkout", "-q", "--force", branch])?;
     git::run(path, &["clean", "-fdq"])?;
+    // One status builds the untracked cache in the fresh index. Without it,
+    // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
+    git::run(path, &["status", "--porcelain"])?;
     git::run(
         golden,
         &["worktree", "unlock", path.to_str().unwrap_or_default()],
