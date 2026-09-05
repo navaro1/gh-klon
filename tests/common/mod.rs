@@ -223,11 +223,12 @@ impl Fixture {
     }
 
     pub fn default_klon_path(&self) -> PathBuf {
-        self.golden
-            .parent()
-            .unwrap()
-            .join("golden.wt")
-            .join("feature")
+        self.klon_path("feature")
+    }
+
+    /// The path `add` gives a klon of `branch` with the default template.
+    pub fn klon_path(&self, branch: &str) -> PathBuf {
+        self.golden.parent().unwrap().join("golden.wt").join(branch)
     }
 
     /// A worktree made by plain `git worktree add` at `<tmp>/oracle/<branch>`.
