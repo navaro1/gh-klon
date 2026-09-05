@@ -161,7 +161,12 @@ impl Fixture {
         diff_paths: usize,
     ) -> Fixture {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let golden = tmp.path().join("golden");
+        // Canonical: on macOS /var is a symlink to /private/var and klon prints resolved paths.
+        let golden = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("golden");
         fs::create_dir(&golden).unwrap();
         for i in 0..tracked_files {
             let dir = golden.join(format!("d{:03}", i % dirs));
@@ -292,6 +297,11 @@ pub fn manifest(root: &Path) -> Vec<Entry> {
     fn walk(root: &Path, dir: &Path, out: &mut Vec<Entry>) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            // R3 defines the manifest without `.git`. Git also writes there in the
+            // background, so a walk through it can see a file vanish.
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
             let meta = fs::symlink_metadata(&path).unwrap();
             let kind = meta.file_type();
             let mut hasher = DefaultHasher::new();
