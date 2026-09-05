@@ -4,6 +4,7 @@ mod backend;
 mod branch;
 mod cli;
 mod config;
+mod envelope;
 mod gh;
 mod git;
 mod journal;
@@ -30,6 +31,9 @@ pub enum Error {
         context: String,
         source: std::io::Error,
     },
+    /// A command that `run` wrapped exited with this code. klon prints nothing:
+    /// the command already reported its own failure on its own stderr.
+    Exit(u8),
 }
 
 impl Error {
@@ -45,6 +49,7 @@ impl Error {
     fn exit_code(&self) -> u8 {
         match self {
             Error::Git { code, .. } => u8::try_from(*code).unwrap_or(1).max(1),
+            Error::Exit(code) => (*code).max(1),
             _ => 1,
         }
     }
@@ -56,6 +61,8 @@ impl fmt::Display for Error {
             Error::Klon(msg) => write!(f, "klon: {msg}"),
             Error::Git { stderr, .. } => write!(f, "{}", stderr.trim_end()),
             Error::Io { context, source } => write!(f, "klon: {context}: {source}"),
+            // The wrapped command owns the message.
+            Error::Exit(_) => Ok(()),
         }
     }
 }
@@ -94,6 +101,12 @@ enum Command {
     Sync(cli::sync::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
     Pr(cli::pr::Args),
+    /// Run a command inside a klon under the envelope.
+    Run(cli::run::Args),
+    /// Start $SHELL inside a klon under the envelope.
+    Shell(cli::shell::Args),
+    /// End every process of a klon: SIGTERM, then SIGKILL after 3 s.
+    Stop(cli::stop::Args),
 }
 
 fn main() -> ExitCode {
@@ -101,10 +114,21 @@ fn main() -> ExitCode {
     // `--json` is global, like `--yes`. `up`, `prune`, and `pr` print no klon
     // document, so the flag would promise one that never arrives. A later
     // chunk that gives a command a document deletes its name from this list.
-    if json && matches!(command, Command::Up | Command::Prune | Command::Pr(_)) {
+    // `run` and `shell` hand stdout to the wrapped command, so klon must not
+    // write a document of its own into that stream.
+    if json
+        && matches!(
+            command,
+            Command::Up
+                | Command::Prune
+                | Command::Pr(_)
+                | Command::Run(_)
+                | Command::Shell(_)
+        )
+    {
         eprintln!(
             "{}",
-            Error::klon("--json is not available for up, prune, and pr")
+            Error::klon("--json is not available for up, prune, pr, run, and shell")
         );
         return ExitCode::from(1);
     }
@@ -117,11 +141,17 @@ fn main() -> ExitCode {
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Sync(args) => cli::sync::run(args),
         Command::Pr(args) => cli::pr::run(args),
+        Command::Run(args) => cli::run::run(args),
+        Command::Shell(args) => cli::shell::run(args),
+        Command::Stop(args) => cli::stop::run(args, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("{err}");
+            let text = err.to_string();
+            if !text.is_empty() {
+                eprintln!("{text}");
+            }
             ExitCode::from(err.exit_code())
         }
     }

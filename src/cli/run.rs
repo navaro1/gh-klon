@@ -1,0 +1,89 @@
+//! `gh klon run (<branch> | --path <p>) -- <cmd...>`: run a command inside a
+//! klon under the envelope (handoff §5, R21).
+//!
+//! The command starts in its own session with the klon's environment, its own
+//! `TMPDIR`, its own loopback address, and `gc.auto=0`. It carries `KLON_ID`,
+//! so `stop` finds the whole tree. The exit code passes back unchanged.
+
+use crate::envelope::Envelope;
+use crate::{git, paths, Error, Result};
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+
+#[derive(clap::Args)]
+pub struct Args {
+    /// A branch that a klon has checked out.
+    pub branch: Option<String>,
+    /// The klon path. It must match a registered worktree.
+    #[arg(long, conflicts_with = "branch")]
+    pub path: Option<PathBuf>,
+    /// The command and its arguments, after `--`.
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    pub command: Vec<String>,
+}
+
+pub fn run(args: Args) -> Result<()> {
+    let klon = resolve(args.branch.as_deref(), args.path.as_deref())?;
+    exec(&klon, &args.command)
+}
+
+/// The klon directory for a branch or a path. The main worktree is not a klon,
+/// so a branch that golden has checked out gives the "no klon" answer.
+pub fn resolve(branch: Option<&str>, path: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    let worktrees = git::worktree_list(&cwd)?;
+    // The first entry is the main worktree. Every other entry is a klon.
+    let klons = worktrees.iter().skip(1);
+    match (branch, path) {
+        (Some(branch), _) => {
+            let full = format!("refs/heads/{branch}");
+            klons
+                .filter(|w| w.branch.as_deref() == Some(full.as_str()))
+                .map(|w| paths::absolute(&w.path))
+                .next()
+                .unwrap_or_else(|| {
+                    Err(Error::klon(format!(
+                        "no klon has the branch {branch} checked out"
+                    )))
+                })
+        }
+        (None, Some(path)) => {
+            let wanted = paths::absolute(path)?;
+            for worktree in klons {
+                if paths::absolute(&worktree.path).is_ok_and(|p| p == wanted) {
+                    return Ok(wanted);
+                }
+            }
+            Err(Error::klon(format!("no klon at {}", wanted.display())))
+        }
+        (None, None) => Err(Error::klon("name a branch or a path with --path")),
+    }
+}
+
+/// Run `argv` inside `klon` under the envelope and pass the exit code back.
+/// A command that fails gives `Error::Exit`, which prints nothing: the command
+/// already reported its own failure on its own stderr.
+pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
+    let envelope = Envelope::load(klon)?;
+    let status = envelope
+        .command(argv)?
+        .status()
+        .map_err(Error::io(format!("run {}", argv.join(" "))))?;
+    match exit_code(&status) {
+        0 => Ok(()),
+        code => Err(Error::Exit(code)),
+    }
+}
+
+/// The exit code of a finished command. A command that a signal ended reports
+/// `128 + signal`, the same as every shell.
+fn exit_code(status: &ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        return u8::try_from(code).unwrap_or(1);
+    }
+    match status.signal() {
+        Some(signal) => u8::try_from(128 + signal).unwrap_or(1),
+        None => 1,
+    }
+}

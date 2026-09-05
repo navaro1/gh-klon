@@ -122,6 +122,77 @@ fn tool_on_path(name: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
+/// Every process that carries all of `tags` in its environment, sorted by pid.
+/// `stop` uses it to find the tree of one klon (R22). Our own process is
+/// skipped, so `stop` works from inside the klon it stops.
+///
+/// A tag is one `KEY=value` pair and the match is exact on a whole entry of the
+/// environment, so the klon `x` never matches the klon `xy`.
+pub fn tagged_processes(tags: &[(String, String)]) -> Vec<u32> {
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    tagged_processes_os(tags)
+}
+
+/// Linux: read `/proc/<pid>/environ`, which holds the environment the process
+/// started with, NUL between entries. An unreadable file belongs to another
+/// user or to a process that just left; skip it.
+#[cfg(target_os = "linux")]
+fn tagged_processes_os(tags: &[(String, String)]) -> Vec<u32> {
+    let me = std::process::id();
+    let needles: Vec<Vec<u8>> = tags
+        .iter()
+        .map(|(key, value)| format!("{key}={value}").into_bytes())
+        .collect();
+    let mut pids = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        eprintln!("klon: cannot read /proc; the process scan found nothing");
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) => pid,
+            None => continue, // /proc also holds non-numeric entries.
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        let items: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+        if needles
+            .iter()
+            .all(|needle| items.iter().any(|item| *item == needle.as_slice()))
+        {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    pids
+}
+
+/// Every other system: the scan needs `/proc`. macOS reads the process group
+/// with `proc_listpgrppids` instead; that lands with the macOS envelope in C21.
+/// Until then `stop` reports one line and ends nothing.
+#[cfg(not(target_os = "linux"))]
+fn tagged_processes_os(_tags: &[(String, String)]) -> Vec<u32> {
+    eprintln!(
+        "klon: the process scan needs /proc; stop cannot find the klon's processes on this system"
+    );
+    Vec::new()
+}
+
+/// Send `signal` to `pid`. The answer is false when the process already left.
+pub fn signal(pid: u32, signal: i32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `kill` reads two integers and touches no memory of ours.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
 /// Start a detached delete for every entry of the `.trash` directory.
 /// A missing directory is not an error.
 pub fn drain_trash(trash: &Path) -> Result<()> {

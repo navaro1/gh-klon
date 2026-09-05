@@ -4,6 +4,7 @@
 
 use crate::backend::{self, Backend, Exclusions};
 use crate::branch;
+use crate::envelope::{env, slots};
 use crate::journal::{self, State};
 use crate::{config, git, paths, repair, Error, Result};
 use serde::Serialize;
@@ -45,6 +46,10 @@ pub struct Args {
         conflicts_with_all = ["path", "pr", "issue"]
     )]
     pub path_mode: Option<config::PathMode>,
+    /// A command to run in the new klon, after `--`. `add` runs it through
+    /// `run` and exits with its exit code.
+    #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
+    pub command: Vec<String>,
 }
 
 /// The `add --json` document.
@@ -181,6 +186,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         println!("{}", path.display());
     }
+    // Step 12: `add <branch> -- <cmd>` is `add` and then `run`. The exit code
+    // of the command becomes the exit code of `add`.
+    if !args.command.is_empty() {
+        return super::run::exec(&path, &args.command);
+    }
     Ok(())
 }
 
@@ -205,6 +215,13 @@ fn recover_stale(golden: &Path, common: &Path, path: &Path) -> Result<bool> {
 /// and the repository is back to the state before `add`.
 fn cleanup(golden: &Path, path: &Path) -> bool {
     let text = path.to_str().unwrap_or_default();
+    // The loopback address goes back before the directory does. A crash here
+    // still frees it, because the allocator drops a slot whose path is gone.
+    if let Ok(common) = git::common_dir_of_main(golden) {
+        if let Err(err) = slots::release(&common, path) {
+            eprintln!("klon: cleanup: {err}");
+        }
+    }
     if let Err(err) = backend::make_removable(path) {
         eprintln!("klon: cleanup: {err}");
     }
@@ -356,6 +373,12 @@ fn fill(
     // One status builds the untracked cache in the fresh index. Without it,
     // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
     git::run(path, &["status", "--porcelain"])?;
+
+    // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
+    // `info/exclude`, so the new directory keeps the klon clean for git.
+    let ip = slots::allocate(common, branch, path)?;
+    env::write(path, branch, &ip)?;
+
     git::run(
         golden,
         &["worktree", "unlock", path.to_str().unwrap_or_default()],
