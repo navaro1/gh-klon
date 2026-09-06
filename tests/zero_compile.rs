@@ -93,9 +93,16 @@ impl Project {
 }
 
 /// Run `program` in `cwd` with the leaking build variables cleared.
+///
+/// The colour is forced off. CI sets `CARGO_TERM_COLOR=always`, and a coloured
+/// `Compiling` line carries ANSI escapes that no plain text match survives.
 fn run(program: &Path, cwd: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env("CARGO_TERM_COLOR", "never")
+        .env("NO_COLOR", "1");
     for name in CARGO_LEAKS {
         command.env_remove(name);
     }
@@ -204,7 +211,7 @@ fn cargo_build_in_a_fresh_klon_compiles_nothing() {
     let report = text(&cold);
     let compiled: Vec<&str> = report
         .lines()
-        .filter(|line| line.trim_start().starts_with("Compiling "))
+        .filter(|line| line.contains("Compiling "))
         .collect();
     assert!(
         compiled.is_empty(),
