@@ -16,6 +16,7 @@
 pub mod env;
 #[cfg(target_os = "linux")]
 pub mod fence_linux;
+pub mod jobserver;
 pub mod scope;
 pub mod slots;
 
@@ -86,8 +87,7 @@ impl Envelope {
     }
 
     /// The value of one variable of the env file. C17 reads `KLON_JOBSERVER`
-    /// and C18 reads `TMPDIR` through it; C16 needs none of them.
-    #[allow(dead_code)]
+    /// and C18 reads `TMPDIR` through it.
     pub fn var(&self, key: &str) -> Option<&str> {
         self.vars
             .iter()

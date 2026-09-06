@@ -2,7 +2,7 @@
 //! (handoff §7, spec R31). Every host feature is one row from one probe. A later
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
-use crate::envelope::{scope, slots};
+use crate::envelope::{jobserver, scope, slots};
 use crate::journal::{self, Entry, Op, State};
 use crate::{backend, branch, git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
@@ -31,15 +31,15 @@ pub struct Host<'a> {
 /// One probe: a name and the function that answers for it.
 type Probe = fn(&Host) -> probe::Status;
 
-/// The `doctor` rows. C20 adds the cgroup delegation and C17 the jobserver.
-/// Each is one line. The selected backend is not a row: it has its own two
-/// fields, because it carries a name and a reason.
+/// The `doctor` rows. Each is one line. The selected backend is not a row: it
+/// has its own two fields, because it carries a name and a reason.
 const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("cgroup.controllers", cgroup_controllers),
     ("fence.residual", fence_residual),
     ("inotify.max_user_instances", inotify_instances),
     ("inotify.max_user_watches", inotify_watches),
+    ("jobserver", jobserver_store),
     ("landlock", landlock_abi),
     ("loopback", loopback),
     ("make", make_version),
@@ -395,8 +395,36 @@ fn fence_residual(host: &Host) -> probe::Status {
     }
 }
 
+/// The installed make, and the handshake klon speaks to it. make below 4.4
+/// stops with `internal error: invalid --jobserver-auth string` on the `fifo:`
+/// style (handoff §11), so klon emits the pipe style `R,W` for every version.
 fn make_version(_host: &Host) -> probe::Status {
-    probe::version_of("make", &["--version"])
+    let status = probe::version_of("make", &["--version"]);
+    let probe::Status::Present(line) = status else {
+        return status;
+    };
+    let note = if jobserver::make_needs_pipe_style(&line) {
+        "klon uses the pipe-style jobserver handshake, which this version needs"
+    } else {
+        "klon uses the pipe-style jobserver handshake"
+    };
+    probe::Status::Present(format!("{line}; {note}"))
+}
+
+/// The shared build-slot store (C17, R19): the fifo path, the tokens it holds
+/// now, the target, and the shortfall. The call also repairs a store that a
+/// killed client left short, so `doctor` both reports and fixes.
+fn jobserver_store(_host: &Host) -> probe::Status {
+    if jobserver::is_off() {
+        return probe::Status::Absent(format!(
+            "{} is set; run exports no MAKEFLAGS",
+            jobserver::OFF_VAR
+        ));
+    }
+    match jobserver::top_up(jobserver::Look::Always) {
+        Ok(report) => probe::Status::Present(report.detail()),
+        Err(err) => probe::Status::Broken(err.to_string()),
+    }
 }
 
 fn ninja_version(_host: &Host) -> probe::Status {

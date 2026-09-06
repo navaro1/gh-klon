@@ -8,7 +8,7 @@
 //! otherwise. The exit code passes back unchanged, and a signal to `run`
 //! passes on to the command.
 
-use crate::envelope::{scope, Envelope, Fence};
+use crate::envelope::{jobserver, scope, Envelope, Fence};
 use crate::{git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -97,6 +97,13 @@ pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
     // command tree. The guard removes a cgroup that klon made once the command
     // has left it.
     let guard = scope::apply(&mut envelope);
+    // C17: the shared build-slot store. `attach` repairs a store that a killed
+    // client left short, then hands the command the two descriptors of the
+    // pipe-style handshake. klon opens the fifo here, in the parent, so the
+    // command inherits the descriptors and never opens the fifo under the
+    // fence below. It never fails: a host that cannot hold a store gets the
+    // handshake variables as empty strings instead.
+    envelope.jobserver = jobserver::attach(&envelope);
     // C18: the fence is the innermost step; the child applies it right
     // before the exec, so the scope wrapper runs inside it too. A cgroup the
     // scope made is joined from inside the child, so the fence opens its

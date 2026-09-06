@@ -164,8 +164,12 @@ fn add_writes_the_env_file_and_the_klon_stays_clean() {
         vars.get("TMPDIR").map(PathBuf::from),
         Some(klon_path.join(".klon").join("tmp"))
     );
-    // C17 fills the jobserver path. Until then the variable is present and empty.
-    assert_eq!(vars.get("KLON_JOBSERVER").map(String::as_str), Some(""));
+    // C17 fills the jobserver path: the shared build-slot store of this user.
+    let store = vars.get("KLON_JOBSERVER").expect("KLON_JOBSERVER");
+    assert!(
+        store.ends_with("/jobserver"),
+        "the env file must name the jobserver fifo: {store}"
+    );
     assert_eq!(vars.get("GIT_CONFIG_COUNT").map(String::as_str), Some("1"));
     assert_eq!(
         vars.get("GIT_CONFIG_KEY_0").map(String::as_str),

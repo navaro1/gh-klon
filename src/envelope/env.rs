@@ -6,6 +6,7 @@
 //! small safe set is wrapped in single quotes, so a path with a space survives
 //! both the shell and the reader below.
 
+use crate::envelope::jobserver;
 use crate::{Error, Result};
 use std::collections::BTreeMap;
 use std::fs;
@@ -115,9 +116,14 @@ pub fn compose(name: &str, klon: &Path, ip: &str) -> Vec<(String, String)> {
             "TMPDIR".to_string(),
             tmp_dir(klon).to_string_lossy().into_owned(),
         ),
-        // C17 writes the jobserver fifo path here. Until then the variable
-        // exists and is empty, so a reader never has to test for its absence.
-        ("KLON_JOBSERVER".to_string(), String::new()),
+        // The shared build-slot store (C17). `run` reads the path back and
+        // hands the command two descriptors that speak the pipe-style
+        // handshake. The value is a path, not a switch:
+        // `KLON_NO_JOBSERVER=1` turns the export off.
+        (
+            jobserver::PATH_VAR.to_string(),
+            jobserver::path().to_string_lossy().into_owned(),
+        ),
     ];
     vars.extend(config.vars());
     vars
