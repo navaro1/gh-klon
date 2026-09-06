@@ -160,6 +160,11 @@ pub fn escapes(claims: &[String], changed: &[String]) -> Vec<String> {
 /// The call refuses an empty path, a `..` component, an absolute path outside
 /// the klon, and a path that names the klon root itself. It touches no file;
 /// `refuse_symlink_ancestor` does that part.
+///
+/// `root` must be the klon directory as `paths::absolute` gives it. Both sides
+/// of the comparison below are then resolved, so a symlinked ancestor of the
+/// klon cannot make a path inside it look like a path outside it. On macOS
+/// that ancestor is `/var`, which is a symlink to `/private/var`.
 pub fn normalize(root: &Path, raw: &str) -> Result<String> {
     if raw.trim().is_empty() {
         return Err(Error::klon("a claim needs a path; the path is empty"));
@@ -524,7 +529,12 @@ mod tests {
     #[test]
     fn normalize_folds_the_path_and_refuses_an_escape() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
+        // The root must be resolved, as every caller's is. On macOS the
+        // temporary directory sits under `/var`, which is a symlink to
+        // `/private/var`, and an unresolved root would make every absolute
+        // path inside it look like a path outside it.
+        let resolved = tmp.path().canonicalize().expect("canonical tempdir");
+        let root = resolved.as_path();
         assert_eq!(normalize(root, "src/a").unwrap(), "src/a");
         assert_eq!(normalize(root, "./src//a/").unwrap(), "src/a");
         assert_eq!(
