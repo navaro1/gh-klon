@@ -86,6 +86,14 @@ impl Drop for Scope {
     }
 }
 
+impl Scope {
+    /// The cgroup klon made for this command, when the cgroupfs fallback
+    /// holds it. The fence (C18) opens its `cgroup.procs` for the join.
+    pub fn cgroup(&self) -> Option<&Path> {
+        self.cgroup.as_deref()
+    }
+}
+
 /// Fill `envelope.scope` with the strongest mechanism this host offers and
 /// print one line when klon had to step down. The answer is the guard that
 /// removes a cgroup klon made.

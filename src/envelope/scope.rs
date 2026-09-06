@@ -19,6 +19,13 @@ mod imp {
     /// Nothing to clean up while no scope exists.
     pub struct Scope;
 
+    impl Scope {
+        /// No cgroup exists here, so the fence has nothing to open.
+        pub fn cgroup(&self) -> Option<&Path> {
+            None
+        }
+    }
+
     /// The reason every row below reports.
     const WHY: &str = "cgroup v2 is a Linux feature; C21 adds the macOS scope";
 

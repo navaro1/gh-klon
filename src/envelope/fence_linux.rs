@@ -189,6 +189,7 @@ fn allow_set(
     tmpdir: Option<&str>,
     dirs: &GitDirs,
     allow: &[String],
+    cgroup: Option<&Path>,
 ) -> Vec<Candidate> {
     let mut set: Vec<Candidate> = Vec::new();
     let mut push = |path: PathBuf, why: String, create: bool| {
@@ -226,6 +227,17 @@ fn allow_set(
     push(PathBuf::from("/var/tmp"), "/var/tmp".into(), false);
     if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
         push(dir, "XDG_RUNTIME_DIR".into(), false);
+    }
+    // The cgroupfs fallback of the scope (C20) joins its cgroup from inside
+    // the child, which is fenced by then: `echo $$ > cgroup.procs`. Only that
+    // file opens; `memory.high` and the rest of the cgroup stay read-only, so
+    // a command cannot lift its own cap.
+    if let Some(dir) = cgroup {
+        push(
+            dir.join("cgroup.procs"),
+            "the scope cgroup.procs".into(),
+            false,
+        );
     }
     // The per-user caches. Each has an environment override and a default
     // under `HOME`; both are candidates, because a tool may use either. An
@@ -337,9 +349,10 @@ pub struct Fence {
 }
 
 /// Build the fence of the klon at `klon`. `tmpdir` is the `TMPDIR` of the env
-/// file. The answer is `None` when the kernel has no Landlock: one stderr line
-/// says so, and the command runs without a fence (spec §5).
-pub fn build(klon: &Path, tmpdir: Option<&str>) -> Result<Option<Fence>> {
+/// file, and `cgroup` the cgroup the scope made for this command, if any. The
+/// answer is `None` when the kernel has no Landlock: one stderr line says so,
+/// and the command runs without a fence (spec §5).
+pub fn build(klon: &Path, tmpdir: Option<&str>, cgroup: Option<&Path>) -> Result<Option<Fence>> {
     let kernel = Kernel::query();
     let abi = match kernel {
         Kernel::Abi(abi) => ABI::from(abi.min(MAX_ABI)),
@@ -356,7 +369,7 @@ pub fn build(klon: &Path, tmpdir: Option<&str>) -> Result<Option<Fence>> {
         .fence
         .and_then(|fence| fence.allow)
         .unwrap_or_default();
-    let candidates = allow_set(klon, tmpdir, &dirs, &allow);
+    let candidates = allow_set(klon, tmpdir, &dirs, &allow, cgroup);
 
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
@@ -519,8 +532,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = dirs(tmp.path());
         let klon = tmp.path().join("golden.wt").join("feature");
-        let set = allow_set(&klon, Some("/tmp/x"), &dirs, &[]);
+        let cgroup = Path::new("/sys/fs/cgroup/user.slice/klon-feature-1");
+        let set = allow_set(&klon, Some("/tmp/x"), &dirs, &[], Some(cgroup));
         let paths: Vec<&Path> = set.iter().map(|c| c.path.as_path()).collect();
+        // The scope's cgroup opens only through its `cgroup.procs` file.
+        assert!(paths.contains(&cgroup.join("cgroup.procs").as_path()));
+        assert!(!paths.contains(&cgroup));
         // System directories and the git directories that always exist are
         // never created; `logs`, `rr-cache`, and `TMPDIR` are.
         let created: Vec<&Path> = set

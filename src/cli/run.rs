@@ -96,10 +96,12 @@ pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
     // C20: the resource scope is the outermost wrapper, so it holds the whole
     // command tree. The guard removes a cgroup that klon made once the command
     // has left it.
-    let _scope = scope::apply(&mut envelope);
+    let guard = scope::apply(&mut envelope);
     // C18: the fence is the innermost step; the child applies it right
-    // before the exec, so the scope wrapper runs inside it too.
-    envelope.fence = fence(klon, &envelope, options)?;
+    // before the exec, so the scope wrapper runs inside it too. A cgroup the
+    // scope made is joined from inside the child, so the fence opens its
+    // `cgroup.procs`.
+    envelope.fence = fence(klon, &envelope, options, guard.cgroup())?;
     // The child leads a new session, so the terminal never signals it: Ctrl-C
     // and a `kill` of `gh klon run` reach only this process. klon relays each
     // of them to the child's process group, so the whole tree ends with the
@@ -123,7 +125,12 @@ pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
 /// The fence of this run, or None when the caller or the environment turns
 /// it off. A host without Landlock gives None too, with one line on stderr.
 /// macOS has no fence until C19.
-fn fence(klon: &Path, envelope: &Envelope, options: Options) -> Result<Option<Fence>> {
+fn fence(
+    klon: &Path,
+    envelope: &Envelope,
+    options: Options,
+    cgroup: Option<&Path>,
+) -> Result<Option<Fence>> {
     let skipped =
         std::env::var_os("KLON_NO_FENCE").is_some_and(|value| !value.is_empty() && value != "0");
     if options.no_fence || skipped {
@@ -131,11 +138,11 @@ fn fence(klon: &Path, envelope: &Envelope, options: Options) -> Result<Option<Fe
     }
     #[cfg(target_os = "linux")]
     {
-        crate::envelope::fence_linux::build(klon, envelope.var("TMPDIR"))
+        crate::envelope::fence_linux::build(klon, envelope.var("TMPDIR"), cgroup)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (klon, envelope);
+        let _ = (klon, envelope, cgroup);
         Ok(None)
     }
 }
