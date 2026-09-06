@@ -53,15 +53,22 @@
 //! The marker is a plain file, not the fifo itself: `flock` on a fifo works on
 //! Linux and fails with `ENOTSUP` on macOS (measured in CI).
 //!
-//! ## One descriptor does all the work
+//! ## One descriptor does all the work, and the count comes from a drain
 //!
 //! Linux gives every open of a fifo the one shared buffer, so klon could read
 //! the count on one descriptor and write the tokens on another. macOS does
 //! not: a second open does not see what the first one wrote (measured in CI).
-//! klon therefore counts, fills, and drains through the single descriptor it
-//! hands to the command. `O_NONBLOCK` goes on only for that work and comes off
-//! before the copies are made, because a client reads the store with a
-//! blocking `read` and an `EAGAIN` there ends its build.
+//! klon therefore works through the single descriptor it hands to the command.
+//! `O_NONBLOCK` goes on only for that work and comes off before the copies are
+//! made, because a client reads the store with a blocking `read` and an
+//! `EAGAIN` there ends its build.
+//!
+//! The repair counts the tokens by taking them all out and writing the target
+//! back. That works on every system, and it is safe because it runs only on an
+//! idle store, where no client owns a token. `FIONREAD` gives Linux a second,
+//! gentler count that takes nothing, so `doctor` can also name the tokens of a
+//! **busy** store there. macOS answers 0 for a fifo whatever it holds
+//! (measured in CI), so a busy store has no count there and the row says so.
 
 use crate::envelope::{Envelope, Part};
 use crate::{Error, Result};
@@ -341,43 +348,74 @@ fn inherit_dup(fd: RawFd, path: &Path) -> Result<RawFd> {
     Ok(copy)
 }
 
-/// The tokens the store holds right now. `FIONREAD` counts the bytes a read
-/// would return and takes none of them, so `doctor` reports the count while a
-/// klon builds.
-fn available(file: &File) -> Result<usize> {
+/// The tokens the store holds, without taking any.
+///
+/// Linux answers with `FIONREAD`, which counts the bytes a read would return,
+/// so `doctor` names the tokens of a store a klon is using. macOS answers 0
+/// for a fifo whatever it holds, so it answers None here and the caller either
+/// drains the store or reports no count.
+#[cfg(target_os = "linux")]
+fn peek(file: &File) -> Option<usize> {
     let mut count: libc::c_int = 0;
     // SAFETY: the descriptor is open and `count` is a live, owned integer.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), FIONREAD, &mut count) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::io("count the jobserver tokens")(err));
-    }
-    Ok(usize::try_from(count).unwrap_or(0))
+    let rc = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            libc::FIONREAD as libc::c_ulong,
+            &mut count,
+        )
+    };
+    (rc == 0).then(|| usize::try_from(count).unwrap_or(0))
 }
 
-/// `FIONREAD` with the integer type each platform's `ioctl` takes.
-#[cfg(target_os = "linux")]
-const FIONREAD: libc::c_ulong = libc::FIONREAD as libc::c_ulong;
 #[cfg(not(target_os = "linux"))]
-const FIONREAD: libc::c_ulong = libc::FIONREAD;
+fn peek(_file: &File) -> Option<usize> {
+    None
+}
+
+/// Take every token out of the store and count them. Only an idle store may be
+/// drained: a token that a client holds must never be taken from it.
+fn drain(file: &File) -> Result<usize> {
+    let _relaxed = NonBlocking::set(file);
+    let mut handle: &File = file;
+    let mut buffer = [0u8; 512];
+    let mut found = 0;
+    loop {
+        match handle.read(&mut buffer) {
+            Ok(0) => return Ok(found),
+            Ok(read) => found += read,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(found),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(Error::io("count the jobserver tokens")(err)),
+        }
+    }
+}
+
+/// Write `count` tokens into the store. The fifo buffer holds 64 KiB and
+/// `MAX_TOKENS` keeps the target far below that, so the write never blocks.
+fn fill(file: &File, count: usize, path: &Path) -> Result<()> {
+    let _relaxed = NonBlocking::set(file);
+    let mut handle: &File = file;
+    handle
+        .write_all(&vec![TOKEN; count])
+        .map_err(Error::io(format!("fill {}", path.display())))
+}
 
 // --- The top-up --------------------------------------------------------------
 
 /// What the caller wants from the top-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Job {
-    /// `run`: it keeps the store open for a command. It skips the probe when
-    /// the store is already full, and it always marks the store as held.
+    /// `run`: it keeps the store open for a command, so it marks the store as
+    /// held before it lets any other klon look.
     Keep,
-    /// `doctor`: it reports only. It always probes and marks nothing.
+    /// `doctor`: it reports only, and marks nothing.
     Look,
 }
 
 /// Whether a klon holds the store open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Holders {
-    /// klon did not probe: the store was already full.
-    NotChecked,
     /// No klon holds the store open, so klon may fill it.
     Idle,
     /// A klon holds the store open. Its tokens come back when it ends, so
@@ -392,8 +430,9 @@ pub struct Report {
     pub path: PathBuf,
     /// The token count klon aims for.
     pub target: usize,
-    /// The tokens the store held when klon looked.
-    pub available: usize,
+    /// The tokens the store held when klon looked. None when a klon holds the
+    /// store and this system cannot count a fifo without emptying it.
+    pub available: Option<usize>,
     /// The processes that hold the store open.
     pub live: Holders,
     /// The tokens klon wrote back.
@@ -403,9 +442,11 @@ pub struct Report {
 }
 
 impl Report {
-    /// The tokens the store lacks. A live client owns most of them.
+    /// The tokens the store lacks. A live client owns most of them. A store
+    /// with no count lacks nothing that klon can name.
     pub fn shortfall(&self) -> usize {
-        self.target.saturating_sub(self.available)
+        self.available
+            .map_or(0, |held| self.target.saturating_sub(held))
     }
 
     /// The `doctor` row: the path, the count, the target, and the shortfall.
@@ -421,18 +462,19 @@ impl Report {
             notes.push(format!("{} short", self.shortfall()));
         }
         match self.live {
-            Holders::NotChecked => {}
             // The count is 0 because a fifo drops its buffer with the last
             // descriptor, not because a token leaked. The note says so.
             Holders::Idle => notes.push("no klon holds the store open".to_string()),
             Holders::Busy => notes.push("a klon holds the store open".to_string()),
         }
-        let head = format!(
-            "{}: {} of {} tokens",
-            self.path.display(),
-            self.available,
-            self.target
-        );
+        let head = match self.available {
+            Some(held) => format!("{}: {held} of {} tokens", self.path.display(), self.target),
+            None => format!(
+                "{}: {} tokens when idle; this system cannot count a busy store",
+                self.path.display(),
+                self.target
+            ),
+        };
         if notes.is_empty() {
             head
         } else {
@@ -468,40 +510,23 @@ fn top_up_at(anchor: &File, path: &Path, target: usize, job: Job) -> Result<Repo
     let mut report = Report {
         path: path.to_path_buf(),
         target,
-        available: available(anchor)?,
-        live: Holders::NotChecked,
+        available: peek(anchor),
+        live: probe(dir),
         restored: 0,
         dropped: 0,
     };
-    // A full store needs no repair, so `run` pays one `ioctl` and no probe.
-    if job == Job::Keep && report.available == target {
-        hold(dir)?;
-        return Ok(report);
-    }
-    report.live = probe(dir);
+    // A token that a live client holds comes back when that client ends. Only
+    // an idle store may be touched, or the count would grow past the target.
     if report.live == Holders::Idle {
         // No klon holds the store, and none can start: a new `run` must first
         // take the lock this call holds. Nothing can take or give a token now,
-        // so the count is read again and no stale number reaches the write.
-        //
-        // The work goes through `anchor`, the one descriptor that carries the
-        // tokens. The flag comes off before the caller duplicates it.
-        let relaxed = NonBlocking::set(anchor);
-        report.available = available(anchor)?;
-        if report.available < target {
-            let missing = target - report.available;
-            let mut handle: &File = anchor;
-            handle
-                .write_all(&vec![TOKEN; missing])
-                .map_err(Error::io(format!(
-                    "write back the tokens of {}",
-                    path.display()
-                )))?;
-            report.restored = missing;
-        } else if report.available > target {
-            report.dropped = take(anchor, report.available - target)?;
-        }
-        drop(relaxed);
+        // so klon takes every token out to count them and writes the target
+        // back. That is the one count that works on every system.
+        let found = drain(anchor)?;
+        fill(anchor, target, path)?;
+        report.available = Some(found);
+        report.restored = target.saturating_sub(found);
+        report.dropped = found.saturating_sub(target);
     }
     if job == Job::Keep {
         hold(dir)?;
@@ -575,24 +600,6 @@ fn hold(dir: &Path) -> Result<()> {
     // The copy carries the lock and survives `exec`; the original closes here.
     let _kept = inherit_dup(marker.as_raw_fd(), &path)?;
     Ok(())
-}
-
-/// Take `count` tokens out of the store. The caller sets `O_NONBLOCK` first,
-/// so a store that a client emptied ends the loop instead of waiting.
-fn take(file: &File, count: usize) -> Result<usize> {
-    let mut handle: &File = file;
-    let mut buffer = vec![0u8; count];
-    let mut taken = 0;
-    while taken < count {
-        match handle.read(&mut buffer[taken..]) {
-            Ok(0) => break,
-            Ok(n) => taken += n,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(Error::io("take the extra jobserver tokens")(err)),
-        }
-    }
-    Ok(taken)
 }
 
 // --- make --------------------------------------------------------------------
@@ -695,15 +702,22 @@ mod tests {
             }
         }
 
+        /// The tokens the store holds. It empties the store and puts the
+        /// tokens back, which only a test may do; `FIONREAD` would answer 0 on
+        /// macOS. The store ends the call exactly as it began.
         fn count(&self) -> usize {
-            available(&self.anchor).expect("count")
+            let found = drain(&self.anchor).expect("drain");
+            fill(&self.anchor, found, &self.path).expect("refill");
+            found
         }
 
         /// Take `count` tokens, as a client does: through the descriptor that
         /// carries the store, not through a second open of the fifo.
         fn take_tokens(&self, count: usize) -> usize {
-            let _relaxed = NonBlocking::set(&self.anchor);
-            take(&self.anchor, count).expect("take")
+            let found = drain(&self.anchor).expect("drain");
+            let kept = found.saturating_sub(count);
+            fill(&self.anchor, kept, &self.path).expect("refill");
+            found - kept
         }
     }
 
@@ -712,15 +726,9 @@ mod tests {
         let store = Store::new();
         assert_eq!(store.count(), 0, "a fresh fifo holds no token");
         let report = top_up_at(&store.anchor, &store.path, 3, Job::Keep).expect("top up");
-        assert_eq!(report.available, 0);
+        assert_eq!(report.available, Some(0));
         assert_eq!(report.live, Holders::Idle);
         assert_eq!(report.restored, 3);
-        assert_eq!(store.count(), 3);
-        // A second call on a full store changes nothing and skips the probe.
-        let report = top_up_at(&store.anchor, &store.path, 3, Job::Keep).expect("top up");
-        assert_eq!(report.available, 3);
-        assert_eq!(report.restored, 0);
-        assert_eq!(report.live, Holders::NotChecked);
         assert_eq!(store.count(), 3);
     }
 
@@ -737,10 +745,13 @@ mod tests {
 
         let report = top_up_at(&store.anchor, &store.path, 2, Job::Look).expect("report");
         assert_eq!(report.live, Holders::Busy, "the marker must be seen");
-        assert_eq!(report.available, 0);
-        assert_eq!(report.shortfall(), 2);
         assert_eq!(report.restored, 0, "a held store must not gain a token");
         assert_eq!(store.count(), 0);
+        // Linux counts a busy store without emptying it; macOS cannot.
+        if cfg!(target_os = "linux") {
+            assert_eq!(report.available, Some(0));
+            assert_eq!(report.shortfall(), 2);
+        }
     }
 
     #[test]
@@ -750,13 +761,14 @@ mod tests {
         ensure(&path).expect("create the fifo");
         {
             let anchor = open_store(&path).expect("open");
-            top_up_at(&anchor, &path, 2, Job::Keep).expect("top up");
-            assert_eq!(available(&anchor).unwrap(), 2);
+            fill(&anchor, 2, &path).expect("fill");
+            assert_eq!(drain(&anchor).expect("drain"), 2);
+            fill(&anchor, 2, &path).expect("refill");
         }
         // The rule the whole module rests on: no descriptor, no buffer, no
         // token. A store that no klon holds open is empty by construction.
         let anchor = open_store(&path).expect("reopen");
-        assert_eq!(available(&anchor).unwrap(), 0);
+        assert_eq!(drain(&anchor).expect("drain"), 0);
     }
 
     #[test]
@@ -781,14 +793,14 @@ mod tests {
         assert_eq!(store.count(), 2);
 
         let report = top_up_at(&store.anchor, &store.path, 4, Job::Look).expect("top up");
-        assert_eq!(report.available, 2);
+        assert_eq!(report.available, Some(2));
         assert_eq!(report.shortfall(), 2);
         assert_eq!(report.restored, 2);
         assert_eq!(store.count(), 4);
 
         // A smaller target takes the extra tokens out again.
         let report = top_up_at(&store.anchor, &store.path, 1, Job::Look).expect("top up");
-        assert_eq!(report.available, 4);
+        assert_eq!(report.available, Some(4));
         assert_eq!(report.dropped, 3);
         assert_eq!(store.count(), 1);
     }
@@ -803,12 +815,10 @@ mod tests {
         assert_eq!(flags & libc::FD_CLOEXEC, 0, "the copy must survive exec");
         // The copy shares the buffer, so it sees the tokens the anchor holds.
         top_up_at(&store.anchor, &store.path, 2, Job::Look).expect("fill");
-        let mut count: libc::c_int = 0;
-        // SAFETY: `copy` is open and `count` is a live, owned integer.
-        unsafe { libc::ioctl(copy, FIONREAD, &mut count) };
-        assert_eq!(count, 2);
-        // SAFETY: the test owns `copy` and closes it once.
-        unsafe { libc::close(copy) };
+        // SAFETY: `copy` is a live descriptor that this test owns; the
+        // `File` gives it a reader and closes it at the end of the block.
+        let mirror = unsafe { <File as std::os::unix::io::FromRawFd>::from_raw_fd(copy) };
+        assert_eq!(drain(&mirror).expect("drain"), 2);
     }
 
     #[test]
@@ -816,20 +826,29 @@ mod tests {
         let full = Report {
             path: PathBuf::from("/run/user/1000/klon/jobserver"),
             target: 18,
-            available: 18,
-            live: Holders::NotChecked,
+            available: Some(18),
+            live: Holders::Busy,
             restored: 0,
             dropped: 0,
         };
         assert_eq!(
             full.detail(),
-            "/run/user/1000/klon/jobserver: 18 of 18 tokens"
+            "/run/user/1000/klon/jobserver: 18 of 18 tokens, a klon holds the store open"
+        );
+        let blind = Report {
+            available: None,
+            ..full
+        };
+        assert_eq!(
+            blind.detail(),
+            "/run/user/1000/klon/jobserver: 18 tokens when idle; \
+             this system cannot count a busy store, a klon holds the store open"
         );
         let idle = Report {
-            available: 0,
+            available: Some(0),
             restored: 18,
             live: Holders::Idle,
-            ..full
+            ..blind
         };
         assert_eq!(
             idle.detail(),
@@ -839,7 +858,7 @@ mod tests {
         let busy = Report {
             path: PathBuf::from("/x/jobserver"),
             target: 18,
-            available: 16,
+            available: Some(16),
             live: Holders::Busy,
             restored: 0,
             dropped: 0,
