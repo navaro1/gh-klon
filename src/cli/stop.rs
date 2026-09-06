@@ -6,7 +6,7 @@
 //! well inside the five seconds R22 allows.
 
 use crate::cli::run as runner;
-use crate::envelope::Envelope;
+use crate::envelope::{scope, Envelope};
 use crate::{process, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,9 @@ struct Report<'a> {
     killed: usize,
     /// The process ids that survived both signals.
     survivors: Vec<u32>,
+    /// The cgroups `stop` emptied with one write each, or an empty array when
+    /// the host gave the klon none (C20).
+    cgroups: Vec<PathBuf>,
 }
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -55,6 +58,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let tags = envelope.tags();
 
     let found = process::klon_processes(&tags);
+    // The cgroups of the klon, read from the live processes before the signals
+    // move anything. They end a process that left the session and cleared its
+    // own environment, which no scan of `/proc` can name (C20).
+    let cgroups = scope::klon_cgroups(&found, &envelope.name);
     for pid in &found {
         process::signal(*pid, libc::SIGTERM);
     }
@@ -66,6 +73,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         wait_for_exit(&tags, GRACE)
     };
     let killed = after_term.len();
+    // One write ends every member of a cgroup, the untagged ones included. A
+    // cgroup that is already empty takes the write and nothing happens, so
+    // `stop` needs no second scan to decide whether the write is worth it. The
+    // report names a cgroup only when the write landed.
+    let cgroups: Vec<PathBuf> = cgroups.into_iter().filter(|dir| scope::kill(dir)).collect();
     for pid in &after_term {
         process::signal(*pid, libc::SIGKILL);
     }
@@ -86,6 +98,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         terminated,
         killed,
         survivors,
+        cgroups,
     };
     if json {
         println!(
@@ -100,6 +113,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             "{}: {} processes, {} ended after SIGTERM, {} after SIGKILL",
             report.name, report.found, report.terminated, report.killed
         );
+        for dir in &report.cgroups {
+            println!("{}: the cgroup {} is empty", report.name, dir.display());
+        }
     }
     if report.survivors.is_empty() {
         return Ok(());
