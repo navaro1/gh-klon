@@ -192,7 +192,12 @@ impl Record {
             // real build, and a ratio of nothing is the honest answer if it did.
             self.ratio = (wall > 0.0).then(|| builders as f64 * solo / wall);
         }
-        let within = self.p50_ms <= self.pass_p50_ms as f64
+        // The time budget guards the series that the cell's timer names. For a
+        // throughput cell that is the concurrent run, which is many times
+        // longer than the solo median in `p50_ms`: a budget on the median would
+        // let a concurrent run of any length through.
+        let timed_ms = self.t_wall6_ms.unwrap_or(self.p50_ms);
+        let within = timed_ms <= self.pass_p50_ms as f64
             && match (self.steady_p50_ms, self.pass_steady_p50_ms) {
                 (Some(steady), Some(budget)) => steady <= budget as f64,
                 _ => true,

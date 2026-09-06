@@ -9,7 +9,13 @@
 //! | Method | When | Meaning |
 //! |---|---|---|
 //! | `btrfs-fi-du` | The tree sits on btrfs and `btrfs` is present | Exact. `btrfs fi du -s --raw` reports the exclusive extent bytes |
-//! | `upper-bound` | Every other host | The apparent size of the tree. Nothing shared is subtracted, so the true figure is this one or less |
+//! | `upper-bound` | Every other host | The allocated size of the tree. Nothing shared is subtracted, so the true figure is this one or less |
+//!
+//! The fallback counts allocated blocks, not file lengths. A tree of many tiny
+//! files costs a block each, so the sum of the lengths would sit far below what
+//! the tree really uses and the figure would not be an upper bound at all. It
+//! counts directories and symlinks for the same reason: their blocks are part
+//! of what one tree costs.
 //!
 //! The walk covers the whole tree, not the ignored directories alone. A
 //! baseline worktree holds no ignored state at all, so a figure over the
@@ -44,7 +50,7 @@ pub fn measure(tree: &Path) -> Usage {
         };
     }
     Usage {
-        bytes: apparent(tree),
+        bytes: allocated(tree),
         method: UPPER_BOUND,
     }
 }
@@ -92,28 +98,40 @@ fn parse_exclusive(text: &str) -> Option<u64> {
     last
 }
 
-/// The apparent size of every regular file below `root`, in bytes. A directory
-/// and a symlink cost inode metadata that no portable call reports, so neither
-/// adds to the figure; that keeps this an upper bound of the shared case and a
-/// close reading of the copied case.
-fn apparent(root: &Path) -> u64 {
+/// The allocated size of everything below `root`, in bytes.
+///
+/// `st_blocks` counts the 512-byte blocks that an entry really occupies, so a
+/// one-byte file costs a whole block here as it does on the disk, and a sparse
+/// file costs only what it wrote. Summing `len()` instead would report far less
+/// than a tree of small files uses, and the figure would not bound anything.
+///
+/// A tree that shares extents with golden still counts them here, which is why
+/// the figure is an upper bound and not the answer. `btrfs fi du` gives the
+/// answer where the filesystem can.
+fn allocated(root: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = fs::read_dir(root) else {
         return 0;
     };
-    let mut total = 0;
+    // The root's own directory blocks belong to the figure too.
+    let mut total = fs::symlink_metadata(root).map_or(0, |meta| meta.blocks() * BLOCK);
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.is_dir() {
-            total += apparent(&path);
-        } else if meta.is_file() {
-            total += meta.len();
+            total += allocated(&path);
+        } else {
+            total += meta.blocks() * BLOCK;
         }
     }
     total
 }
+
+/// The unit of `st_blocks`. POSIX fixes it at 512 bytes, whatever the block
+/// size of the filesystem is.
+const BLOCK: u64 = 512;
 
 #[cfg(test)]
 mod tests {
@@ -132,8 +150,11 @@ mod tests {
         assert_eq!(parse_exclusive(""), None);
     }
 
+    /// The fallback must bound what a tree of small files really uses. Summing
+    /// the lengths would report three hundred bytes for a tree that occupies
+    /// several blocks, and a bound below the truth bounds nothing.
     #[test]
-    fn the_apparent_size_counts_every_file_below_the_root() {
+    fn the_fallback_counts_allocated_blocks_and_bounds_the_lengths() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("a/b")).unwrap();
@@ -141,8 +162,20 @@ mod tests {
         fs::write(root.join("a/two.bin"), vec![0u8; 250]).unwrap();
         fs::write(root.join("a/b/three.bin"), vec![0u8; 5]).unwrap();
         std::os::unix::fs::symlink("one.bin", root.join("link")).unwrap();
-        assert_eq!(apparent(root), 355, "a symlink adds no apparent bytes");
-        assert_eq!(apparent(&root.join("nothing")), 0);
+
+        let bytes = allocated(root);
+        assert!(
+            bytes >= 355,
+            "{bytes} must be at least the 355 bytes the files hold"
+        );
+        assert_eq!(bytes % BLOCK, 0, "the figure counts whole blocks");
+        // Three files of a few hundred bytes each occupy a block apiece on
+        // every filesystem klon supports.
+        assert!(
+            bytes >= 3 * 4096,
+            "{bytes} must cover a block per file, not the sum of the lengths"
+        );
+        assert_eq!(allocated(&root.join("nothing")), 0);
     }
 
     /// The measurement always answers, whatever this host runs.
@@ -153,7 +186,7 @@ mod tests {
         let usage = measure(tmp.path());
         assert!([BTRFS, UPPER_BOUND].contains(&usage.method));
         if usage.method == UPPER_BOUND {
-            assert_eq!(usage.bytes, 1024);
+            assert!(usage.bytes >= 1024, "found {}", usage.bytes);
         }
     }
 }

@@ -488,9 +488,16 @@ fn crate_body(seed: u64, index: usize, functions: usize) -> String {
     out
 }
 
-/// Write a deterministic tarball of one tiny package into `vendor/`. `tar` is
-/// part of every supported host, and a tarball dependency lands in the pnpm
-/// store, which a `file:` directory dependency does not.
+/// Write a tarball of one tiny package into `vendor/`. `tar` is part of every
+/// supported host, and a tarball dependency lands in the pnpm store, which a
+/// `file:` directory dependency does not.
+///
+/// The flags are the portable ones only. `--sort`, `--owner=0`, `--group=0`,
+/// and `--mtime` belong to GNU tar; the BSD tar that macOS ships rejects them,
+/// and the fixture would fail to build on a host that has pnpm. The staged
+/// files carry a pinned mtime instead, which both tars record, so the archive
+/// stays as repeatable as a portable call allows. Its bytes are outside
+/// `fixture_hash` either way: the cell counts installed packages, not bytes.
 fn pack(golden: &Path) -> Result<()> {
     let vendor = golden.join("vendor");
     let stage = vendor.join("package");
@@ -505,18 +512,15 @@ fn pack(golden: &Path) -> Result<()> {
         "module.exports = function (s) { return ' ' + s; };\n",
     )
     .map_err(Error::io("write the vendored index.js"))?;
+    let pinned = filetime::FileTime::from_unix_time(1_577_836_800, 0);
+    for name in ["package.json", "index.js"] {
+        filetime::set_file_mtime(stage.join(name), pinned)
+            .map_err(Error::io("re-time the vendored package"))?;
+    }
+    filetime::set_file_mtime(&stage, pinned).map_err(Error::io("re-time the tar directory"))?;
     let out = Command::new("tar")
         .current_dir(&vendor)
-        .args([
-            "--mtime=2020-01-01 00:00:00",
-            "--sort=name",
-            "--owner=0",
-            "--group=0",
-            "--numeric-owner",
-            "-czf",
-            "leftpad-1.0.0.tgz",
-            "package",
-        ])
+        .args(["-czf", "leftpad-1.0.0.tgz", "package"])
         .output()
         .map_err(Error::io("run tar for the fixture package"))?;
     if !out.status.success() {

@@ -76,6 +76,9 @@ impl Run {
             ("KLON_BENCH_INJECT_MISMATCH", OsStr::new("")),
             ("KLON_BENCH_ORDER_SEED", OsStr::new("")),
             ("KLON_BENCH_N", OsStr::new("")),
+            // The M12 cell measures the build slots, so a developer who turned
+            // them off in their shell must still get the CI result.
+            ("KLON_NO_JOBSERVER", OsStr::new("")),
         ];
         envs.extend_from_slice(extra);
         let out = klon_env(&self.cwd, &envs, &["bench", "--cell", cell, "--json"]);
@@ -390,4 +393,38 @@ fn the_throughput_cell_reports_the_ratio_and_every_build_time() {
         MANIFEST.contains("\npass_ratio = 0.80\n"),
         "the committed cell must keep the 0.80 pass rule"
     );
+}
+
+/// The jobserver is what M12 exists to measure. A run whose builds got no
+/// build slots measured N unbounded builds under another name, so its timing
+/// must not stand, however good the ratio looks.
+#[test]
+fn a_throughput_run_without_build_slots_is_void() {
+    let run = Run::new();
+    let report = run.bench(
+        &[
+            ("KLON_BENCH_N", OsStr::new("2")),
+            ("KLON_NO_JOBSERVER", OsStr::new("1")),
+        ],
+        "m12-throughput-n6",
+    );
+    if let Some(why) = skip_reason(&report, "m12-throughput-n6") {
+        println!("skipped: {why}");
+        return;
+    }
+    let klon = klon_record(&report);
+    assert_eq!(klon["tokens"], Value::Null, "the store was turned off");
+    assert_eq!(klon["timing_valid"], false, "a run without slots is void");
+    assert_eq!(klon["pass"], false);
+    let why = klon["correctness"]["build"].as_str().expect("a verdict");
+    assert!(why.contains("no jobserver slots"), "found {why}");
+    // The samples are still there. The report voids the timing; it does not
+    // hide it.
+    assert!(klon["ratio"].as_f64().expect("a ratio") > 0.0);
+
+    // The baseline runs no envelope at all, so its null token count is by
+    // design and never voids its row.
+    let baseline = baseline_record(&report);
+    assert_eq!(baseline["tokens"], Value::Null);
+    assert_eq!(baseline["timing_valid"], true);
 }

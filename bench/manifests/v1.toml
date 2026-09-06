@@ -217,5 +217,9 @@ crates = 48
 functions = 150
 builders = 6
 timer = "wall: from the first build start to the last build finish of the concurrent builders"
+# `samples_ms` holds the solo builds, so `p50_ms` is `t_solo_ms`. The time
+# budget of a throughput cell guards `t_wall6_ms`, the series that the timer
+# above names; a budget on the solo median would let a concurrent run of any
+# length through. `pass_ratio` is the rule the metric exists for.
 pass_p50_ms = 300000
 pass_ratio = 0.80

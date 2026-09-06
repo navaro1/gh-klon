@@ -241,7 +241,7 @@ fn run_cell(
     // going through the sample loop. It is a warm cell only: dropping the page
     // cache between six builds would measure the disk, not the contention.
     if cell.action == Action::Throughput {
-        return throughput_cell(manifest, cell, fixture, &checked, drop);
+        return throughput_cell(manifest, cell, fixture, &checked, drop, order_seed);
     }
 
     let mut records = Vec::new();
@@ -427,6 +427,11 @@ fn sample(
             let (primary_ms, stdout) =
                 timed(&mut create_command(tool, golden, &path, fixture::BRANCH))?;
             check_spare(tool, &stdout)?;
+            // The timer is closed. A detached warm that C12 started is still
+            // running, so wait for it: the next sample must start on a quiet
+            // disk, and the teardown must not delete a tree that a live process
+            // is still writing into.
+            wait_for_warm(&path)?;
             teardown(golden, &path)?;
             settle(tool, golden)?;
             Ok(Sample {
@@ -513,7 +518,15 @@ fn sample(
 struct Built {
     ms: f64,
     failure: Option<String>,
+    /// True when the envelope told the command it had no build slots. The
+    /// jobserver is what M12 exists to measure, so a build without slots makes
+    /// the record say what it really measured.
+    no_slots: bool,
 }
+
+/// The line the envelope prints when it could not hand the command the build
+/// slots (`src/envelope/jobserver.rs`).
+const NO_SLOTS: &str = "without build slots";
 
 /// M12: `ratio = (builders × t_solo) / t_wall`.
 ///
@@ -530,30 +543,45 @@ struct Built {
 ///
 /// The fixture of this cell has a cold golden, so every builder does the whole
 /// compile. A warm golden would leave all six with nothing to do.
+#[allow(clippy::too_many_arguments)]
 fn throughput_cell(
     manifest: &Manifest,
     cell: &Cell,
     fixture: &Fixture,
     checked: &[Checked],
     drop: &DropCaches,
+    order_seed: u64,
 ) -> Result<Vec<Record>> {
     let builders = manifest.builders(cell);
     let solo_runs = manifest.solo_runs();
     let golden = fixture.golden();
-    let mut records = Vec::new();
-    for check in checked {
+    // A phase of this cell takes minutes, so the tool that always went first
+    // would meet a cooler machine than the one that always went second. The
+    // recorded seed decides the phase order, exactly as it decides the sample
+    // order of every other cell.
+    let mut phases: Vec<usize> = (0..checked.len()).collect();
+    shuffle(&mut phases, order_seed);
+    let mut step = 0;
+    let mut records: Vec<(usize, Record)> = Vec::new();
+    for index in phases {
+        let check = &checked[index];
         let tool = check.tool;
         eprintln!(
             "klon: bench: {}: {solo_runs} solo builds, then {builders} at once",
             tool.tag()
         );
         let mut solo: Vec<f64> = Vec::new();
+        let mut order: Vec<usize> = Vec::new();
         let mut failure: Option<String> = None;
+        let mut no_slots = false;
         for run in 0..solo_runs {
             let name = format!("{}-{}-solo{run}", cell.name, tool.tag());
             let built = one_build(fixture, tool, &name)?;
             solo.push(built.ms);
+            no_slots |= built.no_slots;
             failure = failure.or(built.failure);
+            order.push(step);
+            step += 1;
         }
 
         // The concurrent run. Each builder needs a branch of its own: git
@@ -573,36 +601,54 @@ fn throughput_cell(
             teardown(golden, path)?;
             fixture::git(golden, &["branch", "-D", name])?;
         }
+        no_slots |= per_klon.iter().any(|b| b.no_slots);
         failure = failure.or_else(|| per_klon.iter().find_map(|b| b.failure.clone()));
 
         let mut record = blank_record(manifest, cell, check, false, drop, solo_runs);
-        // The solo builds of one tool run one after the other, so their order
-        // is their index. There is nothing to interleave: the concurrent run
-        // that follows them is the whole point of the cell.
-        record.order = (0..solo.len()).collect();
+        record.order = order;
         record.samples_ms = solo;
         record.t_solo_ms = Some(report::percentile(&record.samples_ms, 0.50));
         record.t_wall6_ms = Some(t_wall_ms);
         record.per_klon_ms = per_klon.iter().map(|b| b.ms).collect();
         record.builders = Some(builders);
-        record.tokens = tool
-            .under_envelope()
-            .then(|| {
-                (!crate::envelope::jobserver::is_off()).then(crate::envelope::jobserver::target)
-            })
-            .flatten();
-        match failure {
-            Some(why) => {
-                record.correctness.build = format!("the build failed: {why}");
-                record.correctness.matched = false;
-                record.timing_valid = false;
-            }
-            None => record.correctness.build = "ok".to_string(),
+        record.tokens = tokens_in_effect(tool, no_slots);
+        if let Some(why) = failure {
+            record.correctness.build = format!("the build failed: {why}");
+            record.correctness.matched = false;
+            record.timing_valid = false;
+        } else if tool.under_envelope() && record.tokens.is_none() {
+            // The jobserver is what this cell measures. A run whose builds got
+            // no slots measured six unbounded builds under another name, so its
+            // timing must not stand.
+            record.correctness.build =
+                "the envelope handed the builds no jobserver slots, so the run \
+                 did not measure what the cell claims"
+                    .to_string();
+            record.correctness.matched = false;
+            record.timing_valid = false;
+        } else {
+            record.correctness.build = "ok".to_string();
         }
         record.summarize();
-        records.push(record);
+        records.push((index, record));
     }
-    Ok(records)
+    // The report lists the tools in the manifest order, whatever order they ran
+    // in. `order` carries the order they ran in.
+    records.sort_by_key(|(index, _)| *index);
+    Ok(records.into_iter().map(|(_, record)| record).collect())
+}
+
+/// The build slots that an M12 phase really had.
+///
+/// The baseline runs no envelope, so it has none by design. A klon phase has
+/// the jobserver target unless the user turned the store off or the envelope
+/// could not open it; either way the answer is None, and the caller voids the
+/// record rather than report a ratio the envelope did not produce.
+fn tokens_in_effect(tool: Tool, no_slots: bool) -> Option<usize> {
+    if !tool.under_envelope() || no_slots || crate::envelope::jobserver::is_off() {
+        return None;
+    }
+    Some(crate::envelope::jobserver::target())
 }
 
 /// One build alone in a fresh tree, from create to teardown. Only the build is
@@ -668,14 +714,19 @@ fn build_together(fixture: &Fixture, tool: Tool, paths: &[PathBuf]) -> Result<(f
 /// The verdict of one finished build.
 fn finished(started: Instant, output: &std::process::Output) -> Built {
     let ms = started.elapsed().as_secs_f64() * 1000.0;
-    if output.status.success() {
-        return Built { ms, failure: None };
-    }
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let no_slots = text.contains(NO_SLOTS);
+    if output.status.success() {
+        return Built {
+            ms,
+            failure: None,
+            no_slots,
+        };
+    }
     Built {
         ms,
         failure: Some(format!(
@@ -683,6 +734,7 @@ fn finished(started: Instant, output: &std::process::Output) -> Built {
             output.status.code().unwrap_or(-1),
             last_line(&text)
         )),
+        no_slots,
     }
 }
 
@@ -737,15 +789,23 @@ const WARM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
 /// the copy runs inside `add` or behind it in the background: it asks when the
 /// tree is usable, not when the command returned.
 ///
-/// The poll is in two steps, because the full comparison hashes every byte and
-/// a fixed 20 ms loop over a 2 GB state would cost more than the copy it times:
+/// The poll is in three steps, because the full comparison hashes every byte
+/// and a fixed 20 ms loop over a 2 GB state would cost more than the copy it
+/// times:
 ///
-/// 1. Each look compares a cheap fingerprint: the entry count and the total
-///    apparent size. That is one `stat` per entry and no read.
-/// 2. The first look whose fingerprint agrees stops the clock, and the full
+/// 1. `warm::pending` must be empty. C12 lets a big ignored directory finish in
+///    a detached process, and its marker names what the klon still waits for.
+/// 2. Each look then compares a cheap fingerprint: the entry count and the
+///    total apparent size. That is one `stat` per entry and no read.
+/// 3. The first look whose fingerprint agrees stops the clock, and the full
 ///    byte-for-byte and time-for-time comparison then confirms it, outside the
 ///    timer. A fingerprint that agreed over wrong content fails that
 ///    confirmation, and the poll goes on with the clock still running.
+///
+/// The `add` process leaving is not the end of the poll. Since C12 it may
+/// return long before the tree is warm, which is the whole reason this cell
+/// times the state and not the command. Only the warm state or the deadline
+/// ends the loop; an `add` that failed ends it with an error.
 ///
 /// Plain `git worktree add` copies no ignored state, so it never reaches the
 /// warm state. Its row measures the command instead and says `warm_reached:
@@ -773,38 +833,32 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(Error::io("start the measured add"))?;
-    let mut warm: Option<f64> = None;
-    loop {
-        if warm.is_none() && signature(path, kind) == want {
+    let mut exited = false;
+    let primary_ms = loop {
+        if !exited {
+            match child.try_wait().map_err(Error::io("wait for the add"))? {
+                Some(status) if !status.success() => {
+                    return Err(Error::klon(format!(
+                        "the measured add failed with {}",
+                        status.code().unwrap_or(-1)
+                    )))
+                }
+                Some(_) => exited = true,
+                None => {}
+            }
+        }
+        if crate::warm::pending(path).is_empty() && signature(path, kind) == want {
             let reached = started.elapsed().as_secs_f64() * 1000.0;
             // The confirmation is outside the timer: the tree was equal when
             // the fingerprints agreed, not when the hash finished.
             if is_warm(golden, path, kind) {
-                warm = Some(reached);
+                break reached;
             }
-        }
-        match child.try_wait().map_err(Error::io("wait for the add"))? {
-            Some(status) if !status.success() => {
-                return Err(Error::klon(format!(
-                    "the measured add failed with {}",
-                    status.code().unwrap_or(-1)
-                )))
-            }
-            // The command has finished. One more look closes the race between
-            // the last poll and the exit.
-            Some(_) => {
-                if warm.is_none() && is_warm(golden, path, kind) {
-                    warm = Some(started.elapsed().as_secs_f64() * 1000.0);
-                }
-                break;
-            }
-            None => {}
-        }
-        if warm.is_some() {
-            break;
         }
         if started.elapsed() > WARM_DEADLINE {
-            let _ = child.kill();
+            if !exited {
+                let _ = child.kill();
+            }
             return Err(Error::klon(format!(
                 "the tree at {} did not reach golden's ignored state in {} s",
                 path.display(),
@@ -813,26 +867,23 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
         }
         std::thread::sleep(wait);
         wait = (wait * 2).min(POLL_LAST);
+    };
+    // The timer is closed. Reap the command, so the teardown finds no child of
+    // this process still holding the tree.
+    if !exited {
+        let status = child.wait().map_err(Error::io("wait for the add"))?;
+        if !status.success() {
+            return Err(Error::klon(format!(
+                "the measured add failed with {}",
+                status.code().unwrap_or(-1)
+            )));
+        }
     }
-    // The timer is closed. Let the command finish before the teardown.
-    let status = child.wait().map_err(Error::io("wait for the add"))?;
-    if !status.success() {
-        return Err(Error::klon(format!(
-            "the measured add failed with {}",
-            status.code().unwrap_or(-1)
-        )));
-    }
-    match warm {
-        Some(primary_ms) => Ok(Sample {
-            primary_ms,
-            warm_reached: Some(true),
-            ..Sample::default()
-        }),
-        None => Err(Error::klon(format!(
-            "the add finished and {} still differs from golden's ignored state",
-            path.display()
-        ))),
-    }
+    Ok(Sample {
+        primary_ms,
+        warm_reached: Some(true),
+        ..Sample::default()
+    })
 }
 
 /// True when `tree` holds the same ignored state as golden, byte for byte and
@@ -1064,9 +1115,42 @@ fn create_branch(tool: Tool, golden: &Path, path: &Path, branch: &str) -> Result
     prepare(tool, golden)?;
     let (_, stdout) = timed(&mut create_command(tool, golden, path, branch))?;
     check_spare(tool, &stdout)?;
+    // C12 sends a big ignored directory to a detached process, so `add` can
+    // return before the tree is filled. Every step that reads a tree it made
+    // outside a timer waits here first, or it would read a half-filled one.
+    // The M2 cell is the exception: it times that wait itself.
+    wait_for_warm(path)?;
     match tool {
         Tool::Klon | Tool::KlonSpare => backend_of(&stdout),
         Tool::Baseline => Ok(BASELINE.to_string()),
+    }
+}
+
+/// How long a caller waits for a detached warm to land.
+const WARM_WAIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Wait until nothing of `klon` is still warming (C12).
+///
+/// A tree with a warm still running is not the tree a cell measures: the
+/// correctness check would compare a half-filled state, and the next sample
+/// would compete with the copy for the disk. A tree that never warmed, a
+/// baseline worktree included, carries no marker and returns at once.
+fn wait_for_warm(klon: &Path) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let pending = crate::warm::pending(klon);
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() > WARM_WAIT {
+            return Err(Error::klon(format!(
+                "{} still warms {} after {} s",
+                klon.display(),
+                pending.join(", "),
+                WARM_WAIT.as_secs()
+            )));
+        }
+        std::thread::sleep(POLL_FIRST);
     }
 }
 
@@ -1090,12 +1174,22 @@ fn klon_binary() -> PathBuf {
 /// which is slow and correct; the timer is already closed.
 fn teardown(golden: &Path, path: &Path) -> Result<()> {
     let text = path.to_str().unwrap_or_default();
-    if fixture::git(golden, &["worktree", "remove", "--force", text]).is_err() {
-        if path.exists() {
-            fs::remove_dir_all(path).map_err(Error::io(format!("remove {}", path.display())))?;
-        }
-        fixture::git(golden, &["worktree", "prune"])?;
+    let Err(why) = fixture::git(golden, &["worktree", "remove", "--force", text]) else {
+        return Ok(());
+    };
+    if path.exists() {
+        // A removal that runs beside a live writer fails with ENOTEMPTY, and a
+        // bare "Directory not empty" hides which step left one behind. Both
+        // reasons go into the error.
+        fs::remove_dir_all(path).map_err(|err| {
+            Error::klon(format!(
+                "remove {}: {err}; git worktree remove said: {}",
+                path.display(),
+                why.to_string().trim()
+            ))
+        })?;
     }
+    fixture::git(golden, &["worktree", "prune"])?;
     Ok(())
 }
 
