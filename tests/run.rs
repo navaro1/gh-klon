@@ -131,7 +131,9 @@ impl Drop for Reaper {
     }
 }
 
-/// True when `program` sits in a PATH directory.
+/// True when `program` sits in a PATH directory. Only the two Linux tests that
+/// shell out to another tool ask.
+#[cfg(target_os = "linux")]
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
@@ -228,6 +230,9 @@ fn every_live_klon_holds_its_own_loopback_address() {
     assert_eq!(addresses, vec!["127.0.0.2", "127.0.0.3"]);
 }
 
+/// The AC names Linux: `lo` owns all of `127/8` there. macOS gives `lo0` only
+/// `127.0.0.1`, and the alias needs a privilege klon never takes (handoff §5).
+#[cfg(target_os = "linux")]
 #[test]
 fn a_command_under_run_binds_the_loopback_address() {
     if !on_path("python3") {
@@ -320,6 +325,10 @@ fn run_sets_the_directory_the_tag_and_the_git_config() {
     );
 }
 
+/// Linux only: `ps -o sid=` prints the session id. The BSD `ps` of macOS has
+/// no session column that compares with a process id, and `stop` reads the
+/// session through `/proc` anyway.
+#[cfg(target_os = "linux")]
 #[test]
 fn run_starts_a_new_session() {
     if !on_path("ps") {
@@ -839,8 +848,18 @@ fn doctor_reports_the_address_pool_and_the_loopback_bind() {
         "one klon means one address: {}",
         document["features"]["slots"]["detail"]
     );
-    assert_eq!(
-        document["features"]["loopback"]["status"], "present",
-        "127.0.0.2 must accept a bind on this host"
-    );
+    // Linux gives `lo` all of `127/8`, so the bind must work. macOS gives
+    // `lo0` only `127.0.0.1`; the row then reports `broken` and names the
+    // `ifconfig` alias, which is the documented state until C21.
+    let loopback = document["features"]["loopback"]["status"]
+        .as_str()
+        .expect("a loopback row");
+    if cfg!(target_os = "linux") {
+        assert_eq!(loopback, "present", "127.0.0.2 must accept a bind on Linux");
+    } else {
+        assert!(
+            loopback == "present" || loopback == "broken",
+            "unexpected loopback status {loopback}"
+        );
+    }
 }

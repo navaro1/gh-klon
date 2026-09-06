@@ -301,13 +301,20 @@ fn slots_in_use(host: &Host) -> probe::Status {
 }
 
 /// A real bind on the first klon address. `lo` owns all of `127/8` on Linux, so
-/// the bind needs no configuration. A host that refuses it cannot give a klon
-/// its own address, and `doctor` says so before the first `run`.
+/// the bind needs no configuration. macOS gives `lo0` only `127.0.0.1` and the
+/// alias needs a privilege klon never takes, so the row names the command a
+/// person can run. `doctor` reports either state before the first `run`.
 fn loopback(_host: &Host) -> probe::Status {
     let address = slots::ip(2);
     match std::net::TcpListener::bind((address.as_str(), 0)) {
         Ok(_) => probe::Status::Present(format!("{address} accepts a bind")),
-        Err(err) => probe::Status::Broken(format!("cannot bind {address}: {err}")),
+        Err(err) if cfg!(target_os = "linux") => {
+            probe::Status::Broken(format!("cannot bind {address}: {err}"))
+        }
+        Err(err) => probe::Status::Broken(format!(
+            "cannot bind {address}: {err}; add the alias with \
+             sudo ifconfig lo0 alias {address} up"
+        )),
     }
 }
 
