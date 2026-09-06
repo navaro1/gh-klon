@@ -365,11 +365,79 @@ pass_p50_ms = 1000
         assert_eq!(manifest.runs.cold, 5, "the development run is 5 cold");
         assert_eq!(manifest.runs.release_warm, 30);
         assert_eq!(manifest.runs.release_cold, 10);
+        assert_eq!(manifest.runs.solo, 3, "an M12 cell takes 3 solo builds");
         let names: Vec<&str> = manifest.cells.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["m1-add-10k", "m1-add-100k", "m4-status-100k", "m6-rm-100k"]
+            [
+                // C8.
+                "m1-add-10k",
+                "m1-add-100k",
+                "m4-status-100k",
+                "m6-rm-100k",
+                // C31.
+                "m2-warm-10k",
+                "m2-warm-100k",
+                "m3-zero-compile-rust",
+                "m3-zero-compile-pnpm",
+                "m5-disk-100k",
+                "m12-throughput-n6",
+            ]
         );
+    }
+
+    /// The v2 cells carry the shape and the pass rule that C31 promised. A
+    /// changed budget here is a changed claim, so the test names each one.
+    #[test]
+    fn the_v2_cells_carry_their_own_pass_rules() {
+        let manifest = Manifest::load().unwrap();
+        let cell = |name: &str| manifest.cell(name).unwrap().clone();
+
+        let warm = cell("m2-warm-10k");
+        assert_eq!(warm.action, Action::Warm);
+        assert_eq!(warm.fixture, Kind::Synthetic);
+        assert!(!warm.wants_warm_golden(), "M2 fills the tree itself");
+
+        for name in ["m3-zero-compile-rust", "m3-zero-compile-pnpm"] {
+            let build = cell(name);
+            assert_eq!(build.action, Action::Build);
+            assert_eq!(build.pass_units_compiled, Some(0), "R10 asks for zero");
+            assert!(build.wants_warm_golden(), "M3 needs a warm golden");
+        }
+        assert_eq!(cell("m3-zero-compile-rust").fixture, Kind::Rust);
+        assert_eq!(cell("m3-zero-compile-pnpm").fixture, Kind::Pnpm);
+
+        assert_eq!(cell("m5-disk-100k").action, Action::Disk);
+
+        let m12 = cell("m12-throughput-n6");
+        assert_eq!(m12.action, Action::Throughput);
+        assert_eq!(m12.builders, 6);
+        assert_eq!(m12.pass_ratio, Some(0.80));
+        assert!(
+            !m12.wants_warm_golden(),
+            "an M12 golden is cold, so every builder does real work"
+        );
+        // The solo build must already fill the token pool of a large machine,
+        // or the concurrent run would beat it on rounding alone.
+        assert!(
+            m12.crates >= 32,
+            "found {} crates, which is too few to fill the pool",
+            m12.crates
+        );
+    }
+
+    /// `KLON_BENCH_SMOKE=1` shrinks the ecosystem cells too, so the test suite
+    /// compiles two tiny crates instead of a workspace.
+    #[test]
+    fn a_smoke_run_shrinks_the_ecosystem_cells() {
+        let mut manifest = Manifest::load().unwrap();
+        assert!(manifest.cell("m12-throughput-n6").unwrap().crates > SMOKE_CRATES);
+        manifest.shrink_to_smoke();
+        let m12 = manifest.cell("m12-throughput-n6").unwrap();
+        assert_eq!(m12.crates, SMOKE_CRATES);
+        assert_eq!(m12.functions, SMOKE_FUNCTIONS);
+        // The builder count is not a shape. `KLON_BENCH_N` alone changes it.
+        assert_eq!(m12.builders, 6);
     }
 
     /// The C8 acceptance line: a changed seed changes the fixture hash.
