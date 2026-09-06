@@ -731,17 +731,22 @@ fn fill(
 /// is not rewritten, so two concurrent `add` calls do not fight over git's
 /// `config.lock`, and every `add` after the first spawns no `git config`.
 fn ensure_config(golden: &Path) -> Result<()> {
-    const WANTED: [(&str, &str); 3] = [
+    const WANTED: [(&str, &str); 4] = [
         ("core.checkStat", "minimal"),
         ("core.untrackedCache", "true"),
         ("index.version", "4"),
+        // `true` means one thread per CPU. The 100k index of the bench reads
+        // in 18 ms with it and in 38 ms without (G2). git writes the `IEOT`
+        // extension that the threads need whenever the key is on, so the
+        // first index that `add` writes already carries it.
+        ("index.threads", "true"),
     ];
     let current = match git::run(
         golden,
         &[
             "config",
             "--get-regexp",
-            "^(core\\.checkstat|core\\.untrackedcache|index\\.version)$",
+            "^(core\\.checkstat|core\\.untrackedcache|index\\.version|index\\.threads)$",
         ],
     ) {
         Ok(text) => text,

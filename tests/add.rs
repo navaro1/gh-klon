@@ -79,6 +79,10 @@ fn add_feature_on_the_10k_fixture() {
         "true"
     );
     assert_eq!(git_ok(&fx.golden, &["config", "index.version"]).trim(), "4");
+    assert_eq!(
+        git_ok(&fx.golden, &["config", "index.threads"]).trim(),
+        "true"
+    );
     let exclude = fs::read_to_string(fx.golden.join(".git/info/exclude")).unwrap();
     assert_eq!(exclude.lines().filter(|l| *l == "/.klon/").count(), 1);
 
