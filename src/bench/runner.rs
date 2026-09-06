@@ -70,15 +70,38 @@ impl Tool {
     fn for_cell(cell: &Cell) -> Vec<Tool> {
         match cell.action {
             Action::Add => vec![Tool::Klon, Tool::KlonSpare, Tool::Baseline],
-            Action::Status | Action::Rm => vec![Tool::Klon, Tool::Baseline],
+            // The v2 cells measure the direct clone against the baseline. A
+            // spare row would triple the cost of every one of them, and only
+            // M2 would learn anything new; G1 opens that question.
+            Action::Warm
+            | Action::Build
+            | Action::Status
+            | Action::Disk
+            | Action::Rm
+            | Action::Throughput => vec![Tool::Klon, Tool::Baseline],
         }
+    }
+
+    /// True when this tool runs its command inside the klon envelope.
+    fn under_envelope(self) -> bool {
+        matches!(self, Tool::Klon | Tool::KlonSpare)
     }
 }
 
-/// One measured sample: the primary series, plus the M4 steady calls.
+/// One measured sample: the primary series, plus what the cell's metric needs.
+#[derive(Default)]
 struct Sample {
     primary_ms: f64,
     steady_ms: Vec<f64>,
+    /// M2: whether the tree reached golden's ignored state.
+    warm_reached: Option<bool>,
+    /// M3: the units this build compiled.
+    units: Option<u64>,
+    /// M5: the unique bytes of the idle tree, and how they were measured.
+    unique_bytes: Option<u64>,
+    method: Option<&'static str>,
+    /// M3 and M12: why a build failed, when one did.
+    build_failure: Option<String>,
 }
 
 /// Run the selected cells and build the report.
@@ -93,16 +116,13 @@ pub fn run(manifest: &Manifest, options: &Options) -> Result<Report> {
     )))?;
 
     let mut records = Vec::new();
-    // One fixture serves every cell of its profile, so a run of four cells
-    // builds two repositories, not four.
-    for name in profile_names(&cells) {
-        let profile = manifest.profiles[&name];
-        eprintln!(
-            "klon: bench: building the {name} fixture ({} tracked files, {} ignored files)",
-            profile.tracked_files, profile.ignored_files
-        );
-        let fixture = Fixture::build(&options.bench_dir, &name, manifest.seed, &profile)?;
-        for cell in cells.iter().filter(|c| c.profile == name) {
+    // One fixture serves every cell that asks for the same recipe, so a run of
+    // four synthetic cells builds two repositories, not four.
+    for group in fixture_groups(manifest, &cells) {
+        eprintln!("klon: bench: building the {} fixture", group.key);
+        let fixture = Fixture::build(&options.bench_dir, &group.key, manifest.seed, &group.recipe)?;
+        for index in group.cells {
+            let cell = &cells[index];
             eprintln!("klon: bench: cell {}", cell.name);
             records.extend(run_cell(
                 manifest, cell, &fixture, warm_runs, cold_runs, &drop, order_seed,
@@ -129,6 +149,10 @@ pub fn run(manifest: &Manifest, options: &Options) -> Result<Report> {
 }
 
 /// The cells to run, and the cells that this host skips with a reason.
+///
+/// Two reasons skip a cell: the big profile needs `KLON_FIXTURE=100k`, and an
+/// ecosystem cell needs its tool. A missing tool is a fact about the host, so
+/// the run reports it and carries on (spec §5).
 fn select(manifest: &Manifest, options: &Options) -> Result<(Vec<Cell>, Vec<Skip>)> {
     let wanted: Vec<Cell> = match &options.cell {
         Some(name) => vec![manifest.cell(name)?.clone()],
@@ -138,26 +162,61 @@ fn select(manifest: &Manifest, options: &Options) -> Result<(Vec<Cell>, Vec<Skip
     let mut run = Vec::new();
     let mut skipped = Vec::new();
     for cell in wanted {
-        match &cell.requires_fixture {
-            Some(required) if *required != fixture => skipped.push(Skip {
+        if let Some(required) = &cell.requires_fixture {
+            if *required != fixture {
+                skipped.push(Skip {
+                    cell: cell.name.clone(),
+                    reason: format!("the {} profile needs KLON_FIXTURE={required}", cell.profile),
+                });
+                continue;
+            }
+        }
+        match missing_tool(&cell) {
+            Some(name) => skipped.push(Skip {
                 cell: cell.name.clone(),
-                reason: format!("the {} profile needs KLON_FIXTURE={required}", cell.profile),
+                reason: format!(
+                    "a {} cell needs {name}, which is not on PATH",
+                    cell.fixture.tag()
+                ),
             }),
-            _ => run.push(cell),
+            None => run.push(cell),
         }
     }
     Ok((run, skipped))
 }
 
-/// The profile names of `cells`, each once, in the order they first appear.
-fn profile_names(cells: &[Cell]) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for cell in cells {
-        if !names.contains(&cell.profile) {
-            names.push(cell.profile.clone());
+/// The first program that `cell` needs and this host does not have.
+fn missing_tool(cell: &Cell) -> Option<&'static str> {
+    cell.fixture
+        .tools()
+        .iter()
+        .find(|name| fixture::tool(name).is_none())
+        .copied()
+}
+
+/// One generated repository and the cells that measure it.
+struct FixtureGroup {
+    key: String,
+    recipe: fixture::Recipe,
+    /// Indexes into the cell list.
+    cells: Vec<usize>,
+}
+
+/// The fixtures that `cells` need, each once, in the order they first appear.
+fn fixture_groups(manifest: &Manifest, cells: &[Cell]) -> Vec<FixtureGroup> {
+    let mut groups: Vec<FixtureGroup> = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        let recipe = manifest.recipe_of(cell);
+        match groups.iter_mut().find(|group| group.recipe == recipe) {
+            Some(group) => group.cells.push(index),
+            None => groups.push(FixtureGroup {
+                key: recipe.key(&cell.profile),
+                recipe,
+                cells: vec![index],
+            }),
         }
     }
-    names
+    groups
 }
 
 /// One cell: the correctness check per tool, then the warm samples, then the
@@ -176,6 +235,13 @@ fn run_cell(
     let mut checked = Vec::new();
     for tool in Tool::for_cell(cell) {
         checked.push(verify(cell, fixture, tool)?);
+    }
+
+    // M12 needs N trees alive at once, so it builds its own record instead of
+    // going through the sample loop. It is a warm cell only: dropping the page
+    // cache between six builds would measure the disk, not the contention.
+    if cell.action == Action::Throughput {
+        return throughput_cell(manifest, cell, fixture, &checked, drop);
     }
 
     let mut records = Vec::new();
@@ -240,34 +306,94 @@ fn group(
     let mut records = Vec::new();
     for (index, check) in checked.iter().enumerate() {
         let taken = std::mem::take(&mut samples[index]);
-        let mut record = Record {
-            cell: cell.name.clone(),
-            metric: cell.metric.clone(),
-            profile: cell.profile.clone(),
-            profile_shape: manifest.profile_of(cell),
-            backend: check.backend.clone(),
-            spare: check.tool == Tool::KlonSpare,
-            cold,
-            cache_drop: drop.label(cold),
-            timer: cell.timer.clone(),
-            runs,
-            order: std::mem::take(&mut orders[index]),
-            samples_ms: taken.iter().map(|s| s.primary_ms).collect(),
-            p50_ms: 0.0,
-            p95_ms: 0.0,
-            first_p50_ms: None,
-            steady_p50_ms: None,
-            steady_samples_ms: taken.iter().flat_map(|s| s.steady_ms.clone()).collect(),
-            correctness: check.correctness.clone(),
-            timing_valid: check.correctness.matched,
-            pass_p50_ms: cell.pass_p50_ms,
-            pass_steady_p50_ms: cell.pass_steady_p50_ms,
-            pass: None,
-        };
+        let mut record = blank_record(manifest, cell, check, cold, drop, runs);
+        record.order = std::mem::take(&mut orders[index]);
+        record.samples_ms = taken.iter().map(|s| s.primary_ms).collect();
+        record.steady_samples_ms = taken.iter().flat_map(|s| s.steady_ms.clone()).collect();
+        fill_metric(&mut record, &taken);
         record.summarize();
         records.push(record);
     }
     Ok(records)
+}
+
+/// A record with the fields that every cell fills. The caller adds the samples
+/// and the metric of its own cell.
+fn blank_record(
+    manifest: &Manifest,
+    cell: &Cell,
+    check: &Checked,
+    cold: bool,
+    drop: &DropCaches,
+    runs: u32,
+) -> Record {
+    Record {
+        cell: cell.name.clone(),
+        metric: cell.metric.clone(),
+        profile: cell.profile.clone(),
+        profile_shape: manifest.profile_of(cell),
+        fixture: cell.fixture,
+        fixture_shape: (cell.fixture == fixture::Kind::Rust).then(|| cell.shape()),
+        backend: check.backend.clone(),
+        spare: check.tool == Tool::KlonSpare,
+        cold,
+        cache_drop: drop.label(cold),
+        timer: cell.timer.clone(),
+        runs,
+        order: Vec::new(),
+        samples_ms: Vec::new(),
+        p50_ms: 0.0,
+        p95_ms: 0.0,
+        first_p50_ms: None,
+        steady_p50_ms: None,
+        steady_samples_ms: Vec::new(),
+        warm_reached: None,
+        units_compiled: None,
+        unique_bytes: None,
+        method: None,
+        ratio: None,
+        t_solo_ms: None,
+        t_wall6_ms: None,
+        per_klon_ms: Vec::new(),
+        builders: None,
+        tokens: None,
+        correctness: check.correctness.clone(),
+        timing_valid: check.correctness.matched,
+        pass_p50_ms: cell.pass_p50_ms,
+        pass_steady_p50_ms: cell.pass_steady_p50_ms,
+        pass_units_compiled: cell.pass_units_compiled,
+        pass_ratio: cell.pass_ratio,
+        pass: None,
+    }
+}
+
+/// Fold what the samples measured into the record.
+///
+/// The unit count is the largest over the samples, not the median: one sample
+/// that compiled a unit means the cell did not reach zero, and a median would
+/// hide it. The unique-byte figure is the median, because every sample measured
+/// one tree of the same shape and the median rejects a stray reading.
+fn fill_metric(record: &mut Record, samples: &[Sample]) {
+    if samples.iter().any(|s| s.warm_reached.is_some()) {
+        record.warm_reached = Some(samples.iter().all(|s| s.warm_reached == Some(true)));
+    }
+    record.units_compiled = samples.iter().filter_map(|s| s.units).max();
+    let bytes: Vec<f64> = samples
+        .iter()
+        .filter_map(|s| s.unique_bytes)
+        .map(|n| n as f64)
+        .collect();
+    if !bytes.is_empty() {
+        record.unique_bytes = Some(report::percentile(&bytes, 0.50) as u64);
+        record.method = samples.iter().find_map(|s| s.method);
+    }
+    if let Some(why) = samples.iter().find_map(|s| s.build_failure.clone()) {
+        record.correctness.build = format!("the build failed: {why}");
+        record.correctness.matched = false;
+        record.timing_valid = false;
+    } else if samples.iter().any(|s| s.units.is_some()) {
+        record.correctness.build = "ok".to_string();
+    }
 }
 
 /// One sample. Only the measured command is inside the timer.
@@ -298,15 +424,49 @@ fn sample(
         Action::Add => {
             prepare(tool, golden)?;
             chill()?;
-            let (primary_ms, stdout) = timed(&mut create_command(tool, golden, &path))?;
+            let (primary_ms, stdout) =
+                timed(&mut create_command(tool, golden, &path, fixture::BRANCH))?;
             check_spare(tool, &stdout)?;
             teardown(golden, &path)?;
             settle(tool, golden)?;
             Ok(Sample {
                 primary_ms,
-                steady_ms: Vec::new(),
+                ..Sample::default()
             })
         }
+        Action::Warm => {
+            chill()?;
+            let sample = warm_sample(fixture, tool, &path)?;
+            teardown(golden, &path)?;
+            Ok(sample)
+        }
+        Action::Build => {
+            create(tool, golden, &path)?;
+            chill()?;
+            let sample = build_sample(fixture, &path)?;
+            teardown(golden, &path)?;
+            Ok(sample)
+        }
+        Action::Disk => {
+            create(tool, golden, &path)?;
+            chill()?;
+            // The tree is idle: nothing has run in it since `add` finished.
+            let started = Instant::now();
+            let usage = super::disk::measure(&path);
+            let primary_ms = started.elapsed().as_secs_f64() * 1000.0;
+            teardown(golden, &path)?;
+            Ok(Sample {
+                primary_ms,
+                unique_bytes: Some(usage.bytes),
+                method: Some(usage.method),
+                ..Sample::default()
+            })
+        }
+        // M12 needs N trees at once, which no single sample can hold. The
+        // throughput path below builds its own record.
+        Action::Throughput => Err(Error::klon(
+            "an M12 cell does not run through the sample loop",
+        )),
         Action::Status => {
             create(tool, golden, &path)?;
             chill()?;
@@ -321,6 +481,7 @@ fn sample(
             Ok(Sample {
                 primary_ms,
                 steady_ms,
+                ..Sample::default()
             })
         }
         Action::Rm => {
@@ -340,10 +501,367 @@ fn sample(
             }
             Ok(Sample {
                 primary_ms,
-                steady_ms: Vec::new(),
+                ..Sample::default()
             })
         }
     }
+}
+
+// --- M12: build throughput at N builders ----------------------------------------
+
+/// One finished build: how long it took and whether it worked.
+struct Built {
+    ms: f64,
+    failure: Option<String>,
+}
+
+/// M12: `ratio = (builders × t_solo) / t_wall`.
+///
+/// `t_solo` is the median of `solo_runs` builds, each alone in a fresh tree.
+/// `t_wall` is the wall time from the first start to the last finish of
+/// `builders` builds that run at once, each in its own tree. A ratio of one
+/// means that N builders together cost exactly N times one builder alone; the
+/// pass rule of 0.80 allows a quarter of the time to contention (handoff §8).
+///
+/// Every klon build runs under `gh klon run`, so the jobserver, the resource
+/// scope, and the write fence are all in the measurement. That is the point of
+/// the cell: the envelope is what klon offers against six unbounded builds. The
+/// baseline builds bare, which is what a `git worktree add` user gets.
+///
+/// The fixture of this cell has a cold golden, so every builder does the whole
+/// compile. A warm golden would leave all six with nothing to do.
+fn throughput_cell(
+    manifest: &Manifest,
+    cell: &Cell,
+    fixture: &Fixture,
+    checked: &[Checked],
+    drop: &DropCaches,
+) -> Result<Vec<Record>> {
+    let builders = manifest.builders(cell);
+    let solo_runs = manifest.solo_runs();
+    let golden = fixture.golden();
+    let mut records = Vec::new();
+    for check in checked {
+        let tool = check.tool;
+        eprintln!(
+            "klon: bench: {}: {solo_runs} solo builds, then {builders} at once",
+            tool.tag()
+        );
+        let mut solo: Vec<f64> = Vec::new();
+        let mut failure: Option<String> = None;
+        for run in 0..solo_runs {
+            let name = format!("{}-{}-solo{run}", cell.name, tool.tag());
+            let built = one_build(fixture, tool, &name)?;
+            solo.push(built.ms);
+            failure = failure.or(built.failure);
+        }
+
+        // The concurrent run. Each builder needs a branch of its own: git
+        // refuses two worktrees on one branch.
+        let names: Vec<String> = (0..builders)
+            .map(|i| format!("{}-{}-n{i}", cell.name, tool.tag()))
+            .collect();
+        let mut paths = Vec::new();
+        for name in &names {
+            fixture::git(golden, &["branch", "-f", name, fixture::BRANCH])?;
+            let path = fixture.root().join(name);
+            create_branch(tool, golden, &path, name)?;
+            paths.push(path);
+        }
+        let (t_wall_ms, per_klon) = build_together(fixture, tool, &paths)?;
+        for (path, name) in paths.iter().zip(&names) {
+            teardown(golden, path)?;
+            fixture::git(golden, &["branch", "-D", name])?;
+        }
+        failure = failure.or_else(|| per_klon.iter().find_map(|b| b.failure.clone()));
+
+        let mut record = blank_record(manifest, cell, check, false, drop, solo_runs);
+        record.samples_ms = solo;
+        record.t_solo_ms = Some(report::percentile(&record.samples_ms, 0.50));
+        record.t_wall6_ms = Some(t_wall_ms);
+        record.per_klon_ms = per_klon.iter().map(|b| b.ms).collect();
+        record.builders = Some(builders);
+        record.tokens = tool
+            .under_envelope()
+            .then(|| {
+                (!crate::envelope::jobserver::is_off()).then(crate::envelope::jobserver::target)
+            })
+            .flatten();
+        match failure {
+            Some(why) => {
+                record.correctness.build = format!("the build failed: {why}");
+                record.correctness.matched = false;
+                record.timing_valid = false;
+            }
+            None => record.correctness.build = "ok".to_string(),
+        }
+        record.summarize();
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// One build alone in a fresh tree, from create to teardown. Only the build is
+/// timed.
+fn one_build(fixture: &Fixture, tool: Tool, name: &str) -> Result<Built> {
+    let golden = fixture.golden();
+    let path = fixture.root().join(name);
+    create(tool, golden, &path)?;
+    let mut command = throughput_command(fixture, tool, &path)?;
+    let started = Instant::now();
+    let output = command
+        .output()
+        .map_err(Error::io("run the measured build"))?;
+    let built = finished(started, &output);
+    teardown(golden, &path)?;
+    Ok(built)
+}
+
+/// Start one build per tree and wait for all of them. The answer is the wall
+/// time of the whole run and the wall time of each build.
+///
+/// One thread per builder, so each build is timed from its own spawn to its own
+/// exit. Reaping the children in order instead would charge every early
+/// finisher with the wait for the slowest one.
+fn build_together(fixture: &Fixture, tool: Tool, paths: &[PathBuf]) -> Result<(f64, Vec<Built>)> {
+    let mut commands = Vec::new();
+    for path in paths {
+        commands.push(throughput_command(fixture, tool, path)?);
+    }
+    let started_all = Instant::now();
+    let built: Vec<Result<Built>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = commands
+            .iter_mut()
+            .map(|command| {
+                scope.spawn(|| {
+                    let started = Instant::now();
+                    let output = command
+                        .output()
+                        .map_err(Error::io("run a concurrent build"))?;
+                    Ok(finished(started, &output))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::klon("a builder thread panicked")))
+            })
+            .collect()
+    });
+    // Every builder has exited, so the elapsed time is the first start to the
+    // last finish. The thread starts add a fraction of a millisecond to it,
+    // which counts against klon and never for it.
+    let t_wall_ms = started_all.elapsed().as_secs_f64() * 1000.0;
+    Ok((
+        t_wall_ms,
+        built.into_iter().collect::<Result<Vec<Built>>>()?,
+    ))
+}
+
+/// The verdict of one finished build.
+fn finished(started: Instant, output: &std::process::Output) -> Built {
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
+    if output.status.success() {
+        return Built { ms, failure: None };
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Built {
+        ms,
+        failure: Some(format!(
+            "exit {}: {}",
+            output.status.code().unwrap_or(-1),
+            last_line(&text)
+        )),
+    }
+}
+
+/// The build that one M12 builder runs. A klon build goes through `gh klon
+/// run`, so the whole envelope is inside the timer; a baseline build runs bare.
+fn throughput_command(fixture: &Fixture, tool: Tool, tree: &Path) -> Result<Command> {
+    let kind = fixture.kind();
+    let program = ecosystem_program(kind)?;
+    let inner = fixture::build_command(kind, &program, tree, &fixture.store(), false);
+    if !tool.under_envelope() {
+        return Ok(inner);
+    }
+    let mut outer = Command::new(klon_binary());
+    outer
+        .current_dir(fixture.golden())
+        .args(["run", "--path"])
+        .arg(tree)
+        .arg("--")
+        .arg(inner.get_program())
+        .args(inner.get_args());
+    // The inner command cleared the leaking build variables and turned the
+    // colour off. `run` passes its own environment on to the command, so the
+    // same treatment on the wrapper reaches the build.
+    for (key, value) in inner.get_envs() {
+        match value {
+            Some(value) => outer.env(key, value),
+            None => outer.env_remove(key),
+        };
+    }
+    fixture::isolate(&mut outer);
+    Ok(outer)
+}
+
+// --- M2: the time to a warm tree ------------------------------------------------
+
+/// How often the M2 poll looks at the ignored state.
+const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long the M2 poll waits before it calls the warm state unreachable.
+const WARM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// M2: the time from the start of `add` until the tree holds golden's ignored
+/// state.
+///
+/// The timer starts before the child does and stops when the poll first sees
+/// the two manifests agree. The measurement therefore holds whether the copy
+/// runs inside `add` or behind it in the background: it asks when the tree is
+/// usable, not when the command returned.
+///
+/// Plain `git worktree add` copies no ignored state, so it never reaches the
+/// warm state. Its row measures the command instead and says `warm_reached:
+/// false`, which is the `never` of the handoff table.
+fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
+    let golden = fixture.golden();
+    if !tool.under_envelope() {
+        let primary_ms = timed(&mut create_command(tool, golden, path, fixture::BRANCH))?.0;
+        return Ok(Sample {
+            primary_ms,
+            warm_reached: Some(false),
+            ..Sample::default()
+        });
+    }
+    let kind = fixture.kind();
+    let started = Instant::now();
+    let mut child = create_command(tool, golden, path, fixture::BRANCH)
+        .spawn()
+        .map_err(Error::io("start the measured add"))?;
+    let mut warm: Option<f64> = None;
+    loop {
+        if warm.is_none() && compare_ignored(golden, path, kind)?.is_none() {
+            warm = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        match child.try_wait().map_err(Error::io("wait for the add"))? {
+            Some(status) if !status.success() => {
+                return Err(Error::klon(format!(
+                    "the measured add failed with {}",
+                    status.code().unwrap_or(-1)
+                )))
+            }
+            // The command has finished. One more look closes the race between
+            // the last poll and the exit.
+            Some(_) => {
+                if warm.is_none() && compare_ignored(golden, path, kind)?.is_none() {
+                    warm = Some(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                break;
+            }
+            None => {}
+        }
+        if warm.is_some() {
+            break;
+        }
+        if started.elapsed() > WARM_DEADLINE {
+            let _ = child.kill();
+            return Err(Error::klon(format!(
+                "the tree at {} did not reach golden's ignored state in {} s",
+                path.display(),
+                WARM_DEADLINE.as_secs()
+            )));
+        }
+        std::thread::sleep(POLL);
+    }
+    // The timer is closed. Let the command finish before the teardown.
+    let status = child.wait().map_err(Error::io("wait for the add"))?;
+    if !status.success() {
+        return Err(Error::klon(format!(
+            "the measured add failed with {}",
+            status.code().unwrap_or(-1)
+        )));
+    }
+    match warm {
+        Some(primary_ms) => Ok(Sample {
+            primary_ms,
+            warm_reached: Some(true),
+            ..Sample::default()
+        }),
+        None => Err(Error::klon(format!(
+            "the add finished and {} still differs from golden's ignored state",
+            path.display()
+        ))),
+    }
+}
+
+// --- M3: the units a first build compiles ---------------------------------------
+
+/// M3: build in `tree` and count what the build compiled.
+///
+/// The build runs directly in the tree, not under `gh klon run`: M3 asks what
+/// the ecosystem does with a warm state that moved, and the envelope changes
+/// neither the unit count nor the answer. M12 below runs under `run`, because
+/// the envelope is exactly what M12 measures.
+///
+/// A failed build is a result, not the end of the run. A plain `git worktree
+/// add` tree has no warm state to install from, so its build may well fail;
+/// the record then says so and its timing is void.
+fn build_sample(fixture: &Fixture, tree: &Path) -> Result<Sample> {
+    let kind = fixture.kind();
+    let program = ecosystem_program(kind)?;
+    let started = Instant::now();
+    let output = fixture::build_command(kind, &program, tree, &fixture.store(), false)
+        .output()
+        .map_err(Error::io("run the measured build"))?;
+    let primary_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Ok(Sample {
+            primary_ms,
+            build_failure: Some(format!(
+                "exit {}: {}",
+                output.status.code().unwrap_or(-1),
+                last_line(&text)
+            )),
+            ..Sample::default()
+        });
+    }
+    Ok(Sample {
+        primary_ms,
+        units: Some(fixture::units_compiled(kind, &text)),
+        ..Sample::default()
+    })
+}
+
+/// The program that builds this kind of fixture. `select` proved it is here.
+fn ecosystem_program(kind: fixture::Kind) -> Result<PathBuf> {
+    let name = kind
+        .tools()
+        .first()
+        .ok_or_else(|| Error::klon("a synthetic cell has no build tool"))?;
+    fixture::tool(name).ok_or_else(|| Error::klon(format!("{name} is not on PATH")))
+}
+
+/// The last line of `text` that holds anything, for a one-line failure report.
+fn last_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no output")
+        .to_string()
 }
 
 // --- The measured commands -----------------------------------------------------
@@ -372,7 +890,7 @@ fn timed(command: &mut Command) -> Result<(f64, String)> {
 /// The plain klon tool passes `--no-spare`, so its number is the direct
 /// clone. The spare tool sets `KLON_SPARE=1`, which beats a `KLON_SPARE=0`
 /// that the test harness may have put in the environment of `bench`.
-fn create_command(tool: Tool, golden: &Path, path: &Path) -> Command {
+fn create_command(tool: Tool, golden: &Path, path: &Path, branch: &str) -> Command {
     match tool {
         Tool::Klon | Tool::KlonSpare => {
             let mut command = Command::new(klon_binary());
@@ -382,13 +900,13 @@ fn create_command(tool: Tool, golden: &Path, path: &Path) -> Command {
             } else {
                 command.env("KLON_SPARE", "1");
             }
-            command.args([fixture::BRANCH, "--path"]).arg(path);
+            command.args([branch, "--path"]).arg(path);
             fixture::isolate(&mut command);
             command
         }
         Tool::Baseline => {
             let mut command = fixture::isolated_git(golden, &["worktree", "add"]);
-            command.arg(path).arg(fixture::BRANCH);
+            command.arg(path).arg(branch);
             command
         }
     }
@@ -461,8 +979,14 @@ fn status_command(path: &Path) -> Command {
 
 /// Create a tree outside the timer. The answer is the backend that filled it.
 fn create(tool: Tool, golden: &Path, path: &Path) -> Result<String> {
+    create_branch(tool, golden, path, fixture::BRANCH)
+}
+
+/// `create`, with the branch that the new tree checks out. M12 needs one branch
+/// per builder: git refuses two worktrees on one branch.
+fn create_branch(tool: Tool, golden: &Path, path: &Path, branch: &str) -> Result<String> {
     prepare(tool, golden)?;
-    let (_, stdout) = timed(&mut create_command(tool, golden, path))?;
+    let (_, stdout) = timed(&mut create_command(tool, golden, path, branch))?;
     check_spare(tool, &stdout)?;
     match tool {
         Tool::Klon | Tool::KlonSpare => backend_of(&stdout),
@@ -544,7 +1068,7 @@ fn verify(cell: &Cell, fixture: &Fixture, tool: Tool) -> Result<Checked> {
     if inject_mismatch() {
         inject(&path)?;
     }
-    let mut correctness = check(golden, &path, tool)?;
+    let mut correctness = check(golden, &path, tool, fixture.kind())?;
     if cell.action == Action::Rm {
         let (ok, detail) = removal_verdict(golden, &path, tool);
         correctness.matched = correctness.matched && ok;
@@ -627,16 +1151,21 @@ fn first_file(dir: &Path) -> Result<Option<PathBuf>> {
 /// 2. The tracked side: the tree holds the branch that the cell asked for, at
 ///    golden's commit for it.
 /// 3. A clean `git status`, after klon forced git to compare content.
-fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
+fn check(golden: &Path, tree: &Path, tool: Tool, kind: fixture::Kind) -> Result<Correctness> {
     let ignored_manifest = match tool {
-        Tool::Klon | Tool::KlonSpare => {
-            let want = golden.join(fixture::IGNORED_DIR);
-            let got = tree.join(fixture::IGNORED_DIR);
-            match compare(&want, &got)? {
-                None => "match".to_string(),
-                Some(why) => format!("mismatch: {why}"),
-            }
-        }
+        // The path fixup pass rewrites golden's absolute path inside a real
+        // build tree, so a correct klon of a cargo or a pnpm fixture can never
+        // equal golden byte for byte (handoff §9). Such a cell rests on the
+        // metric it measures instead: a build that compiled zero units and
+        // exited 0 is the proof that the state moved.
+        _ if kind.fixup_rewrites_ignored_state() => format!(
+            "not-applicable: the path fixup rewrites golden's path inside the {} state",
+            kind.tag()
+        ),
+        Tool::Klon | Tool::KlonSpare => match compare_ignored(golden, tree, kind)? {
+            None => "match".to_string(),
+            Some(why) => format!("mismatch: {why}"),
+        },
         // Plain `git worktree add` copies no ignored state, so there is nothing
         // to compare. That absence is the point of the baseline, not a fault.
         Tool::Baseline => "not-applicable: the baseline copies no ignored state".to_string(),
@@ -655,6 +1184,7 @@ fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
         tracked,
         status,
         removal: "not-applicable: the cell removes no tree".to_string(),
+        build: "not-applicable: the cell builds nothing".to_string(),
     })
 }
 
@@ -720,6 +1250,17 @@ fn force_content_check(tree: &Path) -> Result<()> {
     }
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(0, 0))
         .map_err(Error::io(format!("re-time {}", path.display())))
+}
+
+/// Compare every ignored directory of `kind` between golden and `tree`. The
+/// answer names the first difference, or None when they all agree.
+fn compare_ignored(golden: &Path, tree: &Path, kind: fixture::Kind) -> Result<Option<String>> {
+    for dir in kind.ignored_dirs() {
+        if let Some(why) = compare(&golden.join(dir), &tree.join(dir))? {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
 }
 
 /// One entry of a tree manifest.

@@ -6,6 +6,7 @@
 //! version and the fixture hash, the raw samples, the run order, the host, and
 //! the correctness verdict that decides whether the timing counts at all.
 
+use crate::bench::fixture::{Kind, Shape};
 use crate::bench::manifest::Profile;
 use crate::{probe, time};
 use serde::Serialize;
@@ -79,6 +80,13 @@ pub struct Record {
     pub profile: String,
     /// The shape that the fixture of this record was built from.
     pub profile_shape: Profile,
+    /// Which repository the record measured: `synthetic`, `rust`, or `pnpm`
+    /// (C31).
+    pub fixture: Kind,
+    /// The ecosystem shape behind a `rust` record. Null for the other kinds.
+    /// It is outside `fixture_hash` on purpose, so a C8 result and a C31 result
+    /// of one profile still compare; this field tells two ecosystem runs apart.
+    pub fixture_shape: Option<Shape>,
     /// The klon backend that filled the tree, or `git-worktree-add`.
     pub backend: String,
     /// True when a hot spare was ready before every `add` of the record (C9).
@@ -102,12 +110,42 @@ pub struct Record {
     pub steady_p50_ms: Option<f64>,
     /// M4 only: the raw samples behind `steady_p50_ms`.
     pub steady_samples_ms: Vec<f64>,
+    /// M2 only: true when the tree reached golden's ignored state. A plain
+    /// `git worktree add` copies none of it, so its row reports false: the
+    /// handoff table says `never` for that tool.
+    pub warm_reached: Option<bool>,
+    /// M3 only: the units the measured build compiled. It is the largest count
+    /// over the samples, so one sample that compiled a unit fails the cell.
+    pub units_compiled: Option<u64>,
+    /// M5 only: the bytes that this tree alone holds.
+    pub unique_bytes: Option<u64>,
+    /// M5 only: `btrfs-fi-du` (exact) or `upper-bound`.
+    pub method: Option<&'static str>,
+    /// M12 only: `(builders × t_solo_ms) / t_wall6_ms`. One means that N
+    /// builders together cost exactly N times one builder alone.
+    pub ratio: Option<f64>,
+    /// M12 only: the median wall time of one build alone. It equals `p50_ms`.
+    pub t_solo_ms: Option<f64>,
+    /// M12 only: the wall time from the first start to the last finish of the
+    /// concurrent builds.
+    pub t_wall6_ms: Option<f64>,
+    /// M12 only: the wall time of each concurrent build.
+    pub per_klon_ms: Vec<f64>,
+    /// M12 only: the concurrent builders. Six unless `KLON_BENCH_N` said less.
+    pub builders: Option<usize>,
+    /// M12 only: the jobserver tokens in effect for the klon builds. The
+    /// baseline runs no jobserver, so its row reports null.
+    pub tokens: Option<usize>,
     pub correctness: Correctness,
     /// False when the correctness check failed. A wrong tree voids its timing.
     pub timing_valid: bool,
     pub pass_p50_ms: u64,
     /// The steady budget of an M4 cell. Null for every other cell.
     pub pass_steady_p50_ms: Option<u64>,
+    /// The unit budget of an M3 cell. Null for every other cell.
+    pub pass_units_compiled: Option<u64>,
+    /// The throughput budget of an M12 cell. Null for every other cell.
+    pub pass_ratio: Option<f64>,
     /// Whether the record met the pass rule. Null for the baseline, which the
     /// klon budget does not bind.
     pub pass: Option<bool>,
@@ -126,6 +164,9 @@ pub struct Correctness {
     /// Whether the measured removal left the tree behind. An M6 cell alone
     /// fills it; every other cell removes nothing.
     pub removal: String,
+    /// Whether every measured build exited 0. An M3 or an M12 cell fills it;
+    /// every other cell builds nothing.
+    pub build: String,
 }
 
 /// A cell that did not run.
@@ -144,9 +185,28 @@ impl Record {
             self.first_p50_ms = Some(self.p50_ms);
             self.steady_p50_ms = Some(percentile(&self.steady_samples_ms, 0.50));
         }
+        if let (Some(solo), Some(wall), Some(builders)) =
+            (self.t_solo_ms, self.t_wall6_ms, self.builders)
+        {
+            // A wall time of zero would divide by zero. It cannot happen with a
+            // real build, and a ratio of nothing is the honest answer if it did.
+            self.ratio = (wall > 0.0).then(|| builders as f64 * solo / wall);
+        }
         let within = self.p50_ms <= self.pass_p50_ms as f64
             && match (self.steady_p50_ms, self.pass_steady_p50_ms) {
                 (Some(steady), Some(budget)) => steady <= budget as f64,
+                _ => true,
+            }
+            // A cell with a unit budget and no count measured nothing, so it
+            // cannot pass.
+            && match (self.units_compiled, self.pass_units_compiled) {
+                (Some(units), Some(budget)) => units <= budget,
+                (None, Some(_)) => false,
+                _ => true,
+            }
+            && match (self.ratio, self.pass_ratio) {
+                (Some(ratio), Some(budget)) => ratio >= budget,
+                (None, Some(_)) => false,
                 _ => true,
             };
         // The pass rule binds klon, not the tool it is compared against.
@@ -380,8 +440,8 @@ impl Report {
             self.environment.git_version
         );
         println!(
-            "{:<16} {:<18} {:<5} {:>4} {:>9} {:>9} {:>9} {:>6} verdict",
-            "cell", "backend", "spare", "runs", "p50 ms", "p95 ms", "steady", "budget"
+            "{:<20} {:<18} {:<5} {:>4} {:>9} {:>9} {:>9} {:>6} {:<20} verdict",
+            "cell", "backend", "spare", "runs", "p50 ms", "p95 ms", "steady", "budget", "metric"
         );
         for record in &self.records {
             let steady = match record.steady_p50_ms {
@@ -389,7 +449,7 @@ impl Report {
                 None => "-".to_string(),
             };
             println!(
-                "{:<16} {:<18} {:<5} {:>4} {:>9.1} {:>9.1} {:>9} {:>6} {}",
+                "{:<20} {:<18} {:<5} {:>4} {:>9.1} {:>9.1} {:>9} {:>6} {:<20} {}",
                 record.cell,
                 record.backend,
                 if record.spare { "yes" } else { "no" },
@@ -398,6 +458,7 @@ impl Report {
                 record.p95_ms,
                 steady,
                 record.pass_p50_ms,
+                headline(record),
                 verdict(record)
             );
         }
@@ -405,6 +466,24 @@ impl Report {
             println!("skipped {}: {}", skip.cell, skip.reason);
         }
     }
+}
+
+/// The figure that the cell exists to report. A time cell has none: its p50 is
+/// already in its own column.
+fn headline(record: &Record) -> String {
+    if let Some(units) = record.units_compiled {
+        return format!("{units} units");
+    }
+    if let (Some(bytes), Some(method)) = (record.unique_bytes, record.method) {
+        return format!("{bytes} B {method}");
+    }
+    if let Some(ratio) = record.ratio {
+        return format!("ratio {ratio:.2} of {}", record.builders.unwrap_or(0));
+    }
+    if record.warm_reached == Some(false) {
+        return "never warm".to_string();
+    }
+    "-".to_string()
 }
 
 /// The last column: the reason a record is void, else pass, fail, or baseline.
@@ -430,6 +509,7 @@ impl Correctness {
             self.tracked.as_str(),
             self.status.as_str(),
             self.removal.as_str(),
+            self.build.as_str(),
         ]
         .into_iter()
         .filter(|verdict| {
@@ -501,6 +581,7 @@ mod tests {
             tracked: "on feature at 1a2b3c".to_string(),
             status: "clean".to_string(),
             removal: "removed".to_string(),
+            build: "not-applicable: the cell builds nothing".to_string(),
         };
         assert_eq!(correctness.reason(), "none");
 

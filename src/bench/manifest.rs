@@ -9,6 +9,7 @@
 //! a changed shape gives a new hash, so a reader can tell at once whether two
 //! result files measure the same repository.
 
+use super::fixture::{Kind, Recipe, Shape};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +54,10 @@ const SMOKE: Profile = Profile {
     added_files: 2,
 };
 
+/// The ecosystem shape that `KLON_BENCH_SMOKE=1` gives every cell.
+const SMOKE_CRATES: usize = 2;
+const SMOKE_FUNCTIONS: usize = 5;
+
 /// The sample counts.
 #[derive(Debug, Deserialize)]
 pub struct Runs {
@@ -61,10 +66,18 @@ pub struct Runs {
     pub release_warm: u32,
     pub release_cold: u32,
     pub steady_calls: u32,
+    /// The solo builds behind `t_solo_ms` of an M12 cell. Their median is the
+    /// ideal that the concurrent run is measured against.
+    #[serde(default = "default_solo")]
+    pub solo: u32,
+}
+
+fn default_solo() -> u32 {
+    3
 }
 
 /// One generated repository shape.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Profile {
     pub tracked_files: usize,
     pub dirs: usize,
@@ -80,10 +93,30 @@ pub struct Profile {
 pub enum Action {
     /// M1: create a tree.
     Add,
+    /// M2: create a tree and wait until its ignored state equals golden's.
+    Warm,
+    /// M3: build in a fresh tree and count the units it compiled.
+    Build,
     /// M4: `git status` in a fresh tree.
     Status,
+    /// M5: the unique bytes of an idle tree.
+    Disk,
     /// M6: remove a tree.
     Rm,
+    /// M12: N trees build at once; the ratio against one build alone.
+    Throughput,
+}
+
+impl Action {
+    /// True when the generator must run the ecosystem build once in golden, so
+    /// a tree made from it starts warm.
+    ///
+    /// M3 asks what a klon of a warm golden compiles, so its golden is warm.
+    /// M12 asks what N builders cost, so its golden is cold: a warm one would
+    /// leave every builder with nothing to do.
+    fn wants_warm_golden(self) -> bool {
+        matches!(self, Action::Build)
+    }
 }
 
 /// One benchmark cell.
@@ -93,17 +126,62 @@ pub struct Cell {
     pub metric: String,
     pub profile: String,
     pub action: Action,
+    /// Which repository the cell measures. Default: the generated file tree.
+    #[serde(default = "default_kind")]
+    pub fixture: Kind,
     /// Where the timer starts and stops, in words. The report copies it.
     pub timer: String,
+    /// The member crates of a `rust` fixture.
+    #[serde(default = "default_one")]
+    pub crates: usize,
+    /// The generated functions per crate of a `rust` fixture.
+    #[serde(default = "default_one")]
+    pub functions: usize,
+    /// The concurrent builders of an M12 cell.
+    #[serde(default = "default_builders")]
+    pub builders: usize,
     /// The pass rule: the p50 budget of the primary series, in milliseconds.
     pub pass_p50_ms: u64,
     /// The p50 budget of the steady series, for M4.
     #[serde(default)]
     pub pass_steady_p50_ms: Option<u64>,
+    /// The largest unit count a klon may compile, for M3. R10 asks for zero.
+    #[serde(default)]
+    pub pass_units_compiled: Option<u64>,
+    /// The smallest throughput ratio a klon may reach, for M12.
+    #[serde(default)]
+    pub pass_ratio: Option<f64>,
     /// The value that `KLON_FIXTURE` must hold before this cell may run. A cell
     /// without it always runs.
     #[serde(default)]
     pub requires_fixture: Option<String>,
+}
+
+fn default_kind() -> Kind {
+    Kind::Synthetic
+}
+
+fn default_one() -> usize {
+    1
+}
+
+fn default_builders() -> usize {
+    6
+}
+
+impl Cell {
+    /// The ecosystem shape of this cell.
+    pub fn shape(&self) -> Shape {
+        Shape {
+            crates: self.crates,
+            functions: self.functions,
+        }
+    }
+
+    /// True when the cell needs the ecosystem build in golden.
+    pub fn wants_warm_golden(&self) -> bool {
+        self.action.wants_warm_golden()
+    }
 }
 
 impl Manifest {
@@ -117,17 +195,49 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Put the smoke shape in place of every profile.
+    /// Put the smoke shape in place of every profile and of every ecosystem
+    /// cell. A smoke `cargo build` compiles two tiny crates instead of a
+    /// workspace, which is what the test suite needs.
     pub fn shrink_to_smoke(&mut self) {
         self.smoke = true;
         for profile in self.profiles.values_mut() {
             *profile = SMOKE;
+        }
+        for cell in &mut self.cells {
+            cell.crates = cell.crates.min(SMOKE_CRATES);
+            cell.functions = cell.functions.min(SMOKE_FUNCTIONS);
         }
     }
 
     /// The profile of `cell`. `parse` proved that it exists.
     pub fn profile_of(&self, cell: &Cell) -> Profile {
         self.profiles[&cell.profile]
+    }
+
+    /// The recipe of the fixture that `cell` measures.
+    pub fn recipe_of(&self, cell: &Cell) -> Recipe {
+        Recipe {
+            kind: cell.fixture,
+            profile: self.profile_of(cell),
+            shape: cell.shape(),
+            warm: cell.wants_warm_golden(),
+        }
+    }
+
+    /// The solo builds behind `t_solo_ms`. `KLON_BENCH_RUNS` shortens them for
+    /// the test suite, exactly as it shortens every other sample count.
+    pub fn solo_runs(&self) -> u32 {
+        override_runs().unwrap_or(self.runs.solo).max(1)
+    }
+
+    /// The concurrent builders of an M12 cell. `KLON_BENCH_N` overrides the
+    /// manifest, so a test can measure two builders in a minute while the
+    /// committed cell still asks for six.
+    pub fn builders(&self, cell: &Cell) -> usize {
+        match std::env::var("KLON_BENCH_N").ok().and_then(named_count) {
+            Some(count) => count,
+            None => cell.builders.max(1),
+        }
     }
 
     /// Parse `text`. A version this binary does not know fails closed, like the
@@ -205,12 +315,12 @@ impl Manifest {
 
 /// The `KLON_BENCH_RUNS` override, when it names a count of one or more.
 fn override_runs() -> Option<u32> {
-    std::env::var("KLON_BENCH_RUNS")
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
-        .filter(|runs| *runs > 0)
+    std::env::var("KLON_BENCH_RUNS").ok().and_then(named_count)
+}
+
+/// A count of one or more, from an environment variable.
+fn named_count<T: std::str::FromStr + PartialOrd + From<u8>>(text: String) -> Option<T> {
+    text.trim().parse::<T>().ok().filter(|n| *n >= T::from(1u8))
 }
 
 #[cfg(test)]
