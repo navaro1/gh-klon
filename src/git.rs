@@ -148,6 +148,20 @@ pub fn common_dir_of_main(golden: &Path) -> Result<PathBuf> {
     common_dir(golden)
 }
 
+/// The value of a boolean key of the shared config, or None when the key is
+/// unset. A value in the global or system config does not count here: git
+/// honours an extension such as `extensions.worktreeConfig` only from the
+/// shared config, so a caller that writes or reports on that feature must
+/// read the key from there too.
+pub fn config_bool(cwd: &Path, key: &str) -> Result<Option<bool>> {
+    match run(cwd, &["config", "--local", "--bool", "--get", key]) {
+        Ok(text) => Ok(Some(text.trim() == "true")),
+        // Exit 1 means the key is unset.
+        Err(Error::Git { code: 1, .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// The path in a `gitdir: <path>` file, made absolute against `base`.
 fn read_gitdir_file(file: &Path, base: &Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(file).ok()?;

@@ -10,12 +10,19 @@
 //! Step 1 comes before the fetch, so a refusal leaves the repository exactly as
 //! it was. The approval gate for the `[warm] steps` runs there too: a run that
 //! cannot warm golden should not touch the remote-tracking refs either.
+//!
+//! Since C22 every step runs under the envelope through
+//! `Envelope::spawn_and_wait`: the jobserver exports `MAKEFLAGS`, and the
+//! scope caps the step when the host offers one. There is no fence, because
+//! golden is the write target. Golden has no `.klon/env`, so the step also
+//! carries no klon tag.
 
+use crate::envelope::{Envelope, Options, Root};
 use crate::{branch, config, git, process, spare, Error, Result};
 use serde::Serialize;
 use std::os::fd::AsFd;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ExitStatus, Stdio};
 
 /// The JSON schema name. A field removal or a type change bumps the suffix.
 pub const SCHEMA: &str = "klon.up/1";
@@ -88,24 +95,23 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         }
     };
 
-    // Step 4: `sh -c` per step, in golden, in file order. C22 wraps these in
-    // the jobserver and the scope.
+    // Step 4: `sh -c` per step, in golden, in file order. Since C22 each step
+    // runs under the envelope: the jobserver exports `MAKEFLAGS`, and a scope
+    // caps the step. There is no fence, because golden is the write target.
     let steps = cfg.warm.as_ref().and_then(|warm| warm.steps.clone());
     let steps = steps.unwrap_or_default();
     for step in &steps {
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(step)
-            .current_dir(&golden)
-            .stdout(step_stdout(json)?)
-            .status()
-            .map_err(Error::io(format!("run sh -c {step:?}")))?;
+        let argv = ["sh".to_string(), "-c".to_string(), step.clone()];
+        let options = Options {
+            no_fence: true,
+            stdout: step_stdout(json)?,
+        };
+        let status = Envelope::spawn_and_wait(Root::Golden(&golden), &argv, options)?;
         if !status.success() {
-            let why = match status.code() {
-                Some(code) => format!("exit {code}"),
-                None => "killed by a signal".to_string(),
-            };
-            return Err(Error::klon(format!("warm step failed ({why}): {step}")));
+            return Err(Error::klon(format!(
+                "warm step failed ({}): {step}",
+                why(&status)
+            )));
         }
     }
 
@@ -172,15 +178,24 @@ fn fast_forward(golden: &Path, base: &str, json: bool) -> Result<()> {
 /// Where a warm step writes its stdout. Under `--json` klon owns that stream,
 /// and a step that prints one line would put it in front of the document, so
 /// the step writes to stderr instead.
-fn step_stdout(json: bool) -> Result<Stdio> {
+fn step_stdout(json: bool) -> Result<Option<Stdio>> {
     if !json {
-        return Ok(Stdio::inherit());
+        return Ok(None);
     }
-    std::io::stderr()
+    let fd = std::io::stderr()
         .as_fd()
         .try_clone_to_owned()
         .map(Stdio::from)
-        .map_err(Error::io("duplicate stderr for the warm steps"))
+        .map_err(Error::io("duplicate stderr for the warm steps"))?;
+    Ok(Some(fd))
+}
+
+/// Why a step failed, in the wording the `up` report has used since C14.
+fn why(status: &ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit {code}"),
+        None => "killed by a signal".to_string(),
+    }
 }
 
 /// The branch golden has checked out, or None for a detached HEAD.

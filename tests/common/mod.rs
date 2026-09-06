@@ -48,6 +48,14 @@ pub fn git_ok(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Give the repository a committer identity. Tests that let git write a commit
+/// need it in the repository config, because the harness hides the global
+/// config. Every worktree of the repository shares it.
+pub fn identity(dir: &Path) {
+    git_ok(dir, &["config", "user.name", "klon"]);
+    git_ok(dir, &["config", "user.email", "klon@example.com"]);
+}
+
 pub fn klon(cwd: &Path, args: &[&str]) -> Output {
     klon_env(cwd, &[], args)
 }

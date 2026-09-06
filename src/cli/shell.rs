@@ -3,6 +3,7 @@
 //! command: the klon's `TMPDIR`, its loopback address, and its `KLON_ID` tag.
 
 use crate::cli::run as runner;
+use crate::envelope::Options;
 use crate::Result;
 use std::path::PathBuf;
 
@@ -31,8 +32,9 @@ pub fn run(args: Args) -> Result<()> {
     runner::exec_with(
         &klon,
         &[shell],
-        runner::Options {
+        Options {
             no_fence: args.no_fence,
+            stdout: None,
         },
     )
 }

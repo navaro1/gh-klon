@@ -7,7 +7,9 @@
 
 mod common;
 
-use common::{git, git_ok, klon, klon_env, manifest_without_times, stderr, stdout, Fixture};
+use common::{
+    git, git_ok, identity, klon, klon_env, manifest_without_times, stderr, stdout, Fixture,
+};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
@@ -22,14 +24,6 @@ struct Repo {
     fx: Fixture,
     /// A plain clone of the remote. The tests push from here.
     other: PathBuf,
-}
-
-/// Give the repository a committer identity. `sync` shells to `git rebase` and
-/// `git merge`, which write a commit; the harness hides the global config, so
-/// the identity has to live in the repository. Every worktree shares it.
-fn identity(dir: &Path) {
-    git_ok(dir, &["config", "user.name", "klon"]);
-    git_ok(dir, &["config", "user.email", "klon@example.com"]);
 }
 
 /// A fixture with an identity and no remote.

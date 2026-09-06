@@ -4,7 +4,7 @@
 
 use crate::envelope::{jobserver, scope, slots};
 use crate::journal::{self, Entry, Op, State};
-use crate::{backend, branch, git, probe, radar, repair, time, Error, Result};
+use crate::{backend, branch, git, hooks, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,6 +37,7 @@ const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("cgroup.controllers", cgroup_controllers),
     ("fence.residual", fence_residual),
+    ("hooks", hooks_plain_git),
     ("inotify.max_user_instances", inotify_instances),
     ("inotify.max_user_watches", inotify_watches),
     ("jobserver", jobserver_store),
@@ -394,6 +395,13 @@ fn fence_residual(host: &Host) -> probe::Status {
         )),
         Err(err) => probe::Status::Broken(err.to_string()),
     }
+}
+
+/// Whether plain git inside a klon uses the klon's own hooks (C22). The
+/// per-tree `core.hooksPath` needs the `extensions.worktreeConfig` extension,
+/// which klon never turns on, so the usual answer is absent with the way out.
+fn hooks_plain_git(host: &Host) -> probe::Status {
+    hooks::doctor_row(host.golden)
 }
 
 /// The btrfs loop volume of this repository (C15, R33). The row names the
