@@ -175,6 +175,33 @@ fn run_allows_the_klon_the_tmpdir_and_the_cargo_home() {
     assert_ok(&out, "touch ~/.cargo/x");
     assert!(home.path().join(".cargo").join("x").is_file());
 
+    // A cache that does not exist yet is created before the fence applies,
+    // when its tool is on PATH: a fresh home with a fake `npm` gets `~/.npm`.
+    // The tool would create it on first use, and the fence denies that.
+    let bin = r.temp_home();
+    let fake = bin.path().join("npm");
+    fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut mode = fs::metadata(&fake).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    fs::set_permissions(&fake, mode).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let fresh = r.temp_home();
+    assert!(!fresh.path().join(".npm").exists());
+    let out = r.run(
+        &[
+            ("HOME", fresh.path().as_os_str()),
+            ("PATH", path.as_os_str()),
+        ],
+        "touch \"$HOME/.npm/x\"",
+    );
+    assert_ok(&out, "touch ~/.npm/x on a fresh home");
+    assert!(fresh.path().join(".npm").join("x").is_file());
+    // `~/.cache` is shared by every tool, so it exists too.
+    assert!(fresh.path().join(".cache").is_dir());
+
     // A move across two directories inside the klon needs the refer right
     // of ABI 2. Every host klon supports has it; ABI 1 is the documented
     // exception, so the check runs only where the kernel offers the right.

@@ -161,16 +161,25 @@ impl GitDirs {
             }
             _ => git::main_worktree(klon)?,
         };
+        // Canonical paths, so the `[fence] allow` checks compare like with like.
         Ok(GitDirs {
-            golden,
-            common,
+            golden: paths::absolute(&golden)?,
+            common: paths::absolute(&common)?,
             admin,
         })
     }
 }
 
-/// One candidate of the allow set and why it is there.
-type Candidate = (PathBuf, String);
+/// One candidate of the allow set.
+struct Candidate {
+    path: PathBuf,
+    /// Why it is there, for the debug line.
+    why: String,
+    /// Create the directory before the ruleset builds. The fence denies a
+    /// `mkdir` in the parent later, so a cache a tool would create on first
+    /// use must exist now. System directories and files are never created.
+    create: bool,
+}
 
 /// The allow set of one klon, in the documented order (handoff §5). Every
 /// entry is a candidate: `build` skips the ones that do not exist. The
@@ -182,42 +191,63 @@ fn allow_set(
     allow: &[String],
 ) -> Vec<Candidate> {
     let mut set: Vec<Candidate> = Vec::new();
-    let mut push = |path: PathBuf, why: String| {
-        if !set.iter().any(|(seen, _)| *seen == path) {
-            set.push((path, why));
+    let mut push = |path: PathBuf, why: String, create: bool| {
+        if !set.iter().any(|seen| seen.path == path) {
+            set.push(Candidate { path, why, create });
         }
     };
-    push(klon.to_path_buf(), "the klon".into());
-    for name in ["objects", "refs", "logs", "rr-cache", "klon"] {
-        push(dirs.common.join(name), format!("git {name}"));
+    push(klon.to_path_buf(), "the klon".into(), false);
+    // git creates `logs` and `rr-cache` on first use with a `mkdir` in
+    // `<common>`, which the fence denies. `add` made `klon`; `objects` and
+    // `refs` are part of every repository.
+    for (name, create) in [
+        ("objects", false),
+        ("refs", false),
+        ("logs", true),
+        ("rr-cache", true),
+        ("klon", true),
+    ] {
+        push(dirs.common.join(name), format!("git {name}"), create);
     }
-    push(dirs.admin.clone(), "the worktree admin directory".into());
-    push(dirs.common.join("packed-refs"), "git packed-refs".into());
+    push(
+        dirs.admin.clone(),
+        "the worktree admin directory".into(),
+        false,
+    );
+    push(
+        dirs.common.join("packed-refs"),
+        "git packed-refs".into(),
+        false,
+    );
     if let Some(tmp) = tmpdir.filter(|value| !value.is_empty()) {
-        push(PathBuf::from(tmp), "TMPDIR".into());
+        push(PathBuf::from(tmp), "TMPDIR".into(), true);
     }
-    push(PathBuf::from("/tmp"), "/tmp".into());
-    push(PathBuf::from("/var/tmp"), "/var/tmp".into());
+    push(PathBuf::from("/tmp"), "/tmp".into(), false);
+    push(PathBuf::from("/var/tmp"), "/var/tmp".into(), false);
     if let Some(dir) = env_path("XDG_RUNTIME_DIR") {
-        push(dir, "XDG_RUNTIME_DIR".into());
+        push(dir, "XDG_RUNTIME_DIR".into(), false);
     }
     // The per-user caches. Each has an environment override and a default
-    // under `HOME`; both are candidates, because a tool may use either.
+    // under `HOME`; both are candidates, because a tool may use either. An
+    // override is created because the user named it. A default is created
+    // when its tool is on PATH, so the first `npm install` on a fresh home
+    // finds its cache and no unused tool leaves a directory behind.
     let home = env_path("HOME");
-    for (variable, default, why) in CACHES {
+    for (variable, default, tool, why) in CACHES {
         if let Some(dir) = env_path(variable) {
-            push(dir, (*variable).to_string());
+            push(dir, (*variable).to_string(), true);
         }
         if let Some(home) = &home {
-            push(home.join(default), (*why).to_string());
+            let wanted = tool.is_none_or(|tool| probe::tool_path(tool).is_some());
+            push(home.join(default), (*why).to_string(), wanted);
         }
     }
     for device in ["/dev/null", "/dev/shm", "/dev/tty", "/dev/ptmx", "/dev/pts"] {
-        push(PathBuf::from(device), device.to_string());
+        push(PathBuf::from(device), device.to_string(), false);
     }
     for entry in allow {
         match allow_entry(entry, klon, dirs) {
-            Ok(path) => push(path, format!("[fence] allow {entry}")),
+            Ok(path) => push(path, format!("[fence] allow {entry}"), false),
             Err(why) => eprintln!("klon: fence: skips [fence] allow entry {entry}: {why}"),
         }
     }
@@ -225,18 +255,34 @@ fn allow_set(
 }
 
 /// The per-user caches: the environment override, the default under `HOME`,
-/// and the name in the debug line. The pnpm store is its default location;
-/// `pnpm store path` would cost a node start on every `run`, so klon does not
-/// ask, and `[fence] allow` covers a store elsewhere.
-const CACHES: &[(&str, &str, &str)] = &[
-    ("XDG_CACHE_HOME", ".cache", "~/.cache"),
-    ("CARGO_HOME", ".cargo", "~/.cargo"),
-    ("npm_config_cache", ".npm", "~/.npm"),
-    ("PNPM_HOME", ".local/share/pnpm", "the pnpm store"),
-    ("NUGET_PACKAGES", ".nuget", "~/.nuget"),
-    ("GOCACHE", ".cache/go-build", "the go build cache"),
-    ("GOMODCACHE", "go/pkg/mod", "the go module cache"),
-    ("UV_CACHE_DIR", ".cache/uv", "the uv cache"),
+/// the tool that owns the cache (None for a cache every tool shares), and the
+/// name in the debug line. The pnpm store is its default location; `pnpm
+/// store path` would cost a node start on every `run`, so klon does not ask,
+/// and `[fence] allow` covers a store elsewhere.
+const CACHES: &[(&str, &str, Option<&str>, &str)] = &[
+    ("XDG_CACHE_HOME", ".cache", None, "~/.cache"),
+    ("CARGO_HOME", ".cargo", Some("cargo"), "~/.cargo"),
+    ("npm_config_cache", ".npm", Some("npm"), "~/.npm"),
+    (
+        "PNPM_HOME",
+        ".local/share/pnpm",
+        Some("pnpm"),
+        "the pnpm store",
+    ),
+    ("NUGET_PACKAGES", ".nuget", Some("dotnet"), "~/.nuget"),
+    (
+        "GOCACHE",
+        ".cache/go-build",
+        Some("go"),
+        "the go build cache",
+    ),
+    (
+        "GOMODCACHE",
+        "go/pkg/mod",
+        Some("go"),
+        "the go module cache",
+    ),
+    ("UV_CACHE_DIR", ".cache/uv", Some("uv"), "the uv cache"),
 ];
 
 /// The value of an environment variable as a path, when it is set and not empty.
@@ -247,9 +293,12 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Resolve one `[fence] allow` entry. `~` is the home directory; a relative
-/// path is relative to the klon. An entry that would open the whole fence
-/// (`/`, the home directory, golden, or `<common>`) is refused with a reason:
-/// a repository must not turn the fence off from inside a file it controls.
+/// path is relative to the klon. An entry that would open the fence is
+/// refused with a reason: one that holds golden, `<common>`, the home
+/// directory, or the klon's parent (the siblings live there), and one inside
+/// `<common>`, where `hooks/` and `config` live. A repository must not turn
+/// the fence off from inside a file it controls. A directory inside golden
+/// stays legal: a repository may share one directory of its own.
 fn allow_entry(entry: &str, klon: &Path, dirs: &GitDirs) -> std::result::Result<PathBuf, String> {
     let expanded = if entry == "~" || entry.starts_with("~/") {
         let home = env_path("HOME").ok_or("it uses ~ but HOME is not set")?;
@@ -266,14 +315,18 @@ fn allow_entry(entry: &str, klon: &Path, dirs: &GitDirs) -> std::result::Result<
     if resolved == Path::new("/") {
         return Err("it resolves to /".into());
     }
-    if env_path("HOME").is_some_and(|home| paths::absolute(&home).is_ok_and(|h| h == resolved)) {
-        return Err("it resolves to the home directory".into());
+    if dirs.golden.starts_with(&resolved) {
+        return Err("it holds golden".into());
     }
-    if resolved == dirs.golden {
-        return Err("it resolves to golden".into());
+    if dirs.common.starts_with(&resolved) || resolved.starts_with(&dirs.common) {
+        return Err("it holds or enters the git directory".into());
     }
-    if resolved == dirs.common {
-        return Err("it resolves to the git directory".into());
+    let home = env_path("HOME").and_then(|home| paths::absolute(&home).ok());
+    if home.is_some_and(|home| home.starts_with(&resolved)) {
+        return Err("it holds the home directory".into());
+    }
+    if resolved != klon && klon.starts_with(&resolved) {
+        return Err("it holds the klon and its siblings".into());
     }
     Ok(resolved)
 }
@@ -299,14 +352,6 @@ pub fn build(klon: &Path, tmpdir: Option<&str>) -> Result<Option<Fence>> {
         }
     };
     let dirs = GitDirs::of(klon)?;
-    // git creates these on first use with a `mkdir` in `<common>`, which the
-    // fence denies. klon creates them now, unfenced, so the rules can attach.
-    for name in ["logs", "rr-cache", "klon"] {
-        let dir = dirs.common.join(name);
-        if let Err(err) = fs::create_dir_all(&dir) {
-            debug(|| format!("cannot create {}: {err}", dir.display()));
-        }
-    }
     let allow = config::load(&dirs.golden)?
         .fence
         .and_then(|fence| fence.allow)
@@ -321,7 +366,13 @@ pub fn build(klon: &Path, tmpdir: Option<&str>) -> Result<Option<Fence>> {
         .map_err(fence_error("create the ruleset"))?
         .add_rule(PathBeneath::new(open(Path::new("/"))?, read_set(abi)))
         .map_err(fence_error("allow reads under /"))?;
-    for (path, why) in candidates {
+    for Candidate { path, why, create } in candidates {
+        // The klon process is not fenced, so it can still make the directory.
+        if create {
+            if let Err(err) = fs::create_dir_all(&path) {
+                debug(|| format!("cannot create {why} at {}: {err}", path.display()));
+            }
+        }
         let fd = match PathFd::new(&path) {
             Ok(fd) => fd,
             Err(err) => {
@@ -469,7 +520,21 @@ mod tests {
         let dirs = dirs(tmp.path());
         let klon = tmp.path().join("golden.wt").join("feature");
         let set = allow_set(&klon, Some("/tmp/x"), &dirs, &[]);
-        let paths: Vec<&Path> = set.iter().map(|(path, _)| path.as_path()).collect();
+        let paths: Vec<&Path> = set.iter().map(|c| c.path.as_path()).collect();
+        // System directories and the git directories that always exist are
+        // never created; `logs`, `rr-cache`, and `TMPDIR` are.
+        let created: Vec<&Path> = set
+            .iter()
+            .filter(|c| c.create)
+            .map(|c| c.path.as_path())
+            .collect();
+        assert!(created.contains(&dirs.common.join("logs").as_path()));
+        assert!(created.contains(&dirs.common.join("rr-cache").as_path()));
+        assert!(created.contains(&Path::new("/tmp/x")));
+        assert!(!created.contains(&Path::new("/tmp")));
+        assert!(!created.contains(&Path::new("/dev/null")));
+        assert!(!created.contains(&dirs.common.join("objects").as_path()));
+        assert!(!created.contains(&klon.as_path()));
         assert!(paths.contains(&klon.as_path()));
         assert!(paths.contains(&dirs.common.join("objects").as_path()));
         assert!(paths.contains(&dirs.common.join("refs").as_path()));
@@ -502,9 +567,25 @@ mod tests {
         assert!(allow_entry("/", &klon, &dirs).is_err());
         assert!(allow_entry("../../golden", &klon, &dirs).is_err());
         assert!(allow_entry("../../golden/.git", &klon, &dirs).is_err());
+        // An ancestor opens everything below it, so it is refused too: the
+        // parent of golden, the parent of the klon (the siblings live there),
+        // and any entry inside `<common>`.
+        assert!(allow_entry("../..", &klon, &dirs).is_err());
+        assert!(allow_entry("..", &klon, &dirs).is_err());
+        assert!(allow_entry("../../golden/.git/hooks", &klon, &dirs).is_err());
+        assert!(allow_entry(tmp.path().to_str().unwrap(), &klon, &dirs).is_err());
+        // The klon itself and a directory inside golden stay legal.
+        assert_eq!(allow_entry(".", &klon, &dirs).unwrap(), klon);
+        assert_eq!(
+            allow_entry("../../golden/shared", &klon, &dirs).unwrap(),
+            dirs.golden.join("shared")
+        );
         if let Some(home) = env_path("HOME") {
             assert!(allow_entry(home.to_str().unwrap(), &klon, &dirs).is_err());
             assert!(allow_entry("~", &klon, &dirs).is_err());
+            if let Some(parent) = home.parent().filter(|p| *p != Path::new("/")) {
+                assert!(allow_entry(parent.to_str().unwrap(), &klon, &dirs).is_err());
+            }
             assert_eq!(
                 allow_entry("~/.local/share/x", &klon, &dirs).unwrap(),
                 paths::absolute(&home.join(".local/share/x")).unwrap()
