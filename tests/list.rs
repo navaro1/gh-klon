@@ -9,6 +9,17 @@ use common::{git_ok, klon, stderr, stdout, Fixture};
 
 const SEED: u64 = 42;
 
+/// The byte size of the fixture's ignored `build/` directory. `list` reports it
+/// as the upper bound of the disk delta, marked with a `≤` (C30). Both klons of
+/// this fixture carry the same five ignored files, so both show the same size.
+fn ignored_bytes(klon_path: &Path) -> u64 {
+    fs::read_dir(klon_path.join("build"))
+        .expect("the ignored directory")
+        .flatten()
+        .map(|entry| entry.metadata().expect("stat").len())
+        .sum()
+}
+
 #[test]
 fn list_with_no_klons_prints_nothing() {
     let fx = Fixture::generate(SEED, 20, 4, 4, 0);
@@ -45,33 +56,41 @@ fn list_shows_every_klon_with_a_dirty_flag() {
             .trim()
             .to_string()
     };
-    // C24 appends the three radar columns after the existing ones. Neither klon
-    // touches a file the other touches, so both read `clean`.
+    // C30 puts the five extras columns between the head and the radar columns:
+    // disk, RSS, live processes, PR, checks. The klons idle, so the disk column
+    // bounds the ignored-directory size and every other extra shows `-`. Neither
+    // klon touches a file the other touches, so the radar reads `clean`.
+    let extras = |path: &Path| format!("| ≤ {} B | - | 0 | - | -", ignored_bytes(path));
     const RADAR: &str = "| clean | clean | behind 0";
     assert_eq!(
         stdout(&out).trim(),
         format!(
-            "{} feature {} {RADAR}\n{} other {} {RADAR}",
+            "{} feature {} {} {RADAR}\n{} other {} {} {RADAR}",
             feature.display(),
             head(&feature),
+            extras(&feature),
             other.display(),
-            head(&other)
+            head(&other),
+            extras(&other)
         ),
-        "one line per klon: path, branch, short HEAD, then the radar columns"
+        "one line per klon: path, branch, short HEAD, extras, then the radar"
     );
 
-    // A modified file puts a `*` on that klon's line and on no other.
+    // A modified file puts a `*` on that klon's line and on no other. The disk
+    // reading is unchanged: only the ignored directory counts.
     fs::write(feature.join("f2.txt"), "dirty\n").unwrap();
     let out = klon(&fx.golden, &["list"]);
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     assert_eq!(
         stdout(&out).trim(),
         format!(
-            "{} feature {} * {RADAR}\n{} other {} {RADAR}",
+            "{} feature {} * {} {RADAR}\n{} other {} {} {RADAR}",
             feature.display(),
             head(&feature),
+            extras(&feature),
             other.display(),
-            head(&other)
+            head(&other),
+            extras(&other)
         )
     );
 }
