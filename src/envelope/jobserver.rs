@@ -766,16 +766,32 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("jobserver");
         ensure(&path).expect("create the fifo");
-        {
-            let anchor = open_store(&path).expect("open");
-            fill(&anchor, 2, &path).expect("fill");
-            assert_eq!(drain(&anchor).expect("drain"), 2);
-            fill(&anchor, 2, &path).expect("refill");
-        }
         // The rule the whole module rests on: no descriptor, no buffer, no
         // token. A store that no klon holds open is empty by construction.
-        let anchor = open_store(&path).expect("reopen");
-        assert_eq!(drain(&anchor).expect("drain"), 0);
+        //
+        // Another test in this process can fork a child between the close and
+        // the reopen. The child holds a copy of the descriptor until it execs,
+        // so the buffer survives that window. Retry across it: every attempt
+        // must see 0 or the 2 tokens the window kept alive, and one attempt
+        // must see 0.
+        let mut saw_empty = false;
+        for _ in 0..20 {
+            {
+                let anchor = open_store(&path).expect("open");
+                fill(&anchor, 2, &path).expect("fill");
+                assert_eq!(drain(&anchor).expect("drain"), 2);
+                fill(&anchor, 2, &path).expect("refill");
+            }
+            let anchor = open_store(&path).expect("reopen");
+            let left = drain(&anchor).expect("drain");
+            assert!(left == 0 || left == 2, "unexpected token count {left}");
+            if left == 0 {
+                saw_empty = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(saw_empty, "the buffer never died with the last descriptor");
     }
 
     #[test]
