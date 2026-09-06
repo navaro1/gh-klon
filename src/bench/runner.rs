@@ -1172,7 +1172,12 @@ fn klon_binary() -> PathBuf {
 
 /// Remove a tree between two samples. `git worktree remove` deletes it inline,
 /// which is slow and correct; the timer is already closed.
+///
+/// The warm pass has to finish first. A delete that walks a directory while a
+/// detached process still writes into it fails with `ENOTEMPTY`, and the whole
+/// run ends on a cleanup race instead of a result.
 fn teardown(golden: &Path, path: &Path) -> Result<()> {
+    wait_for_warm(path)?;
     let text = path.to_str().unwrap_or_default();
     let Err(why) = fixture::git(golden, &["worktree", "remove", "--force", text]) else {
         return Ok(());
