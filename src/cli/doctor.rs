@@ -3,7 +3,7 @@
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
 use crate::journal::{self, Entry, Op, State};
-use crate::{git, probe, radar, repair, time, Error, Result};
+use crate::{backend, git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,8 +30,9 @@ pub struct Host<'a> {
 /// One probe: a name and the function that answers for it.
 type Probe = fn(&Host) -> probe::Status;
 
-/// The `doctor` rows. C5 adds `backend`, C18 the fence ABI, C20 the cgroup
-/// delegation, and C17 the jobserver. Each is one line.
+/// The `doctor` rows. C18 adds the fence ABI, C20 the cgroup delegation, and
+/// C17 the jobserver. Each is one line. The selected backend is not a row: it
+/// has its own two fields, because it carries a name and a reason.
 const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("inotify.max_user_instances", inotify_instances),
@@ -40,6 +41,7 @@ const FEATURES: &[(&str, Probe)] = &[
     ("ninja", ninja_version),
     ("pasta", pasta_version),
     ("radar", radar_form),
+    ("reflink", reflink_support),
 ];
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -47,9 +49,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let golden = git::main_worktree(&cwd)?;
     let common = git::common_dir(&cwd)?;
 
-    // The journal is read first. An unknown version fails here, before any
-    // probe runs and before `--repair` touches anything.
+    // The two state files are read first. An unknown version of either fails
+    // here, before any probe runs and before `--repair` touches anything. An
+    // old binary must never repair or delete a format it cannot read.
     let found = journal::list(&common)?;
+    backend::check_probe_cache(&common)?;
     let (repaired, failure) = if args.repair {
         repair_all(&golden, &common, &found)?
     } else {
@@ -63,6 +67,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         found
     };
 
+    // `--repair` also refreshes the cached backend answer, so a host that
+    // changed filesystem or gained a tool gets a fresh probe (C5).
+    if args.repair {
+        backend::forget_probe(&common)?;
+    }
+
     let host = Host {
         golden: &golden,
         common: &common,
@@ -71,11 +81,14 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         .iter()
         .map(|(name, probe)| (*name, probe(&host)))
         .collect();
+    let (backend_name, backend_reason) = backend_row(&golden, &common);
     let report = Report {
         schema: SCHEMA,
         timestamp: time::now_rfc3339(),
         git_version: git_version(),
-        filesystem: filesystem(&golden),
+        filesystem: probe::filesystem(&golden),
+        backend: backend_name,
+        backend_reason,
         features: features
             .iter()
             .map(|(name, status)| (*name, status.report()))
@@ -140,6 +153,11 @@ struct Report<'a> {
     timestamp: String,
     git_version: String,
     filesystem: String,
+    /// The backend that `add` will use, or `none` when no probe passed.
+    backend: String,
+    /// Why that backend won: the rejection reason of every preferred backend,
+    /// or the detail of the winning probe.
+    backend_reason: String,
     features: BTreeMap<&'static str, probe::Report<'a>>,
     journal: Vec<JournalRow>,
     repaired: Vec<RepairRow>,
@@ -187,6 +205,10 @@ fn print_human(report: &Report, features: &[(&'static str, probe::Status)]) {
         .unwrap_or(10);
     println!("{:width$}  {}", "git", report.git_version);
     println!("{:width$}  {}", "filesystem", report.filesystem);
+    println!(
+        "{:width$}  {}: {}",
+        "backend", report.backend, report.backend_reason
+    );
     for (name, status) in features {
         println!("{name:width$}  {}: {}", status.key(), status.detail());
     }
@@ -284,54 +306,18 @@ fn radar_form(host: &Host) -> probe::Status {
     probe::Status::Present(radar::form(host.golden).name().to_string())
 }
 
-/// The filesystem of golden, from the `statfs` magic on Linux and from
-/// `f_fstypename` elsewhere. An unmapped magic prints as hexadecimal, so a new
-/// filesystem still gives a stable, comparable answer.
-#[cfg(target_os = "linux")]
-fn filesystem(path: &Path) -> String {
-    /// The magic numbers of the filesystems klon has a backend rule for.
-    const NAMES: &[(u32, &str)] = &[
-        (0x0102_1994, "tmpfs"),
-        (0x5846_5342, "xfs"),
-        (0x794c_7630, "overlay"),
-        (0x9123_683e, "btrfs"),
-        (0xef53, "ext4"),
-    ];
-    match statfs(path) {
-        Some(stat) => {
-            let magic = stat.f_type as u32;
-            match NAMES.iter().find(|(m, _)| *m == magic) {
-                Some((_, name)) => (*name).to_string(),
-                None => format!("{magic:#x}"),
-            }
-        }
-        None => "unknown".to_string(),
+/// Whether golden's filesystem answers `FICLONE` (C5). The detail names the
+/// errno when it does not, so a user can tell "no reflink" from "broken".
+fn reflink_support(host: &Host) -> probe::Status {
+    backend::reflink::capability(host.golden)
+}
+
+/// The backend that `add` will use, and why. A probe failure is a report row,
+/// not an exit code: the user asked for a report. `doctor` names no
+/// destination, because it clones nothing.
+fn backend_row(golden: &Path, common: &Path) -> (String, String) {
+    match backend::select(golden, common, None, None) {
+        Ok(choice) => (choice.backend.name().to_string(), choice.reason),
+        Err(err) => ("none".to_string(), err.to_string()),
     }
-}
-
-/// macOS and the other BSD systems name the filesystem in the `statfs` result.
-#[cfg(not(target_os = "linux"))]
-fn filesystem(path: &Path) -> String {
-    let stat = match statfs(path) {
-        Some(stat) => stat,
-        None => return "unknown".to_string(),
-    };
-    let bytes: Vec<u8> = stat
-        .f_fstypename
-        .iter()
-        .take_while(|c| **c != 0)
-        .map(|c| *c as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// The raw `statfs` result for `path`, or None when the call fails.
-fn statfs(path: &Path) -> Option<libc::statfs> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c_path` is NUL-terminated and `stat` is a live, owned buffer.
-    let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
-    (rc == 0).then_some(stat)
 }

@@ -112,7 +112,7 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
 fn unregister(golden: &Path, path: &Path, actions: &mut Vec<String>) -> Option<Error> {
     let text = path.to_string_lossy().into_owned();
     if path.exists() {
-        if let Err(err) = crate::backend::copy::make_removable(path) {
+        if let Err(err) = crate::backend::make_removable(path) {
             eprintln!("klon: repair: {err}");
         }
     }

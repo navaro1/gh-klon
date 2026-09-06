@@ -1,7 +1,8 @@
-//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>]`: the `add`
-//! transaction from handoff §4, copy backend only.
+//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>] [--backend <b>]`:
+//! the `add` transaction from handoff §4. The probed backend fills the working
+//! directory (C5).
 
-use crate::backend::copy;
+use crate::backend::{self, Backend, Exclusions};
 use crate::branch;
 use crate::journal::{self, State};
 use crate::{config, git, paths, repair, Error, Result};
@@ -12,9 +13,6 @@ use std::time::{Instant, SystemTime};
 
 /// The JSON schema name. A field removal or a type change bumps the suffix.
 pub const SCHEMA: &str = "klon.add/1";
-
-/// The only backend in v0. C5 replaces this with the probed backend name.
-const BACKEND: &str = "copy";
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -31,6 +29,10 @@ pub struct Args {
     /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}` and `{branch}`.
     #[arg(long)]
     pub path: Option<PathBuf>,
+    /// Use this clone backend instead of the probed one, for example
+    /// `reflink-walk` or `copy`.
+    #[arg(long)]
+    pub backend: Option<String>,
 }
 
 /// The `add --json` document.
@@ -86,6 +88,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // left the branch registered at the destination of this very run.
     refuse_checked_out(&worktrees, &branch)?;
 
+    // The probe writes a fixture next to golden and can fail, so it runs before
+    // the journal entry and before the first repository change (R5). The
+    // destination decides whether a block-sharing backend can reach it.
+    let choice = backend::select(&golden, &common, Some(&path), args.backend.as_deref())?;
+
     // Step 0: the journal entry precedes the first repository change.
     let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&branch))?;
 
@@ -109,7 +116,15 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     }
     record.reach(State::Registered)?;
 
-    let result = fill(&golden, &common, &worktrees, &path, &branch, &mut record);
+    let result = fill(
+        &golden,
+        &common,
+        &worktrees,
+        &path,
+        &branch,
+        choice.backend.as_ref(),
+        &mut record,
+    );
     if result.is_err() && cleanup(&golden, &path) {
         // The rollback finished, so the entry has no work left either.
         record.close()?;
@@ -124,7 +139,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             path: &path,
             branch: &branch,
             head: git::run(&path, &["rev-parse", "HEAD"])?.trim().to_string(),
-            backend: BACKEND,
+            backend: choice.backend.name(),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         println!(
@@ -159,7 +174,7 @@ fn recover_stale(golden: &Path, common: &Path, path: &Path) -> Result<bool> {
 /// and the repository is back to the state before `add`.
 fn cleanup(golden: &Path, path: &Path) -> bool {
     let text = path.to_str().unwrap_or_default();
-    if let Err(err) = copy::make_removable(path) {
+    if let Err(err) = backend::make_removable(path) {
         eprintln!("klon: cleanup: {err}");
     }
     git::run_quiet(golden, &["worktree", "unlock", text]);
@@ -190,7 +205,7 @@ fn check_path(golden: &Path, path: &Path) -> Result<()> {
     }
     if let Ok(rel) = path.strip_prefix(golden) {
         let allowed = ALLOWED_INSIDE_GOLDEN.iter().any(|d| rel.starts_with(d))
-            || copy::Exclusions::new(golden, []).excludes(path, true);
+            || Exclusions::new(golden, []).excludes(path, true);
         if !allowed {
             return Err(Error::klon(format!(
                 "path {} is inside the repository; use .claude/worktrees, .t3, or a path that .klonignore excludes",
@@ -241,20 +256,21 @@ fn fill(
     worktrees: &[git::Worktree],
     path: &Path,
     branch: &str,
+    backend: &dyn Backend,
     record: &mut journal::Record,
 ) -> Result<()> {
     let admin_dir = read_admin_dir(path)?;
     exclude_klon_dir(common)?;
 
-    // Step 4: copy golden minus .git, the destination, and every registered worktree.
+    // Step 4: clone golden minus .git, the destination, and every registered worktree.
     let others = worktrees
         .iter()
         .map(|w| paths::absolute(&w.path))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|p| p != golden);
-    let exclude = copy::Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
-    copy::clone_tree(golden, path, &exclude)?;
+    let exclude = Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
+    backend.clone(golden, path, &exclude)?;
 
     // Step 5: the .git file points at the admin entry that git created.
     fs::write(

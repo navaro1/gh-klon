@@ -8,8 +8,11 @@
 # The `nightly` job runs the 100k-fixture timing test. It runs on a schedule
 # and through `workflow_dispatch` only, so pull requests stay fast.
 #
-# Later chunks extend this file: C5 adds an ubuntu-24.04 loop-filesystem job,
-# C32 adds a release workflow beside it.
+# The `loop-fs` job builds an xfs and a btrfs loop filesystem and runs the
+# backend tests on each. It is the only proof for the copy-on-write acceptance
+# lines, because the development laptop runs ext4.
+#
+# Later chunks extend this file: C32 adds a release workflow beside it.
 
 name: ci
 
@@ -51,6 +54,70 @@ jobs:
       # matching Cargo.lock update, before clippy can rewrite the lock.
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # The copy-on-write backends need a filesystem that answers FICLONE. The
+  # development laptop runs ext4 and has no btrfs-progs, so this job is the only
+  # proof for those acceptance lines of C5. Two loop images give one xfs mount
+  # with reflink and one btrfs mount. The scheduled run adds the 100k timing.
+  loop-fs:
+    name: backend tests on the xfs and btrfs loop filesystems (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      # The 100k fixture needs room for golden, its object store, and the clone.
+      IMAGE_SIZE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '10G' || '2G' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs xfsprogs
+      # `reflink=1` is the xfs default today. The flag is explicit, so a changed
+      # default cannot disable the test without a failure here.
+      - name: Create the xfs loop filesystem
+        run: |
+          set -eux
+          truncate -s "$IMAGE_SIZE" "$RUNNER_TEMP/xfs.img"
+          mkfs.xfs -q -f -m reflink=1 "$RUNNER_TEMP/xfs.img"
+          sudo mkdir -p /mnt/klon-xfs
+          sudo mount -o loop "$RUNNER_TEMP/xfs.img" /mnt/klon-xfs
+          sudo mkdir -p /mnt/klon-xfs/work
+          sudo chown "$(id -u):$(id -g)" /mnt/klon-xfs/work
+      # `user_subvol_rm_allowed` lets C7 delete a subvolume without sudo.
+      - name: Create the btrfs loop filesystem
+        run: |
+          set -eux
+          truncate -s "$IMAGE_SIZE" "$RUNNER_TEMP/btrfs.img"
+          mkfs.btrfs -q -f "$RUNNER_TEMP/btrfs.img"
+          sudo mkdir -p /mnt/klon-btrfs
+          sudo mount -o loop,user_subvol_rm_allowed "$RUNNER_TEMP/btrfs.img" /mnt/klon-btrfs
+          sudo mkdir -p /mnt/klon-btrfs/work
+          sudo chown "$(id -u):$(id -g)" /mnt/klon-btrfs/work
+      - name: Report the two mounts
+        run: |
+          findmnt -no FSTYPE,OPTIONS /mnt/klon-xfs
+          findmnt -no FSTYPE,OPTIONS /mnt/klon-btrfs
+      - name: Backend tests on xfs
+        env:
+          KLON_TEST_REFLINK_DIR: /mnt/klon-xfs/work
+        run: cargo test --locked --test backend -- --nocapture
+      # btrfs answers FICLONE on a plain directory, so the same tests run again.
+      # KLON_TEST_BTRFS_DIR is for C7, which adds the subvolume backend.
+      - name: Backend tests on btrfs
+        env:
+          KLON_TEST_REFLINK_DIR: /mnt/klon-btrfs/work
+          KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
+        run: cargo test --locked --test backend -- --nocapture
+      # The 100k reflink budget of 10 s. It needs a big fixture, so it runs on
+      # the schedule and on demand only, like the other 100k cell.
+      - name: The 100k reflink walk on xfs
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          KLON_FIXTURE: 100k
+          KLON_TEST_REFLINK_DIR: /mnt/klon-xfs/work
+        run: cargo test --locked --release --test backend -- --nocapture reflink_walk_of_the_100k
 
   nightly:
     name: nightly, 100k fixture (ubuntu-22.04)
