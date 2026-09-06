@@ -277,6 +277,46 @@ fn up_json_reports_the_fast_forward() {
     assert_eq!(doc["spare_started"], false);
 }
 
+/// A `[warm]` step that prints must not break `up --json`, and a fetched
+/// `.klon.toml` must replace the one klon read before the fast-forward.
+#[test]
+fn up_json_stays_one_document_and_runs_the_fetched_warm_steps() {
+    let repo = setup(20);
+    // The remote adds the config, so golden learns the steps from the merge.
+    git_ok(&repo.other, &["fetch", "-q", "origin"]);
+    git_ok(
+        &repo.other,
+        &["checkout", "-q", "-B", "main", "origin/main"],
+    );
+    fs::write(repo.other.join(".gitignore"), "/build/\n/loud\n").unwrap();
+    fs::write(
+        repo.other.join(".klon.toml"),
+        "[warm]\nsteps = [\"echo noise on stdout; touch loud\"]\n",
+    )
+    .unwrap();
+    git_ok(&repo.other, &["add", "-A"]);
+    git_ok(&repo.other, &["commit", "-qm", "add the warm steps"]);
+    git_ok(&repo.other, &["push", "-q", "origin", "main"]);
+
+    let out = klon(&repo.fx.golden, &["up", "--json", "--yes"]);
+    assert!(out.status.success(), "up --json failed: {}", stderr(&out));
+    let doc = parse(&stdout(&out));
+    assert_eq!(doc["schema"], "klon.up/1");
+    assert_eq!(
+        doc["steps_run"], 1,
+        "up must run the step of the fetched config"
+    );
+    assert!(
+        repo.fx.golden.join("loud").is_file(),
+        "the fetched warm step must run"
+    );
+    assert!(
+        stderr(&out).contains("noise on stdout"),
+        "the step output must go to stderr: {}",
+        stderr(&out)
+    );
+}
+
 /// `up` refuses a golden that is not on `base`, and names the base.
 #[test]
 fn up_refuses_a_golden_that_is_not_on_base() {
@@ -529,6 +569,88 @@ fn a_recorded_tip_survives_a_fetch_between_two_syncs() {
     );
 }
 
+/// The first `sync` of a branch has no record, so the reflog of the upstream
+/// ref carries the evidence. It catches a rewrite that another program fetched
+/// before klon ever ran.
+#[test]
+fn the_reflog_catches_a_force_push_that_another_program_fetched() {
+    let repo = setup(20);
+    push_from_other(&repo, "feature", "from-other.txt", "other work\n");
+    git_ok(&repo.fx.golden, &["fetch", "-q", "origin"]);
+    git_ok(
+        &repo.fx.golden,
+        &["branch", "-f", "feature", "origin/feature"],
+    );
+    let path = add_klon(&repo.fx.golden, "feature");
+    commit_in(&path, "local.txt", "local work\n");
+
+    force_push_from_other(&repo, "feature", "rewritten.txt", "rewritten\n");
+    // Another program, for example an editor, fetches the rewrite first. klon
+    // has recorded nothing yet, and its own fetch below changes no ref.
+    git_ok(&repo.fx.golden, &["fetch", "-q", "origin"]);
+
+    let out = klon(&repo.fx.golden, &["sync", "feature"]);
+    assert!(!out.status.success(), "sync must refuse");
+    assert!(
+        stderr(&out).contains("force-pushed"),
+        "the reflog must carry the evidence: {}",
+        stderr(&out)
+    );
+}
+
+/// A branch whose configured upstream is gone from the remote is not a branch
+/// without an upstream. `sync` refuses instead of rebasing it onto `base`.
+#[test]
+fn sync_refuses_a_branch_whose_upstream_is_gone() {
+    let repo = setup(20);
+    let path = add_klon(&repo.fx.golden, "feature");
+    let before = head(&path);
+    // The remote drops the branch, and a pruning fetch drops the local
+    // remote-tracking ref. `branch.feature.merge` still names the upstream.
+    git_ok(
+        &repo.other,
+        &["push", "-q", "origin", "--delete", "feature"],
+    );
+    git_ok(&repo.fx.golden, &["fetch", "-q", "--prune", "origin"]);
+
+    let out = klon(&repo.fx.golden, &["sync", "feature"]);
+    assert!(!out.status.success(), "sync must refuse a gone upstream");
+    assert!(
+        stderr(&out).contains("gone from the remote"),
+        "the refusal must name the cause: {}",
+        stderr(&out)
+    );
+    assert_eq!(head(&path), before, "a refused sync moves nothing");
+
+    // `--onto` names a target, so the same klon syncs.
+    let out = klon(&repo.fx.golden, &["sync", "feature", "--onto", "main"]);
+    assert!(out.status.success(), "--onto must work: {}", stderr(&out));
+}
+
+/// `--onto` records no upstream tip. A plain sync after it must not read the
+/// `--onto` target as the last upstream tip and refuse.
+#[test]
+fn an_onto_run_leaves_the_upstream_record_alone() {
+    let repo = setup(20);
+    let path = add_klon(&repo.fx.golden, "feature");
+    commit_in(&path, "local.txt", "local work\n");
+    push_from_other(&repo, "main", "from-main.txt", "main work\n");
+    assert!(
+        klon(&repo.fx.golden, &["sync", "feature", "--onto", "main"])
+            .status
+            .success()
+    );
+
+    push_from_other(&repo, "feature", "from-other.txt", "other work\n");
+    let out = klon(&repo.fx.golden, &["sync", "feature", "--json"]);
+    assert!(
+        out.status.success(),
+        "the plain sync after --onto must not report a force-push: {}",
+        stderr(&out)
+    );
+    assert_eq!(parse(&stdout(&out))["action"], "rebase");
+}
+
 /// A branch with no upstream syncs onto `base`.
 #[test]
 fn sync_of_a_branch_without_an_upstream_uses_base() {
@@ -613,6 +735,56 @@ fn sync_fresh_rebuilds_the_klon_from_golden() {
     // The klon is registered, clean, and holds no leftover of the old tree.
     assert!(git_ok(&repo.fx.golden, &["worktree", "list"]).contains(path.to_str().unwrap()));
     assert_eq!(git_ok(&path, &["status", "--porcelain"]), "");
+}
+
+/// `--fresh` takes no hot spare. A spare made before golden's last build
+/// holds the old ignored state, and `git checkout --force` rewrites only
+/// tracked paths, so a spare would break the promise of `--fresh`.
+#[test]
+fn sync_fresh_ignores_a_stale_spare() {
+    let repo = setup(20);
+    let path = add_klon(&repo.fx.golden, "feature");
+    // A spare of golden as it is now.
+    let out = klon_env(
+        &repo.fx.golden,
+        &[("KLON_SPARE", OsStr::new("1"))],
+        &["spare-build", repo.fx.golden.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "spare-build failed: {}", stderr(&out));
+    // Golden's ignored state moves on, so the spare is stale.
+    fs::write(repo.fx.golden.join("build").join("fresh.bin"), "new\n").unwrap();
+    fs::remove_file(repo.fx.golden.join("build").join("o0.bin")).unwrap();
+
+    let out = klon_env(
+        &repo.fx.golden,
+        &[("KLON_SPARE", OsStr::new("1"))],
+        &["sync", "feature", "--fresh"],
+    );
+    assert!(
+        out.status.success(),
+        "sync --fresh failed: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        manifest_without_times(&path.join("build")),
+        manifest_without_times(&repo.fx.golden.join("build")),
+        "--fresh must give golden's ignored state of now, not the spare's"
+    );
+
+    // The rebuild leaves a builder behind, so the next `add` is warm again.
+    let spare = repo
+        .fx
+        .golden
+        .parent()
+        .unwrap()
+        .join("golden.wt")
+        .join(".spare")
+        .join(".klon")
+        .join("spare.json");
+    assert!(
+        wait_until(|| spare.is_file(), Duration::from_secs(60)),
+        "--fresh must start the next spare"
+    );
 }
 
 /// `--fresh` refuses a dirty klon: it must never lose work.
