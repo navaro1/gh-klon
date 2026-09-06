@@ -302,12 +302,12 @@ fn outbound_traffic_works_inside_the_namespace() {
 /// inside the namespace, which applies the same fence to the command. The
 /// `KLON_DEBUG` lines are the proof the fence is on.
 #[test]
-fn pasta_starts_under_the_write_fence() {
+fn the_command_keeps_the_write_fence_under_netns() {
     if !has_pasta() {
         println!("skipped: pasta is not on PATH");
         return;
     }
-    watchdog("pasta_starts_under_the_write_fence", 150);
+    watchdog("the_command_keeps_the_write_fence_under_netns", 150);
     let fx = fixture();
     add(&fx, "feature");
     let _ports = hold_ports();
