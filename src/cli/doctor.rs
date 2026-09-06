@@ -62,6 +62,18 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         (Vec::new(), None)
     };
+    // A repaired `init` leaves the caller standing beside the repository, not
+    // in it: the command runs from `<golden>.klon-old`, which the repair either
+    // renamed back to golden or handed to a background delete. The entry of
+    // that repair names golden, so the report below describes the repository
+    // that exists now instead of the copy the caller stands in (C7).
+    let (golden, common) = match repaired_golden(args.repair, &found) {
+        Some(path) => {
+            let common = git::common_dir_of_main(&path).unwrap_or(common);
+            (path, common)
+        }
+        None => (golden, common),
+    };
     // The array always shows the state after the repair, and `repaired` shows
     // what changed. An entry that the repair could not close is still listed.
     let entries = if args.repair {
@@ -114,6 +126,19 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// Golden's path from a repaired `init` entry, when that path holds a
+/// directory now. `entry.path` of an `init` entry is golden itself.
+fn repaired_golden(repaired: bool, entries: &[Entry]) -> Option<PathBuf> {
+    if !repaired {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|entry| entry.op == Op::Init)
+        .map(|entry| entry.path.clone())
+        .filter(|path| path.is_dir())
 }
 
 /// Repair every entry and collect one row per action. The answer holds the
@@ -256,19 +281,18 @@ fn git_version() -> String {
 }
 
 /// `btrfs-progs` on PATH, or under `$KLON_BTRFS_TOOLS` for a host that keeps it
-/// outside PATH.
+/// outside PATH. The backend resolves the same binary the same way (C7).
 fn btrfs_progs(_host: &Host) -> probe::Status {
-    if let Some(dir) = std::env::var_os("KLON_BTRFS_TOOLS") {
-        let candidate = Path::new(&dir).join("btrfs");
-        return match probe::executable(&candidate) {
-            Some(path) => probe::run_version(&path, &["--version"]),
-            None => probe::Status::Absent(format!(
+    match backend::btrfs::tool() {
+        Some(path) => probe::run_version(&path, &["--version"]),
+        None => match std::env::var_os("KLON_BTRFS_TOOLS") {
+            Some(dir) => probe::Status::Absent(format!(
                 "KLON_BTRFS_TOOLS is set but {} is not an executable",
-                candidate.display()
+                Path::new(&dir).join("btrfs").display()
             )),
-        };
+            None => probe::Status::Absent("btrfs is not on PATH".to_string()),
+        },
     }
-    probe::version_of("btrfs", &["--version"])
 }
 
 fn inotify_watches(_host: &Host) -> probe::Status {

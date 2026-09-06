@@ -7,9 +7,10 @@
 //! for the probe.
 //!
 //! A new filesystem adds a file and one line in `registry`. It never edits
-//! `add`. C6 adds `apfs-clone` and C7 adds `btrfs-snapshot` ahead of
-//! `reflink-walk`.
+//! `add`. C7 added `btrfs-snapshot` ahead of `reflink-walk`; C6 adds
+//! `apfs-clone` the same way.
 
+pub mod btrfs;
 pub mod copy;
 pub mod reflink;
 mod verify;
@@ -52,6 +53,15 @@ pub trait Backend: Send + Sync {
     /// feature exists and the clone was wrong.
     fn probe(&self, golden: &Path) -> probe::Status;
 
+    /// True when this host could take the backend at all. `probe_order` drops a
+    /// backend that answers false, so a filesystem-specific rejection never
+    /// joins the selection reason of an unrelated filesystem: `doctor` on ext4
+    /// still says exactly `reflink unsupported`. The probe still decides
+    /// whether a backend that applies is safe.
+    fn applies(&self, _golden: &Path) -> bool {
+        true
+    }
+
     /// Copy the children of `src` into the existing directory `dst`.
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing>;
 
@@ -67,10 +77,9 @@ pub trait Backend: Send + Sync {
     /// low priority (R8); C7's btrfs backend replaces this with one subvolume
     /// delete.
     ///
-    /// `rm` still calls `process::spawn_background_delete` itself, because in
-    /// v0 every backend deletes the same way. C7 gives btrfs an O(1) delete and
-    /// routes `rm` through this method.
-    #[allow(dead_code)]
+    /// `rm` reads the cached backend answer through `cached` and calls this
+    /// method, so a btrfs klon takes the O(1) subvolume delete and every other
+    /// klon takes the byte delete.
     fn delete(&self, dst: &Path) -> Result<()> {
         crate::process::spawn_background_delete(dst)
     }
@@ -157,11 +166,17 @@ pub fn make_removable(path: &Path) -> Result<()> {
     if !meta.is_dir() {
         return Ok(());
     }
-    fs::set_permissions(
-        path,
-        fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
-    )
-    .map_err(Error::io("restore directory access for cleanup"))?;
+    // Only a narrow mode needs the call. A directory that already grants the
+    // owner all three bits skips it, which saves one syscall per directory and
+    // keeps a path that refuses `chmod` out of the way: btrfs stands a nested
+    // subvolume of the source in a snapshot as a stub that answers `EPERM`, and
+    // `rmdir` still removes it (C7, S1 §8).
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700)).map_err(Error::io(
+            format!("restore access to {} for cleanup", path.display()),
+        ))?;
+    }
     for entry in fs::read_dir(path).map_err(Error::io("read the failed clone"))? {
         let entry = entry.map_err(Error::io("read the failed clone"))?;
         make_removable(&entry.path())?;
@@ -187,22 +202,26 @@ pub struct Choice {
 /// (handoff §4, spec §7 C6). The `reflink` row of `doctor` still reports the
 /// host fact on every platform.
 fn registry() -> Vec<Box<dyn Backend>> {
-    // C7 inserts `btrfs-snapshot` and C6 inserts `apfs-clone` ahead of these.
+    // C6 inserts `apfs-clone` ahead of these.
     #[cfg(target_os = "linux")]
-    let list: Vec<Box<dyn Backend>> = vec![Box::new(reflink::Reflink), Box::new(copy::Copy)];
+    let list: Vec<Box<dyn Backend>> = vec![
+        Box::new(btrfs::BtrfsSnapshot),
+        Box::new(reflink::Reflink),
+        Box::new(copy::Copy),
+    ];
     #[cfg(not(target_os = "linux"))]
     let list: Vec<Box<dyn Backend>> = vec![Box::new(copy::Copy)];
     list
 }
 
-/// The list that `select` probes. It holds the real backends, plus the
-/// test-only broken backend when `KLON_TEST_DROP_BACKEND=1` asks for it.
-fn probe_order() -> Vec<Box<dyn Backend>> {
+/// The list that `select` probes: every backend that applies to golden, plus
+/// the test-only broken backend when `KLON_TEST_DROP_BACKEND=1` asks for it.
+fn probe_order(golden: &Path) -> Vec<Box<dyn Backend>> {
     let mut list: Vec<Box<dyn Backend>> = Vec::new();
     if std::env::var("KLON_TEST_DROP_BACKEND").as_deref() == Ok("1") {
         list.push(Box::new(verify::DropOne));
     }
-    list.extend(registry());
+    list.extend(registry().into_iter().filter(|b| b.applies(golden)));
     list
 }
 
@@ -331,7 +350,7 @@ fn device(path: &Path) -> Option<u64> {
 /// A backend that wins without a rejection above it reports its own detail.
 fn run_probes(golden: &Path) -> Result<Choice> {
     let mut rejected: Vec<String> = Vec::new();
-    for backend in probe_order() {
+    for backend in probe_order(golden) {
         match backend.probe(golden) {
             probe::Status::Present(detail) => {
                 let reason = if rejected.is_empty() {
@@ -407,6 +426,14 @@ struct VersionOnly {
 /// Write the cache atomically: a temporary file in the same directory, then one
 /// rename.
 fn write_cache(common: &Path, cache: &Cache) -> Result<()> {
+    // A common directory that vanished under the running command names no
+    // repository any more. `doctor --repair` reaches this state when it renames
+    // golden back after an interrupted `init`: its own path is then stale, and
+    // one `create_dir_all` below would rebuild the directory tree it just
+    // removed. An answer that nothing will read is not worth that.
+    if !common.is_dir() {
+        return Ok(());
+    }
     let path = cache_path(common);
     let dir = path.parent().unwrap_or(common);
     fs::create_dir_all(dir).map_err(Error::io(format!("create {}", dir.display())))?;
@@ -427,6 +454,16 @@ fn write_cache(common: &Path, cache: &Cache) -> Result<()> {
 /// (spec §4 "State on disk").
 pub fn check_probe_cache(common: &Path) -> Result<()> {
     read_cache(common).map(|_| ())
+}
+
+/// The backend of the cached probe answer, without a probe of its own.
+///
+/// `rm` must return inside 100 ms (R8) and a fresh probe clones a fixture, so
+/// `rm` takes the cached answer or nothing. None means "delete the universal
+/// way": no cache, an unreadable cache, or a name this binary does not know.
+pub fn cached(common: &Path) -> Option<Box<dyn Backend>> {
+    let cache = read_cache(common).ok()??;
+    find(&cache.backend).ok()
 }
 
 /// Delete the cached answer, so the next `select` probes again. `doctor
@@ -637,6 +674,7 @@ mod tests {
     fn the_cache_round_trips_and_forget_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let common = tmp.path().join("common");
+        fs::create_dir(&common).unwrap();
         let cache = Cache {
             version: PROBE_VERSION,
             backend: "copy".to_string(),
@@ -652,5 +690,26 @@ mod tests {
         assert!(read_cache(&common).unwrap().is_none());
         // A second forget stays quiet.
         forget_probe(&common).unwrap();
+    }
+
+    /// `doctor --repair` renames golden back after an interrupted `init`, which
+    /// leaves its own common path stale. The cache write must not rebuild that
+    /// directory tree (C7).
+    #[test]
+    fn a_common_directory_that_vanished_gets_no_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("gone").join(".git");
+        let cache = Cache {
+            version: PROBE_VERSION,
+            backend: "copy".to_string(),
+            reason: "x".to_string(),
+            filesystem: "ext4".to_string(),
+            created: time::now_rfc3339(),
+        };
+        write_cache(&common, &cache).unwrap();
+        assert!(
+            !tmp.path().join("gone").exists(),
+            "the write must create nothing"
+        );
     }
 }

@@ -98,6 +98,8 @@ enum Command {
     List,
     /// Report the host features and the open journal entries.
     Doctor(cli::doctor::Args),
+    /// Convert golden into a btrfs subvolume so add can snapshot it.
+    Init(cli::init::Args),
     /// Bring a klon up to date. C24 ships the `--check` dry run only.
     Sync(cli::sync::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
@@ -138,6 +140,7 @@ fn main() -> ExitCode {
         Command::Prune => cli::prune::run(),
         Command::List => cli::list::run(json),
         Command::Doctor(args) => cli::doctor::run(args, json),
+        Command::Init(args) => cli::init::run(args, yes, json),
         Command::Sync(args) => cli::sync::run(args),
         Command::Pr(args) => cli::pr::run(args),
         Command::Run(args) => cli::run::run(args),

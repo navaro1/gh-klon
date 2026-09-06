@@ -64,28 +64,65 @@ impl Backend for Reflink {
     }
 
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing> {
-        let started = Instant::now();
-        let mut plan = Plan::default();
-        collect(src, dst, excludes, &mut plan)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(WORKERS)
-            .build()
-            .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
-        pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
-        // Deepest first: a directory keeps its mtime only after its children
-        // are complete.
-        for dir in plan.dirs.iter().rev() {
-            let meta = fs::symlink_metadata(&dir.from)
-                .map_err(Error::io(format!("stat {}", dir.from.display())))?;
-            set_times(&dir.to, &meta)?;
-            fs::set_permissions(&dir.to, meta.permissions())
-                .map_err(Error::io(format!("chmod {}", dir.to.display())))?;
-        }
-        Ok(Timing {
-            duration: started.elapsed(),
-            entries: (plan.files.len() + plan.dirs.len() + plan.links) as u64,
-        })
+        copy_tree(
+            src,
+            dst,
+            &|path, is_dir| excludes.excludes(path, is_dir),
+            OnSpecial::Skip,
+        )
     }
+}
+
+/// What the walk does with an entry that `FICLONE` cannot copy: a FIFO, a
+/// socket, or a device node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnSpecial {
+    /// Print one line and go on. A klon is a second copy, so a lost socket
+    /// costs nothing that the source does not still hold.
+    Skip,
+    /// Fail. `gh klon init` replaces golden with the copy and deletes the
+    /// original, so a path the copy left out would be the only one left.
+    Refuse,
+}
+
+/// Clone every child of `src` into the existing directory `dst`, with the modes
+/// and the mtimes of the source. `skip` answers whether one path stays out; it
+/// receives the source path and whether that path is a directory.
+///
+/// `Backend::clone` passes the `Exclusions` of `add`. `gh klon init` (C7) passes
+/// its own rule, because it must copy golden's `.git` directory, which every
+/// klon leaves out (R3).
+pub fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    skip: &dyn Fn(&Path, bool) -> bool,
+    on_special: OnSpecial,
+) -> Result<Timing> {
+    let started = Instant::now();
+    let mut plan = Plan::default();
+    collect(src, dst, skip, on_special, &mut plan)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(WORKERS)
+        .build()
+        .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
+    pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
+    // Deepest first: a directory keeps its mtime only after its children are
+    // complete. A source directory that vanished since phase 1 keeps the
+    // default mode and time on its empty copy; `vanished` explains why.
+    for dir in plan.dirs.iter().rev() {
+        let meta = match fs::symlink_metadata(&dir.from) {
+            Ok(meta) => meta,
+            Err(_) if vanished(&dir.from) => continue,
+            Err(err) => return Err(Error::io(format!("stat {}", dir.from.display()))(err)),
+        };
+        set_times(&dir.to, &meta)?;
+        fs::set_permissions(&dir.to, meta.permissions())
+            .map_err(Error::io(format!("chmod {}", dir.to.display())))?;
+    }
+    Ok(Timing {
+        duration: started.elapsed(),
+        entries: (plan.files.len() + plan.dirs.len() + plan.links) as u64,
+    })
 }
 
 /// One source and destination pair.
@@ -107,21 +144,37 @@ struct Plan {
 
 /// Phase 1: read `src`, create the directories and the symlinks under `dst`,
 /// and list the files.
-fn collect(src: &Path, dst: &Path, exclude: &Exclusions, plan: &mut Plan) -> Result<()> {
-    let entries = fs::read_dir(src).map_err(Error::io(format!("read {}", src.display())))?;
+fn collect(
+    src: &Path,
+    dst: &Path,
+    skip: &dyn Fn(&Path, bool) -> bool,
+    on_special: OnSpecial,
+    plan: &mut Plan,
+) -> Result<()> {
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(_) if vanished(src) => return Ok(()),
+        Err(err) => return Err(Error::io(format!("read {}", src.display()))(err)),
+    };
     for entry in entries {
         let entry = entry.map_err(Error::io(format!("read {}", src.display())))?;
         let from = entry.path();
-        let meta =
-            fs::symlink_metadata(&from).map_err(Error::io(format!("stat {}", from.display())))?;
+        let meta = match fs::symlink_metadata(&from) {
+            Ok(meta) => meta,
+            Err(_) if vanished(&from) => continue,
+            Err(err) => return Err(Error::io(format!("stat {}", from.display()))(err)),
+        };
         let kind = meta.file_type();
-        if exclude.excludes(&from, kind.is_dir()) {
+        if skip(&from, kind.is_dir()) {
             continue;
         }
         let to = dst.join(entry.file_name());
         if kind.is_symlink() {
-            let target =
-                fs::read_link(&from).map_err(Error::io(format!("readlink {}", from.display())))?;
+            let target = match fs::read_link(&from) {
+                Ok(target) => target,
+                Err(_) if vanished(&from) => continue,
+                Err(err) => return Err(Error::io(format!("readlink {}", from.display()))(err)),
+            };
             std::os::unix::fs::symlink(&target, &to)
                 .map_err(Error::io(format!("symlink {}", to.display())))?;
             set_symlink_times(&to, &meta)?;
@@ -134,22 +187,61 @@ fn collect(src: &Path, dst: &Path, exclude: &Exclusions, plan: &mut Plan) -> Res
                 from: from.clone(),
                 to: to.clone(),
             });
-            collect(&from, &to, exclude, plan)?;
+            collect(&from, &to, skip, on_special, plan)?;
         } else if kind.is_file() {
             plan.files.push(Pair { from, to });
-        } else {
+        } else if on_special == OnSpecial::Skip {
             eprintln!("klon: skip special file {}", from.display());
+        } else {
+            return Err(Error::klon(format!(
+                "{} is a FIFO, a socket, or a device node, which klon cannot copy. \
+                 Remove it, then run the command again.",
+                from.display()
+            )));
         }
     }
     Ok(())
 }
 
+/// True when `path` is gone, so the error only says that the source tree moved
+/// on while the walk read it.
+///
+/// A live tree is normal: a build writes and deletes temporary files, and
+/// `git gc --auto` prunes the loose objects it has just packed, and then their
+/// empty fan-out directory. One vanished path costs a line on stderr instead of
+/// a failed clone. `init` proves afterwards, with `git fsck`, that the
+/// repository it copied is still whole.
+///
+/// The answer comes from a fresh stat, not from the error kind: `reflink-copy`
+/// checks the source itself and wraps a missing file in its own message, so the
+/// kind is not reliable. Only a confirmed `NotFound` counts; every other stat
+/// failure keeps the original error.
+fn vanished(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "klon: {} vanished during the clone; skipped",
+                path.display()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Phase 2: one `FICLONE` for one file, then its mode and its source mtime.
 fn clone_one(pair: &Pair) -> Result<()> {
-    reflink_copy::reflink(&pair.from, &pair.to)
-        .map_err(Error::io(format!("reflink {}", pair.from.display())))?;
-    let meta = fs::symlink_metadata(&pair.from)
-        .map_err(Error::io(format!("stat {}", pair.from.display())))?;
+    if let Err(err) = reflink_copy::reflink(&pair.from, &pair.to) {
+        if vanished(&pair.from) {
+            return Ok(());
+        }
+        return Err(Error::io(format!("reflink {}", pair.from.display()))(err));
+    }
+    let meta = match fs::symlink_metadata(&pair.from) {
+        Ok(meta) => meta,
+        Err(_) if vanished(&pair.from) => return Ok(()),
+        Err(err) => return Err(Error::io(format!("stat {}", pair.from.display()))(err)),
+    };
     // `reflink` gives the clone the source mode. Set it again, so a platform
     // that ignores the creation mode still produces an equal manifest.
     fs::set_permissions(&pair.to, meta.permissions())
@@ -337,5 +429,47 @@ mod tests {
         }
         let other = std::io::Error::from_raw_os_error(libc::ENOSPC);
         assert!(matches!(classify(&other), Trial::Failed(_)));
+    }
+
+    /// `OnSpecial::Refuse` must stop before the walk creates anything, because
+    /// `init` deletes the source after the copy. `Skip` keeps the old behaviour
+    /// for a klon, which is a second copy of a tree that stays.
+    #[test]
+    fn a_fifo_stops_a_strict_copy_and_not_a_klon_clone() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("plain.txt"), b"content\n").unwrap();
+        let fifo = CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and the mode is a plain constant.
+        let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) };
+        if rc != 0 {
+            println!("skipped: this host refused mkfifo");
+            return;
+        }
+        let keep_all = |_: &Path, _: bool| false;
+
+        let strict = tmp.path().join("strict");
+        fs::create_dir(&strict).unwrap();
+        let err = copy_tree(&src, &strict, &keep_all, OnSpecial::Refuse)
+            .expect_err("a strict copy must refuse a FIFO");
+        assert!(
+            err.to_string().contains("FIFO"),
+            "the error must name the shape: {err}"
+        );
+
+        let lenient = tmp.path().join("lenient");
+        fs::create_dir(&lenient).unwrap();
+        match copy_tree(&src, &lenient, &keep_all, OnSpecial::Skip) {
+            Ok(_) => assert!(!lenient.join("pipe").exists(), "the FIFO stays out"),
+            // ext4 answers no `FICLONE`, so the plain file cannot be cloned
+            // here. The walk still proved that it did not refuse the FIFO.
+            Err(err) => assert!(
+                err.to_string().contains("reflink"),
+                "only a clone failure is expected: {err}"
+            ),
+        }
     }
 }

@@ -123,7 +123,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // the tail after a crash.
     let mut record = journal::Record::start(&common, journal::Op::Rm, &target, branch.as_deref())?;
     record.reach(State::Removing)?;
-    let trash = remove_worktree(&golden, &target)?;
+    let trash = remove_worktree(&golden, &common, &target)?;
     // Step 7: the loopback address goes back to the pool, so the next `add`
     // takes it again. A failure here costs an address, never the removal, and
     // `rm` must still return inside 100 ms (R8).
@@ -205,7 +205,7 @@ fn refuse_reserved(target: &Path, golden: &Path) -> Result<()> {
 /// Steps 4 to 6. Rename the klon into `.trash` when that stays on one
 /// filesystem, then let git forget it and delete the copy in the background.
 /// The answer is the trash path, or None when the klon never reached the trash.
-fn remove_worktree(golden: &Path, target: &Path) -> Result<Option<PathBuf>> {
+fn remove_worktree(golden: &Path, common: &Path, target: &Path) -> Result<Option<PathBuf>> {
     if !target.exists() {
         // A stale registration with no directory on disk: prune drops it.
         git::run(golden, &["worktree", "prune"])?;
@@ -218,7 +218,7 @@ fn remove_worktree(golden: &Path, target: &Path) -> Result<Option<PathBuf>> {
         Ok(()) => {
             drop_git_file(&victim)?;
             git::run(golden, &["worktree", "prune"])?;
-            process::spawn_background_delete(&victim)?;
+            delete(common, &victim)?;
             Ok(Some(victim))
         }
         // Step 4: `.trash` on another filesystem; delete in place instead.
@@ -232,6 +232,21 @@ fn remove_worktree(golden: &Path, target: &Path) -> Result<Option<PathBuf>> {
             Ok(None)
         }
         Err(err) => Err(Error::io(format!("rename {}", target.display()))(err)),
+    }
+}
+
+/// Step 6: hand the trash copy to the backend that made it (C5, C7). The btrfs
+/// backend drops a subvolume in one ioctl where the mount allows it; every
+/// other backend, and every klon that is not a subvolume, takes the detached
+/// `rm -rf`.
+///
+/// The backend comes from the cached probe answer only. A fresh probe clones a
+/// fixture, and `rm` must return inside 100 ms (R8), so no cache means the
+/// universal delete.
+fn delete(common: &Path, victim: &Path) -> Result<()> {
+    match crate::backend::cached(common) {
+        Some(backend) => backend.delete(victim),
+        None => process::spawn_background_delete(victim),
     }
 }
 

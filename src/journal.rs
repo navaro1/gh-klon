@@ -47,6 +47,13 @@ pub enum State {
     Ready,
     /// `rm` is about to rename the klon into `.trash`.
     Removing,
+    /// `init` filled `<golden>.klon-sub` (or `<golden>.klon-plain` for
+    /// `--undo`). Golden is untouched, so a repair only drops the staging copy.
+    Copied,
+    /// `init` is about to swap golden with the staging copy. klon writes this
+    /// state **before** the first rename, so a kill between the two renames is
+    /// repairable: the entry then names a swap that is in flight.
+    Swapped,
 }
 
 impl State {
@@ -59,6 +66,8 @@ impl State {
             State::CheckedOut => "checked-out",
             State::Ready => "ready",
             State::Removing => "removing",
+            State::Copied => "copied",
+            State::Swapped => "swapped",
         }
     }
 }
@@ -269,8 +278,15 @@ fn read_entry(dir: &Path, name: &str) -> Result<Entry> {
 /// the transaction. klon never sets this variable itself and no command reads
 /// it for any other purpose.
 fn pause_if_requested(state: State) {
+    pause_at(state.key());
+}
+
+/// The same injection at a point that is not a journal state. `init` (C7) calls
+/// it with `between-mv`, the window between its two renames, which no state can
+/// name because golden does not exist there.
+pub fn pause_at(point: &str) {
     let requested = std::env::var("KLON_TEST_PAUSE_AT").unwrap_or_default();
-    if requested != state.key() {
+    if requested != point {
         return;
     }
     eprintln!("klon: KLON_TEST_PAUSE_AT={requested}: waiting for a signal");
@@ -311,6 +327,8 @@ mod tests {
             State::CheckedOut,
             State::Ready,
             State::Removing,
+            State::Copied,
+            State::Swapped,
         ] {
             let text = serde_json::to_string(&state).expect("serialize");
             assert_eq!(text, format!("\"{}\"", state.key()));

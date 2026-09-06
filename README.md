@@ -47,6 +47,53 @@ Repository and destination paths must use UTF-8, a text encoding. They cannot co
 Git 2.34 does not provide an unambiguous list format for paths with newline characters.
 The destination cannot be inside the Git common directory, which holds shared repository data.
 
+## btrfs: `gh klon init`
+
+On btrfs, klon clones a klon with one `btrfs subvolume snapshot`. That takes
+about 5 ms whatever the file count. It needs golden to be a btrfs subvolume that
+you own. `gh klon init` converts a plain golden directory into one:
+
+```sh
+gh klon init                # prints the plan and asks; y converts golden
+gh klon init --yes          # converts without a question
+gh klon init --undo --yes   # converts golden back into a plain directory
+```
+
+A subvolume cannot be made from a directory in place, so `init` copies golden
+into `<golden>.klon-sub` with `FICLONE` and swaps the two paths with two
+renames. Golden keeps its path and every byte. The replaced copy shares its
+blocks with the new golden, so a background process deletes it without freeing
+user data.
+
+`init` replaces golden and then deletes the original, so it checks the copy
+three ways before the swap. It refuses a FIFO, a socket, or a device node,
+which `FICLONE` cannot copy. It runs `git fsck --connectivity-only` on the
+copy. It compares every ref, HEAD, and index file before and after the walk,
+and refuses when a git command moved the repository under it. Golden stays as
+it is whenever a check fires. Let every build and every git command in golden
+and in every klon finish first.
+
+The swap gives the path a new directory, so a shell that stands in golden still
+holds the old one. `init` prints the `cd` line for that case. Run it, or open a
+new shell.
+
+`init` refuses a golden that is not on btrfs with `not btrfs`. On a golden that
+already has the wanted shape it exits 0 and changes nothing.
+
+Two host facts limit what klon does with subvolumes. `btrfs subvolume show`,
+`list`, and `delete` need root, so klon detects a subvolume with `stat` and
+deletes a klon with `btrfs subvolume delete` only where the filesystem carries
+the `user_subvol_rm_allowed` mount option. Everywhere else `rm` falls back to
+the background byte delete, which removes a subvolume too.
+
+A snapshot does not copy a nested subvolume: it leaves an empty directory in
+its place. `add` refuses rather than hand over a klon that lost those files.
+Exclude the path in `.klonignore`, or pass `--backend reflink-walk`.
+
+klon looks for the `btrfs` binary on `PATH`, and under `$KLON_BTRFS_TOOLS` when
+that variable names a directory. A user can unpack `btrfs-progs` there without
+root.
+
 ## Configuration
 
 `add` reads `.klon.toml` from the golden root. All keys are optional.
@@ -103,6 +150,10 @@ stops a command.
 | `add` `ready` | Delete the entry. The klon is complete. |
 | `rm` `removing` | Delete the `.git` file in the trash copy, start the background delete, run `git worktree prune`, delete the entry. |
 | `rm` in any earlier state | Delete the entry. The klon stays. |
+| `init` `planned` or `copied` | Delete the staging copy. Golden never moved. |
+| `init` `swapped`, golden missing | Rename `<golden>.klon-old` back to golden, then delete the staging copy. |
+| `init` `swapped`, golden present | Delete the staging copy and the replaced copy. |
+| `init` `ready` | Delete the replaced copy. Golden is complete. |
 
 A repeated command repairs its own entry too. `add` closes the entry of its
 destination before it validates the path, so a second `add` after an interrupted
@@ -117,9 +168,10 @@ An entry with an unknown `version` fails closed: `doctor` exits non-zero with
 
 ## JSON output
 
-`--json` makes `add`, `list`, `rm`, `doctor`, and `bench` print one JSON document
-on stdout instead of the human report. Each document carries a `schema` field:
-`klon.add/1`, `klon.list/1`, `klon.rm/1`, `klon.doctor/1`, and `klon.bench/1`. An
+`--json` makes `add`, `list`, `rm`, `doctor`, `init`, and `bench` print one JSON
+document on stdout instead of the human report. Each document carries a `schema`
+field: `klon.add/1`, `klon.list/1`, `klon.rm/1`, `klon.doctor/1`,
+`klon.init/1`, and `klon.bench/1`. An
 error still goes to stderr as text and keeps the same exit code.
 
 ```sh
