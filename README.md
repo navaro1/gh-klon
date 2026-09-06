@@ -94,7 +94,7 @@ The table is the product shape from the handoff. The status column says what wor
 | `gh klon prune` | Same as `git worktree prune`, plus journal cleanup and a sweep of the receipts older than 30 days. | done |
 | `gh klon pr <branch>` | `gh pr create` from that tree. | done |
 | `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check] [--force] [--json]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | done. `--json` prints one document per klon, one per line. |
-| `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--no-check] [--json]` | Fetch, `pre_merge` hook, the `check` receipt gate, structured merge, advance base, remove. Never pushes. | done. Where `.klon.toml` names `[proof] steps`, the klon's HEAD needs a passing receipt; `--no-check` skips that gate. |
+| `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--no-check] [--json]` | Fetch, `pre_merge` hook, the `check` receipt gate, structured merge, advance base, remove. Never pushes. | done. Where `.klon.toml` names `[proof] steps`, the branch tip needs a passing receipt; `--no-check` skips that gate. |
 | `gh klon check <branch> [--json]` | Run the approved `[proof] steps` at a clean HEAD and record a receipt under `<common>/klon/receipts/<commit>.json`. | done |
 | `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
@@ -264,10 +264,12 @@ next one changes anything:
 3. Run the merge gate. It has two halves, and both can apply. The executable
    `<klon>/.klon/hooks/pre_merge` runs inside the klon under the envelope, and
    its failure prints `pre_merge failed: <cmd>`. Then, where `.klon.toml` names
-   `[proof] steps`, the klon's HEAD needs a passing `check` receipt; see
-   `check` below. `merge` does not run the steps itself. klon reads the branch
-   tip before and after the gate and refuses a tip that moved, so the commit
-   that lands is the commit the gate proved.
+   `[proof] steps`, the branch tip that step 5 lands needs a passing `check`
+   receipt; see `check` below. `merge` does not run the steps itself. The gate
+   names that tip and never the klon's live HEAD, because a hook can detach the
+   klon between the check and the merge. klon reads the tip before and after
+   the gate and refuses a tip that moved, so the commit that lands is the
+   commit the gate proved.
 4. Configure the mergiraf merge driver when `mergiraf` is on PATH. klon writes
    `merge.mergiraf.driver` to the repository config and two generated lines to
    `<common>/info/attributes`. A host without mergiraf keeps git's line merge,

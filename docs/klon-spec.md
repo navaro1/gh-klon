@@ -525,7 +525,7 @@ Implement `gh klon sync <branch> [--merge|--onto <base>|--fresh|--all|--check]` 
 **Build:** Implement `gh klon merge <branch>` with these steps:
 1. Refuse a dirty golden.
 2. Run `git fetch`.
-3. Run the `pre_merge` hook from `.klon/hooks`, or the approved `[proof] steps` when present. Stop on failure. (C26 supersedes the second half: where `[proof] steps` are present, `merge` reads the `check` receipt of the klon's HEAD instead of running the steps again.)
+3. Run the `pre_merge` hook from `.klon/hooks`, or the approved `[proof] steps` when present. Stop on failure. (C26 supersedes the second half: where `[proof] steps` are present, `merge` reads the `check` receipt of the branch tip it is about to land instead of running the steps again.)
 4. Configure `merge.mergiraf.driver` and a generated `<common>/info/attributes` when `mergiraf` is present.
 5. Run `git merge --no-ff` or `--ff-only` per `.klon.toml`. On a conflict, stop and print the paths.
 6. On success, fast-forward `base`, then run `rm`.
