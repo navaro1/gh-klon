@@ -2,8 +2,9 @@
 //! klon under the envelope (handoff §5, R21).
 //!
 //! The command starts in its own session with the klon's environment, its own
-//! `TMPDIR`, its own loopback address, and `gc.auto=0`. It carries `KLON_ID`,
-//! so `stop` finds the whole tree. The exit code passes back unchanged.
+//! `TMPDIR`, its own loopback address, and `gc.auto=0`. It carries `KLON_ID`
+//! and `KLON_DIR`, so `stop` finds the whole tree. The exit code passes back
+//! unchanged, and a signal to `run` passes on to the command.
 
 use crate::envelope::Envelope;
 use crate::{git, paths, Error, Result};
