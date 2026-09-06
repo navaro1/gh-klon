@@ -32,20 +32,36 @@ const BASE_MTIME: i64 = 1_600_000_000;
 
 /// Probe `backend` on the filesystem that holds `golden`.
 pub fn run(backend: &dyn Backend, golden: &Path) -> probe::Status {
+    run_with(backend, golden, &|_| Ok(()))
+}
+
+/// `run` for a backend whose `clone` needs a prepared source directory. C7's
+/// btrfs snapshot reads a subvolume, so it passes `btrfs subvolume create`
+/// here; `prepare` receives the source path before the fixture lands in it.
+pub fn run_with(
+    backend: &dyn Backend,
+    golden: &Path,
+    prepare: &dyn Fn(&Path) -> Result<()>,
+) -> probe::Status {
     let scratch = match Scratch::next_to(golden) {
         Ok(scratch) => scratch,
         Err(err) => return probe::Status::Broken(format!("probe failed: {err}")),
     };
-    match attempt(backend, scratch.path()) {
+    match attempt(backend, scratch.path(), prepare) {
         Ok(status) => status,
         Err(err) => probe::Status::Broken(format!("probe failed: {err}")),
     }
 }
 
 /// One probe round inside an existing scratch directory.
-fn attempt(backend: &dyn Backend, dir: &Path) -> Result<probe::Status> {
+fn attempt(
+    backend: &dyn Backend,
+    dir: &Path,
+    prepare: &dyn Fn(&Path) -> Result<()>,
+) -> Result<probe::Status> {
     let src = dir.join("src");
     let dst = dir.join("dst");
+    prepare(&src)?;
     build_fixture(&src)?;
     fs::create_dir(&dst).map_err(Error::io(format!("create {}", dst.display())))?;
     let excludes = Exclusions::new(&src, []);

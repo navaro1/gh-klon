@@ -64,28 +64,39 @@ impl Backend for Reflink {
     }
 
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing> {
-        let started = Instant::now();
-        let mut plan = Plan::default();
-        collect(src, dst, excludes, &mut plan)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(WORKERS)
-            .build()
-            .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
-        pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
-        // Deepest first: a directory keeps its mtime only after its children
-        // are complete.
-        for dir in plan.dirs.iter().rev() {
-            let meta = fs::symlink_metadata(&dir.from)
-                .map_err(Error::io(format!("stat {}", dir.from.display())))?;
-            set_times(&dir.to, &meta)?;
-            fs::set_permissions(&dir.to, meta.permissions())
-                .map_err(Error::io(format!("chmod {}", dir.to.display())))?;
-        }
-        Ok(Timing {
-            duration: started.elapsed(),
-            entries: (plan.files.len() + plan.dirs.len() + plan.links) as u64,
-        })
+        copy_tree(src, dst, &|path, is_dir| excludes.excludes(path, is_dir))
     }
+}
+
+/// Clone every child of `src` into the existing directory `dst`, with the modes
+/// and the mtimes of the source. `skip` answers whether one path stays out; it
+/// receives the source path and whether that path is a directory.
+///
+/// `Backend::clone` passes the `Exclusions` of `add`. `gh klon init` (C7) passes
+/// its own rule, because it must copy golden's `.git` directory, which every
+/// klon leaves out (R3).
+pub fn copy_tree(src: &Path, dst: &Path, skip: &dyn Fn(&Path, bool) -> bool) -> Result<Timing> {
+    let started = Instant::now();
+    let mut plan = Plan::default();
+    collect(src, dst, skip, &mut plan)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(WORKERS)
+        .build()
+        .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
+    pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
+    // Deepest first: a directory keeps its mtime only after its children are
+    // complete.
+    for dir in plan.dirs.iter().rev() {
+        let meta = fs::symlink_metadata(&dir.from)
+            .map_err(Error::io(format!("stat {}", dir.from.display())))?;
+        set_times(&dir.to, &meta)?;
+        fs::set_permissions(&dir.to, meta.permissions())
+            .map_err(Error::io(format!("chmod {}", dir.to.display())))?;
+    }
+    Ok(Timing {
+        duration: started.elapsed(),
+        entries: (plan.files.len() + plan.dirs.len() + plan.links) as u64,
+    })
 }
 
 /// One source and destination pair.
@@ -107,7 +118,12 @@ struct Plan {
 
 /// Phase 1: read `src`, create the directories and the symlinks under `dst`,
 /// and list the files.
-fn collect(src: &Path, dst: &Path, exclude: &Exclusions, plan: &mut Plan) -> Result<()> {
+fn collect(
+    src: &Path,
+    dst: &Path,
+    skip: &dyn Fn(&Path, bool) -> bool,
+    plan: &mut Plan,
+) -> Result<()> {
     let entries = fs::read_dir(src).map_err(Error::io(format!("read {}", src.display())))?;
     for entry in entries {
         let entry = entry.map_err(Error::io(format!("read {}", src.display())))?;
@@ -115,7 +131,7 @@ fn collect(src: &Path, dst: &Path, exclude: &Exclusions, plan: &mut Plan) -> Res
         let meta =
             fs::symlink_metadata(&from).map_err(Error::io(format!("stat {}", from.display())))?;
         let kind = meta.file_type();
-        if exclude.excludes(&from, kind.is_dir()) {
+        if skip(&from, kind.is_dir()) {
             continue;
         }
         let to = dst.join(entry.file_name());
@@ -134,7 +150,7 @@ fn collect(src: &Path, dst: &Path, exclude: &Exclusions, plan: &mut Plan) -> Res
                 from: from.clone(),
                 to: to.clone(),
             });
-            collect(&from, &to, exclude, plan)?;
+            collect(&from, &to, skip, plan)?;
         } else if kind.is_file() {
             plan.files.push(Pair { from, to });
         } else {

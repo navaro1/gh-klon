@@ -5,6 +5,7 @@
 //! repairs the entry of its own destination before it validates the path, so a
 //! repeated command recovers an interrupted one without `doctor`.
 
+use crate::cli::init as cli_init;
 use crate::journal::{self, Entry, Op, State};
 use crate::{git, paths, process, Error, Result};
 use std::fs;
@@ -69,8 +70,11 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
             }
             // `add` wrote `ready` and stopped before it deleted the entry.
             State::Ready => actions.push("the klon is complete".to_string()),
-            // `add` never writes `removing`.
-            State::Removing => actions.push("add never reaches this state".to_string()),
+            // `add` writes none of these: `removing` belongs to `rm`, and
+            // `copied` and `swapped` belong to `init`.
+            State::Removing | State::Copied | State::Swapped => {
+                actions.push("add never reaches this state".to_string())
+            }
         },
         Op::Rm => match entry.state {
             // Finish the `rm` tail. A trash copy that still holds a `.git` file
@@ -93,17 +97,71 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
             // `rm` stopped before the rename, so the klon is untouched.
             _ => actions.push("rm changed nothing; the klon stays".to_string()),
         },
-        // C7 and C15 add the `init` tails. Until then the entry stays, so a
-        // later klon can still finish or revert the move.
-        Op::Init => {
-            return Ok(Outcome::closed(vec![
-                "init has no repair rule yet; the entry stays".to_string(),
-            ]))
-        }
+        // C15 adds the `--volume` tail on top of this one.
+        Op::Init => init(&entry.path, entry.state, &mut actions)?,
     }
     journal::remove(common, &entry.name)?;
     actions.push("deleted the journal entry".to_string());
     Ok(Outcome::closed(actions))
+}
+
+/// The `init` tail (spec §7 C7). `path` is golden, and the staging copies sit
+/// next to it. The state says how far the conversion came; the paths on disk
+/// say which half of the swap ran.
+///
+/// The repair has two steps. Step one puts golden back at its path when the
+/// kill landed between the two renames: only the state `swapped` with a missing
+/// golden can reach that, and `<golden>.klon-old` then holds the original.
+/// Step two deletes every sibling copy that survived, whichever half of the
+/// swap ran:
+///
+/// | State | Disk | Result |
+/// |---|---|---|
+/// | `planned` | golden in place, a partial `<golden>.klon-sub` | the staging copy goes |
+/// | `copied` | golden in place, a complete staging copy | the staging copy goes |
+/// | `swapped` | golden missing, `<golden>.klon-old` present | golden comes back, the staging copy goes |
+/// | `swapped` | golden present, `<golden>.klon-old` present | the swap finished; the replaced copy goes |
+/// | `swapped` | golden present, no `<golden>.klon-old` | the swap never started; the staging copy goes |
+/// | `ready` | golden present | the replaced copy goes |
+///
+/// Every delete is the detached background delete, so a repair returns at once
+/// and a second run finds nothing left to do.
+fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
+    let siblings = [
+        cli_init::sibling(golden, cli_init::OLD_SUFFIX)?,
+        cli_init::sibling(golden, cli_init::STAGING_SUFFIX)?,
+        cli_init::sibling(golden, cli_init::PLAIN_SUFFIX)?,
+    ];
+    let old = &siblings[0];
+    if !golden.exists() {
+        if state != State::Swapped || !old.exists() {
+            return Err(Error::klon(format!(
+                "init left no directory at {} and none at {}; klon cannot repair that",
+                golden.display(),
+                old.display()
+            )));
+        }
+        fs::rename(old, golden).map_err(Error::io(format!(
+            "rename {} back to {}",
+            old.display(),
+            golden.display()
+        )))?;
+        actions.push(format!(
+            "renamed {} back to {}",
+            old.display(),
+            golden.display()
+        ));
+    }
+    // Golden is at its path now. Every remaining sibling is a copy that no
+    // command reads: the staging copy of a conversion that stopped, or the
+    // replaced golden of one that finished.
+    for path in &siblings {
+        if path.exists() {
+            process::spawn_background_delete(path)?;
+            actions.push(format!("started the delete of {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 /// Unlock and remove a registered worktree, then prune. `git worktree remove`

@@ -7,9 +7,10 @@
 //! for the probe.
 //!
 //! A new filesystem adds a file and one line in `registry`. It never edits
-//! `add`. C6 adds `apfs-clone` and C7 adds `btrfs-snapshot` ahead of
-//! `reflink-walk`.
+//! `add`. C7 added `btrfs-snapshot` ahead of `reflink-walk`; C6 adds
+//! `apfs-clone` the same way.
 
+pub mod btrfs;
 pub mod copy;
 pub mod reflink;
 mod verify;
@@ -52,6 +53,15 @@ pub trait Backend: Send + Sync {
     /// feature exists and the clone was wrong.
     fn probe(&self, golden: &Path) -> probe::Status;
 
+    /// True when this host could take the backend at all. `probe_order` drops a
+    /// backend that answers false, so a filesystem-specific rejection never
+    /// joins the selection reason of an unrelated filesystem: `doctor` on ext4
+    /// still says exactly `reflink unsupported`. The probe still decides
+    /// whether a backend that applies is safe.
+    fn applies(&self, _golden: &Path) -> bool {
+        true
+    }
+
     /// Copy the children of `src` into the existing directory `dst`.
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing>;
 
@@ -67,10 +77,9 @@ pub trait Backend: Send + Sync {
     /// low priority (R8); C7's btrfs backend replaces this with one subvolume
     /// delete.
     ///
-    /// `rm` still calls `process::spawn_background_delete` itself, because in
-    /// v0 every backend deletes the same way. C7 gives btrfs an O(1) delete and
-    /// routes `rm` through this method.
-    #[allow(dead_code)]
+    /// `rm` reads the cached backend answer through `cached` and calls this
+    /// method, so a btrfs klon takes the O(1) subvolume delete and every other
+    /// klon takes the byte delete.
     fn delete(&self, dst: &Path) -> Result<()> {
         crate::process::spawn_background_delete(dst)
     }
@@ -187,22 +196,26 @@ pub struct Choice {
 /// (handoff §4, spec §7 C6). The `reflink` row of `doctor` still reports the
 /// host fact on every platform.
 fn registry() -> Vec<Box<dyn Backend>> {
-    // C7 inserts `btrfs-snapshot` and C6 inserts `apfs-clone` ahead of these.
+    // C6 inserts `apfs-clone` ahead of these.
     #[cfg(target_os = "linux")]
-    let list: Vec<Box<dyn Backend>> = vec![Box::new(reflink::Reflink), Box::new(copy::Copy)];
+    let list: Vec<Box<dyn Backend>> = vec![
+        Box::new(btrfs::BtrfsSnapshot),
+        Box::new(reflink::Reflink),
+        Box::new(copy::Copy),
+    ];
     #[cfg(not(target_os = "linux"))]
     let list: Vec<Box<dyn Backend>> = vec![Box::new(copy::Copy)];
     list
 }
 
-/// The list that `select` probes. It holds the real backends, plus the
-/// test-only broken backend when `KLON_TEST_DROP_BACKEND=1` asks for it.
-fn probe_order() -> Vec<Box<dyn Backend>> {
+/// The list that `select` probes: every backend that applies to golden, plus
+/// the test-only broken backend when `KLON_TEST_DROP_BACKEND=1` asks for it.
+fn probe_order(golden: &Path) -> Vec<Box<dyn Backend>> {
     let mut list: Vec<Box<dyn Backend>> = Vec::new();
     if std::env::var("KLON_TEST_DROP_BACKEND").as_deref() == Ok("1") {
         list.push(Box::new(verify::DropOne));
     }
-    list.extend(registry());
+    list.extend(registry().into_iter().filter(|b| b.applies(golden)));
     list
 }
 
@@ -331,7 +344,7 @@ fn device(path: &Path) -> Option<u64> {
 /// A backend that wins without a rejection above it reports its own detail.
 fn run_probes(golden: &Path) -> Result<Choice> {
     let mut rejected: Vec<String> = Vec::new();
-    for backend in probe_order() {
+    for backend in probe_order(golden) {
         match backend.probe(golden) {
             probe::Status::Present(detail) => {
                 let reason = if rejected.is_empty() {
@@ -427,6 +440,16 @@ fn write_cache(common: &Path, cache: &Cache) -> Result<()> {
 /// (spec §4 "State on disk").
 pub fn check_probe_cache(common: &Path) -> Result<()> {
     read_cache(common).map(|_| ())
+}
+
+/// The backend of the cached probe answer, without a probe of its own.
+///
+/// `rm` must return inside 100 ms (R8) and a fresh probe clones a fixture, so
+/// `rm` takes the cached answer or nothing. None means "delete the universal
+/// way": no cache, an unreadable cache, or a name this binary does not know.
+pub fn cached(common: &Path) -> Option<Box<dyn Backend>> {
+    let cache = read_cache(common).ok()??;
+    find(&cache.backend).ok()
 }
 
 /// Delete the cached answer, so the next `select` probes again. `doctor
