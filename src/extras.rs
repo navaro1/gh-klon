@@ -149,6 +149,10 @@ fn unique_bytes_from_du(text: &str) -> Option<u64> {
 /// The size of every ignored path of the klon: the files and directories git
 /// excludes, which is the data a clone copies and every other klon re-copies.
 /// The listing stays cheap when the klon has none; only then the walk starts.
+///
+/// `-z` gives NUL-separated raw paths: git quotes nothing, so a path with
+/// spaces, tabs, or non-ASCII bytes still resolves and the sum stays a true
+/// upper bound.
 fn ignored_bytes(klon: &Path) -> u64 {
     let out = match git::run(
         klon,
@@ -158,6 +162,7 @@ fn ignored_bytes(klon: &Path) -> u64 {
             "--ignored",
             "--exclude-standard",
             "--directory",
+            "-z",
         ],
     ) {
         Ok(out) => out,
@@ -165,13 +170,12 @@ fn ignored_bytes(klon: &Path) -> u64 {
         Err(_) => return 0,
     };
     let mut total = 0;
-    for line in out.lines() {
-        let path = unquote_git(line);
+    for path in out.split('\0').filter(|path| !path.is_empty()) {
         // klon's own state directory is not part of the warm copy.
         if path == ".klon/" {
             continue;
         }
-        let full = klon.join(&path);
+        let full = klon.join(path);
         let Ok(meta) = std::fs::symlink_metadata(&full) else {
             continue;
         };
@@ -182,16 +186,6 @@ fn ignored_bytes(klon: &Path) -> u64 {
         }
     }
     total
-}
-
-/// git quotes a path that holds special characters as `"..."`. klon strips the
-/// quotes and keeps the raw text; a misread path only lowers an upper bound.
-fn unquote_git(line: &str) -> String {
-    let line = line.trim();
-    line.strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .map(str::to_string)
-        .unwrap_or_else(|| line.to_string())
 }
 
 /// The byte size of every file below `dir`. A symlink counts as zero: its
@@ -365,12 +359,6 @@ mod tests {
         );
         // Exclusive above the total is not a report klon understands.
         assert_eq!(unique_bytes_from_du("100\t200\t0\t/x\n"), None);
-    }
-
-    #[test]
-    fn git_quotes_are_stripped() {
-        assert_eq!(unquote_git("build/"), "build/");
-        assert_eq!(unquote_git(" \"wei\u{00df}.txt\" "), "wei\u{00df}.txt");
     }
 
     #[test]
