@@ -15,9 +15,9 @@
 //! `merge` never runs `git push`. Landing a branch and publishing it are two
 //! decisions, and only the user makes the second one.
 
-use crate::cli::{rm, run};
+use crate::cli::rm;
 use crate::config::{self, Ff};
-use crate::envelope::{env, Envelope};
+use crate::envelope::{env, step_stdout, Envelope, Options, Root};
 use crate::journal;
 use crate::{branch, git, paths, process, Error, Result};
 use serde::Serialize;
@@ -104,18 +104,27 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     let full = format!("refs/heads/{}", args.branch);
     // The main worktree is not a klon, so `skip(1)` keeps `merge <base>` from
     // naming golden itself.
-    let klon = worktrees
+    let entry = worktrees
         .iter()
         .skip(1)
         .find(|w| w.branch.as_deref() == Some(full.as_str()))
-        .map(|w| paths::absolute(&w.path))
-        .transpose()?
         .ok_or_else(|| {
             Error::klon(format!(
                 "no klon has the branch {} checked out",
                 args.branch
             ))
         })?;
+    let klon = paths::absolute(&entry.path)?;
+    // A lock says that somebody wants this klon kept. The check belongs before
+    // the merge: `remove_target` refuses a locked klon too, but by then base
+    // has already taken the branch, and the command would fail after it
+    // changed golden.
+    if entry.locked {
+        return Err(Error::klon(format!(
+            "{} is locked; unlock it with git worktree unlock before a merge",
+            klon.display()
+        )));
+    }
 
     // --- Step 1: the two trees and the branch golden stands on ---------------
     // `.klon.toml` is read once. A second read repeats every warning line the
@@ -125,6 +134,18 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     if args.branch == base {
         return Err(Error::klon(format!(
             "{base} is the base branch; merge lands a klon's branch in it"
+        )));
+    }
+    // A merge that stopped comes first, because it is the sharper answer. A
+    // stopped merge usually also reads dirty, and `git merge --continue` is
+    // not advice that the word "dirty" gives. A merge that a `commit-msg` hook
+    // refused leaves `MERGE_HEAD` with a clean working tree, which the dirty
+    // check below cannot see at all.
+    if merge_in_progress(&golden) {
+        return Err(Error::klon(format!(
+            "{} holds a merge that stopped; finish it with git merge --continue \
+             or drop it with git merge --abort",
+            golden.display()
         )));
     }
     if process::dirty(&golden)? {
@@ -163,7 +184,20 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     }
 
     // --- Step 3: the merge gate ---------------------------------------------
-    let hook = gate(&klon, &cfg, yes)?;
+    // The gate proves one commit. A gate that runs a test suite takes minutes,
+    // and the agent that owns the klon can commit inside that window, so klon
+    // reads the branch tip before and after and refuses a tip that moved.
+    let tested = tip(&golden, &full)?;
+    let hook = gate(&klon, &cfg, yes, json)?;
+    let now = tip(&golden, &full)?;
+    if now != tested {
+        return Err(Error::klon(format!(
+            "{} moved from {} to {} while the gate ran; run merge again",
+            args.branch,
+            short(&tested),
+            short(&now)
+        )));
+    }
 
     // --- Step 4: the structured merge driver --------------------------------
     configure_mergiraf(&golden, &common)?;
@@ -176,20 +210,29 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     // in step 6 writes its own `rm` entry over this one, so a kill there
     // repairs through the `rm` tail; see `repair::entry`.
     let record = journal::Record::start(&common, journal::Op::Merge, &klon, Some(&args.branch))?;
-    // The merge names the full ref, because a tag beats a branch of the same
-    // name in git's short-name order. The message then has to be explicit too:
-    // git would title the commit `Merge branch 'refs/heads/x'` from that ref.
-    // A fast-forward writes no commit and ignores the message.
+    // The merge names the commit the gate proved, not the branch name: a tag
+    // beats a branch of the same name in git's short-name order, and the exact
+    // id also pins what lands. The message then has to be explicit, because
+    // git would title the commit `Merge commit '<id>'` from a bare id. A
+    // fast-forward writes no commit and ignores the message.
     let message = format!("Merge branch '{}'", args.branch);
     let landed = git::run(
         &golden,
-        &["merge", mode.flag(), "--no-edit", "-m", &message, &full],
+        &["merge", mode.flag(), "--no-edit", "-m", &message, &tested],
     );
     if let Err(err) = landed {
+        let conflicts = unmerged(&golden)?;
+        // Abort whatever the failed merge left behind, conflicted or not. A
+        // `commit-msg` hook that refuses the merge commit leaves `MERGE_HEAD`
+        // with no unmerged path, and golden would stay in an active merge.
+        if merge_in_progress(&golden) {
+            if let Err(why) = git::run(&golden, &["merge", "--abort"]) {
+                eprintln!("klon: git merge --abort failed: {why}");
+            }
+        }
+        record.close()?;
         // `--ff-only` on a branch that needs a merge commit fails with no
         // conflicted path. That is git's own refusal, so klon passes it on.
-        let conflicts = unmerged(&golden)?;
-        record.close()?;
         if conflicts.is_empty() {
             return Err(err);
         }
@@ -198,10 +241,26 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     let head_after = head(&golden)?;
 
     // --- Step 6: the removal -------------------------------------------------
+    // Base took the branch. From here a failure costs the removal, never the
+    // command: the merge is in golden's history and no report may call it a
+    // failure. The worktree list is read again, because the gate ran for as
+    // long as a test suite takes and the first list is old by now.
     let removed = if args.keep {
         false
     } else {
-        remove(&golden, &common, &worktrees, &klon, &args.branch)?
+        match git::worktree_list(&golden)
+            .and_then(|fresh| remove(&golden, &common, &fresh, &klon, &args.branch))
+        {
+            Ok(removed) => removed,
+            Err(err) => {
+                eprintln!("{err}");
+                eprintln!(
+                    "klon: {base} took {}; remove the klon with gh klon rm {}",
+                    args.branch, args.branch
+                );
+                false
+            }
+        }
     };
     record.close()?;
 
@@ -238,10 +297,10 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
 /// Every command runs inside the klon under the envelope, so the write fence
 /// holds a test that writes where it should not. The first failure stops the
 /// merge and golden never moves.
-fn gate(klon: &Path, cfg: &config::Config, yes: bool) -> Result<Option<&'static str>> {
+fn gate(klon: &Path, cfg: &config::Config, yes: bool, json: bool) -> Result<Option<&'static str>> {
     if let Some(hook) = pre_merge_hook(klon) {
         let argv = vec![hook.to_string_lossy().into_owned()];
-        exec_step(klon, &argv, &hook.display().to_string())?;
+        exec_step(klon, &argv, &hook.display().to_string(), json)?;
         return Ok(Some(GATE_HOOK));
     }
     let steps = cfg
@@ -256,18 +315,25 @@ fn gate(klon: &Path, cfg: &config::Config, yes: bool) -> Result<Option<&'static 
     cfg.ensure_approved(yes, &["proof.steps"])?;
     for step in &steps {
         let argv = vec!["sh".to_string(), "-c".to_string(), step.clone()];
-        exec_step(klon, &argv, step)?;
+        exec_step(klon, &argv, step, json)?;
     }
     Ok(Some(GATE_PROOF))
 }
 
 /// One gate command inside the klon. The envelope spawns and waits, so `merge`
-/// continues with the answer instead of handing its process to the command.
-fn exec_step(klon: &Path, argv: &[String], what: &str) -> Result<()> {
-    match Envelope::spawn_and_wait(klon, argv, run::Options::default()) {
-        Ok(()) => Ok(()),
+/// reads the exit status instead of handing its process to the command.
+///
+/// Under `--json` the command's stdout goes to stderr: klon owns stdout for
+/// the one document, and a hook that prints a line would put it in front.
+fn exec_step(klon: &Path, argv: &[String], what: &str, json: bool) -> Result<()> {
+    let options = Options {
+        no_fence: false,
+        stdout: step_stdout(json)?,
+    };
+    match Envelope::spawn_and_wait(Root::Klon(klon), argv, options) {
         // The command already reported its own failure on its own stderr.
-        Err(Error::Exit(_)) => Err(Error::klon(format!("pre_merge failed: {what}"))),
+        Ok(status) if !status.success() => Err(Error::klon(format!("pre_merge failed: {what}"))),
+        Ok(_) => Ok(()),
         Err(err) => Err(Error::klon(format!("pre_merge failed: {what}: {err}"))),
     }
 }
@@ -295,17 +361,42 @@ fn pre_merge_hook(klon: &Path) -> Option<PathBuf> {
 /// in one file that touch two declarations join without a conflict.
 ///
 /// It is an optional host feature (spec §5). A host without mergiraf keeps
-/// git's line merge and takes one stderr line. The answer says whether the
-/// driver is configured, for the caller that wants to report it.
-fn configure_mergiraf(golden: &Path, common: &Path) -> Result<bool> {
-    if !tool_on_path("mergiraf") {
+/// git's line merge and takes one stderr line.
+///
+/// A host that loses mergiraf also loses the setup. git runs a merge driver it
+/// cannot find as a failed merge and calls every hunk a conflict, so a rule
+/// left behind would turn a clean line merge into a conflict on every file.
+/// The removal touches only what klon generated: the two marked lines in
+/// `info/attributes`, and each config key whose value is klon's own string.
+fn configure_mergiraf(golden: &Path, common: &Path) -> Result<()> {
+    if !process::tool_on_path("mergiraf") {
         eprintln!("klon: mergiraf is not on PATH; merge uses git's line merge");
-        return Ok(false);
+        return remove_mergiraf(golden, common);
     }
     git::ensure_config(golden, "merge.mergiraf.name", MERGIRAF_NAME)?;
     git::ensure_config(golden, "merge.mergiraf.driver", MERGIRAF_DRIVER)?;
-    write_attributes(common)?;
-    Ok(true)
+    write_attributes(common)
+}
+
+/// Drop the generated mergiraf setup of an earlier run.
+fn remove_mergiraf(golden: &Path, common: &Path) -> Result<()> {
+    let dropped = drop_attributes(common)?;
+    for (key, generated) in [
+        ("merge.mergiraf.name", MERGIRAF_NAME),
+        ("merge.mergiraf.driver", MERGIRAF_DRIVER),
+    ] {
+        // A value that klon did not write belongs to the user, who may point
+        // the driver at a mergiraf that PATH does not name.
+        if git::run(golden, &["config", "--get", key])
+            .is_ok_and(|value| value.trim_end_matches('\n') == generated)
+        {
+            git::run_quiet(golden, &["config", "--unset", key]);
+        }
+    }
+    if dropped {
+        eprintln!("klon: dropped the generated mergiraf rule from info/attributes");
+    }
+    Ok(())
 }
 
 /// Add the two generated lines to `<common>/info/attributes` once. Every line
@@ -333,6 +424,51 @@ fn write_attributes(common: &Path) -> Result<()> {
         current.push(b'\n');
     }
     fs::write(&file, current).map_err(Error::io("write info/attributes"))
+}
+
+/// Take the generated block out of `<common>/info/attributes` again. Only the
+/// marker line and the rule line right after it go; a rule that a person wrote
+/// carries no marker and stays. The answer says whether a block was there.
+fn drop_attributes(common: &Path) -> Result<bool> {
+    let file = common.join("info").join("attributes");
+    let current = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::io("read info/attributes")(err)),
+    };
+    let trailing_newline = current.ends_with(b"\n");
+    let lines: Vec<&[u8]> = current.split(|byte| *byte == b'\n').collect();
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(lines.len());
+    let mut dropped = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].strip_suffix(b"\r").unwrap_or(lines[index]);
+        if line == ATTRIBUTES_MARKER.as_bytes() {
+            dropped = true;
+            index += 1;
+            let next = lines.get(index).map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+            if next == Some(ATTRIBUTES_RULE.as_bytes()) {
+                index += 1;
+            }
+            continue;
+        }
+        kept.push(lines[index]);
+        index += 1;
+    }
+    if !dropped {
+        return Ok(false);
+    }
+    // `split` gives a trailing empty piece for a file that ends in a newline.
+    // Dropping it and adding the newline back keeps the file byte-exact.
+    if trailing_newline && kept.last() == Some(&&b""[..]) {
+        kept.pop();
+    }
+    let mut out = kept.join(&b'\n');
+    if trailing_newline && !out.is_empty() {
+        out.push(b'\n');
+    }
+    fs::write(&file, out).map_err(Error::io("write info/attributes"))?;
+    Ok(true)
 }
 
 /// The two merge keys of handoff §6, in the shared config. `zdiff3` shows the
@@ -432,17 +568,17 @@ fn report_conflict(
     )))
 }
 
-/// The conflicted paths of golden, then `git merge --abort`. The read comes
-/// first: the abort drops the index that names them.
+/// The conflicted paths of golden. The caller reads them before it aborts:
+/// the abort drops the index that names them.
 fn unmerged(golden: &Path) -> Result<Vec<String>> {
     let text = git::run(golden, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-    let paths: Vec<String> = text.lines().map(str::to_string).collect();
-    if !paths.is_empty() {
-        if let Err(err) = git::run(golden, &["merge", "--abort"]) {
-            eprintln!("klon: git merge --abort failed: {err}");
-        }
-    }
-    Ok(paths)
+    Ok(text.lines().map(str::to_string).collect())
+}
+
+/// True when golden holds a merge that has not finished. `MERGE_HEAD` exists
+/// from the start of a merge until the merge commit or the abort.
+fn merge_in_progress(golden: &Path) -> bool {
+    git::run(golden, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]).is_ok()
 }
 
 /// The full object id of golden's HEAD.
@@ -450,19 +586,16 @@ fn head(golden: &Path) -> Result<String> {
     Ok(git::run(golden, &["rev-parse", "HEAD"])?.trim().to_string())
 }
 
+/// The full object id that `reference` names.
+fn tip(golden: &Path, reference: &str) -> Result<String> {
+    Ok(git::run(golden, &["rev-parse", "--verify", reference])?
+        .trim()
+        .to_string())
+}
+
 /// The first seven characters of an object id, for a report line.
 fn short(oid: &str) -> &str {
     oid.get(..7).unwrap_or(oid)
-}
-
-/// True when an executable `name` sits in a PATH directory.
-fn tool_on_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            fs::metadata(dir.join(name))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-    })
 }
 
 fn print_report(report: &Report) -> Result<()> {

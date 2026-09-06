@@ -17,12 +17,11 @@
 //! golden is the write target. Golden has no `.klon/env`, so the step also
 //! carries no klon tag.
 
-use crate::envelope::{Envelope, Options, Root};
+use crate::envelope::{step_stdout, Envelope, Options, Root};
 use crate::{branch, config, git, process, spare, Error, Result};
 use serde::Serialize;
-use std::os::fd::AsFd;
 use std::path::Path;
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 
 /// The JSON schema name. A field removal or a type change bumps the suffix.
 pub const SCHEMA: &str = "klon.up/1";
@@ -173,21 +172,6 @@ fn fast_forward(golden: &Path, base: &str, json: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Where a warm step writes its stdout. Under `--json` klon owns that stream,
-/// and a step that prints one line would put it in front of the document, so
-/// the step writes to stderr instead.
-fn step_stdout(json: bool) -> Result<Option<Stdio>> {
-    if !json {
-        return Ok(None);
-    }
-    let fd = std::io::stderr()
-        .as_fd()
-        .try_clone_to_owned()
-        .map(Stdio::from)
-        .map_err(Error::io("duplicate stderr for the warm steps"))?;
-    Ok(Some(fd))
 }
 
 /// Why a step failed, in the wording the `up` report has used since C14.

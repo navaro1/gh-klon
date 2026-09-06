@@ -258,18 +258,25 @@ ff = "no-ff"                     # or "ff-only"
 It never pushes. The steps run in this order, and each one refuses before the
 next one changes anything:
 
-1. Refuse a dirty golden, a dirty klon, and a golden that is not on `base`.
+1. Refuse a locked klon, a golden that holds a merge that stopped, a dirty
+   golden, a dirty klon, and a golden that is not on `base`.
 2. `git fetch origin`. A repository with no `origin` remote draws one line.
 3. Run the merge gate inside the klon under the envelope: the executable
    `<klon>/.klon/hooks/pre_merge`, else the approved `[proof] steps`. The first
-   failure prints `pre_merge failed: <cmd>` and golden never moves.
+   failure prints `pre_merge failed: <cmd>` and golden never moves. klon reads
+   the branch tip before and after the gate and refuses a tip that moved, so
+   the commit that lands is the commit the gate proved.
 4. Configure the mergiraf merge driver when `mergiraf` is on PATH. klon writes
    `merge.mergiraf.driver` to the repository config and two generated lines to
-   `<common>/info/attributes`. A host without mergiraf keeps git's line merge.
-5. Merge the branch. On a conflict klon prints the conflicting paths, runs
-   `git merge --abort`, and exits non-zero, so golden stays where it stood.
+   `<common>/info/attributes`. A host without mergiraf keeps git's line merge,
+   and klon drops its own generated lines and keys again.
+5. Merge the commit the gate proved. On a conflict klon prints the conflicting
+   paths and aborts, so golden stays where it stood. A merge that a `commit-msg`
+   hook refuses is aborted too: git leaves that one with no conflicting path.
 6. Remove the klon. `--keep` skips the removal, and a klon with a live process
    stays with one line. The branch itself stays: `rm --merged` deletes that.
+   From step 5 on, a failure costs the removal and never the command: the merge
+   is in golden's history, and no report may call that a failure.
 
 `merge` sets `merge.conflictStyle` and `rerere.enabled=true` in the repository
 config. `zdiff3` needs git 2.35; an older git gets `diff3`, because it rejects

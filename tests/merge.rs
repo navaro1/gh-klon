@@ -580,3 +580,162 @@ fn the_generated_attributes_block_stays_one_block() {
         "the other lines must stay:\n{text}"
     );
 }
+
+// --- The review findings -----------------------------------------------------
+
+/// A gate that prints on stdout must not break `merge --json`. klon owns that
+/// stream for the one document, so the gate's stdout goes to stderr.
+#[test]
+fn gate_output_stays_out_of_the_json_document() {
+    let fx = repo(20);
+    let klon_dir = add(&fx, "feature");
+    write_hook(
+        &klon_dir,
+        "#!/bin/sh\necho 'the gate talks on stdout'\nexit 0\n",
+    );
+
+    let out = klon(&fx.golden, &["merge", "--json", "feature"]);
+    assert!(out.status.success(), "merge failed: {}", stderr(&out));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out))
+        .unwrap_or_else(|err| panic!("stdout must be one JSON document: {err}\n{}", stdout(&out)));
+    assert_eq!(report["hook"], "pre_merge");
+    assert!(
+        stderr(&out).contains("the gate talks on stdout"),
+        "the gate output must reach stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// The gate proves one commit. A commit that lands while the gate runs must
+/// not ride into base untested.
+#[test]
+fn a_branch_that_moves_during_the_gate_stops_the_merge() {
+    let fx = repo(20);
+    let klon_dir = add(&fx, "feature");
+    // The hook commits inside its own klon, which moves the branch under the
+    // gate that is still running.
+    write_hook(
+        &klon_dir,
+        "#!/bin/sh\nset -e\necho untested > untested.txt\ngit add untested.txt\n\
+         git -c user.name=klon -c user.email=klon@example.com commit -qm 'a late commit'\n",
+    );
+    let before = head(&fx.golden);
+
+    let out = klon(&fx.golden, &["merge", "feature"]);
+    assert!(!out.status.success(), "a moved branch must stop the merge");
+    assert!(
+        stderr(&out).contains("moved") && stderr(&out).contains("while the gate ran"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(head(&fx.golden), before, "base HEAD must not move");
+}
+
+/// A `commit-msg` hook that refuses the merge commit leaves `MERGE_HEAD` and no
+/// unmerged path. klon must abort that, so golden never stays mid-merge.
+#[test]
+fn a_rejected_merge_commit_leaves_golden_out_of_the_merge() {
+    let fx = repo(20);
+    add(&fx, "feature");
+    let hooks = fx.golden.join(".git").join("hooks");
+    write_script(&hooks, "commit-msg", "#!/bin/sh\nexit 1\n");
+    let before = head(&fx.golden);
+
+    let out = klon(&fx.golden, &["merge", "feature"]);
+    assert!(
+        !out.status.success(),
+        "a refused commit must fail the merge"
+    );
+    assert_eq!(head(&fx.golden), before, "base HEAD must not move");
+    assert!(
+        !git(
+            &fx.golden,
+            &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]
+        )
+        .status
+        .success(),
+        "klon must abort the merge that the hook stopped"
+    );
+    assert_eq!(
+        git_ok(&fx.golden, &["status", "--porcelain"]),
+        "",
+        "golden must be clean again"
+    );
+
+    // A golden that still holds a stopped merge is refused up front.
+    git_ok(&fx.golden, &["merge", "--no-commit", "--no-ff", "feature"]);
+    let out = klon(&fx.golden, &["merge", "feature"]);
+    assert!(!out.status.success(), "a merge in progress must be refused");
+    assert!(
+        stderr(&out).contains("holds a merge that stopped"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// A host that loses mergiraf loses the generated setup too. A rule left
+/// behind would send git to a command it cannot find, and git then calls every
+/// hunk of every file a conflict.
+#[test]
+fn a_missing_mergiraf_drops_the_generated_setup() {
+    let fx = repo(20);
+    let tools = fx.golden.parent().unwrap().join("tools");
+    write_script(&tools, "mergiraf", "#!/bin/sh\nexit 1\n");
+    let attributes = fx.golden.join(".git").join("info").join("attributes");
+    fs::create_dir_all(attributes.parent().unwrap()).expect("create info/");
+    fs::write(&attributes, "*.bin binary\n").expect("write info/attributes");
+
+    add(&fx, "feature");
+    let out = klon_env(
+        &fx.golden,
+        &[("PATH", &path_with(&tools))],
+        &["merge", "feature"],
+    );
+    assert!(out.status.success(), "merge failed: {}", stderr(&out));
+    let text = fs::read_to_string(&attributes).expect("read info/attributes");
+    assert!(text.contains("* merge=mergiraf"), "{text}");
+
+    // The second merge runs without the tool on PATH.
+    git_ok(&fx.golden, &["branch", "second"]);
+    git_ok(&fx.golden, &["checkout", "-q", "second"]);
+    commit(&fx.golden, "late.txt", "late\n", "a second branch");
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    add(&fx, "second");
+    let out = klon(&fx.golden, &["merge", "second"]);
+    assert!(out.status.success(), "merge failed: {}", stderr(&out));
+
+    let text = fs::read_to_string(&attributes).expect("read info/attributes");
+    assert!(
+        !text.contains("merge=mergiraf"),
+        "the generated rule must go:\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l == "*.bin binary"),
+        "the other lines must stay:\n{text}"
+    );
+    assert!(
+        !git(&fx.golden, &["config", "--get", "merge.mergiraf.driver"])
+            .status
+            .success(),
+        "the generated driver key must go"
+    );
+}
+
+/// A lock says that somebody wants the klon kept. The refusal comes before the
+/// merge, so base never moves for a klon that klon cannot remove.
+#[test]
+fn a_locked_klon_stops_the_merge_before_base_moves() {
+    let fx = repo(20);
+    let klon_dir = add(&fx, "feature");
+    git_ok(
+        &fx.golden,
+        &["worktree", "lock", klon_dir.to_str().unwrap()],
+    );
+    let before = head(&fx.golden);
+
+    let out = klon(&fx.golden, &["merge", "feature"]);
+    assert!(!out.status.success(), "a locked klon must stop the merge");
+    assert!(stderr(&out).contains("locked"), "stderr: {}", stderr(&out));
+    assert_eq!(head(&fx.golden), before, "base HEAD must not move");
+    assert!(registered(&fx.golden, &klon_dir), "the klon must stay");
+}

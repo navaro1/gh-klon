@@ -410,17 +410,6 @@ pub fn freeze_times(root: &Path) {
     walk(root, &times);
 }
 
-// --- Repository state --------------------------------------------------------
-
-/// Give the repository a committer identity. `sync` and `merge` shell to `git
-/// rebase` and `git merge`, which write a commit; the harness hides the global
-/// config, so the identity has to live in the repository. Every worktree of the
-/// repository shares it.
-pub fn identity(dir: &Path) {
-    git_ok(dir, &["config", "user.name", "klon"]);
-    git_ok(dir, &["config", "user.email", "klon@example.com"]);
-}
-
 // --- Oracle and parity -------------------------------------------------------
 
 /// Assert that the klon is clean: `git status --porcelain` prints nothing.

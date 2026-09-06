@@ -159,10 +159,17 @@ pub fn spawn_detached_klon_with(args: &[&OsStr], job: &str, setup: Detached) -> 
         .map_err(Error::io(format!("start the {job}")))
 }
 
-/// True when an executable `name` sits in a PATH directory.
-fn tool_on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+/// True when an executable `name` sits in a PATH directory. The mode matters:
+/// a file that nobody may run is not a tool, and `merge` (C25) must not
+/// configure a merge driver around one.
+pub fn tool_on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 /// Every process of one klon, sorted by pid. `stop` ends this list (R22).
