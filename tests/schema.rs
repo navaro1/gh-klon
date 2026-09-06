@@ -67,6 +67,8 @@ const LIST_ROW: Fields = &[
     ("checks", Ty::StrOrNull),
     // The C12 warm list: the directories a detached warm process still owes.
     ("warming", Ty::Arr),
+    // C29: true for a klon that `hibernate` put away. Its directory is gone.
+    ("hibernated", Ty::Bool),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -602,6 +604,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -624,6 +627,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -644,6 +648,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -666,6 +671,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -686,6 +692,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,

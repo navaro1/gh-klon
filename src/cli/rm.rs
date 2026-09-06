@@ -256,7 +256,10 @@ fn refuse_reserved(target: &Path, golden: &Path) -> Result<()> {
 /// Steps 4 to 6. Rename the klon into `.trash` when that stays on one
 /// filesystem, then let git forget it and delete the copy in the background.
 /// The answer is the trash path, or None when the klon never reached the trash.
-fn remove_worktree(golden: &Path, common: &Path, target: &Path) -> Result<Option<PathBuf>> {
+///
+/// `hibernate` (C29) removes its klon through this same function, so a
+/// hibernated tree and a removed one leave the repository in the same shape.
+pub fn remove_worktree(golden: &Path, common: &Path, target: &Path) -> Result<Option<PathBuf>> {
     if !target.exists() {
         // A stale registration with no directory on disk: prune drops it.
         git::run(golden, &["worktree", "prune"])?;

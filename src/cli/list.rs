@@ -12,7 +12,7 @@ use crate::extras;
 use crate::paths;
 use crate::radar;
 use crate::warm;
-use crate::{git, Error, Result};
+use crate::{git, hibernate, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +67,9 @@ struct Row {
     /// The ignored directories a detached warm process still owes the klon
     /// (C12). It is empty once every directory landed.
     warming: Vec<String>,
+    /// True for a klon that `gh klon hibernate` put away (C29). Its directory
+    /// is gone; its work sits on `refs/klon/hibernate/<name>`.
+    hibernated: bool,
     #[serde(flatten)]
     radar: radar::Row,
 }
@@ -116,8 +119,39 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             warming: warm::pending(&path),
             branch,
             locked: worktree.locked,
+            hibernated: false,
             path,
             radar,
+        });
+    }
+    // C29: a hibernated klon has no directory, so `git worktree list` cannot
+    // show it. Its record can, and a person who forgot a klon needs to see it.
+    // The radar cannot measure a tree that is not there, so those columns stay
+    // unknown.
+    for record in hibernate::list(&common)? {
+        if hibernate::is_awake(&worktrees, &record) {
+            continue;
+        }
+        rows.push(Row {
+            head: short_head(&record.head, json),
+            dirty: false,
+            ip: record.ip,
+            // Nothing to measure: the directory is gone, so it costs no disk
+            // outside the object store and runs no process. The pull request
+            // is left out too, because `list` reads it per live klon and a
+            // sleeping klon is not one a reader is about to work in.
+            disk_bytes: 0,
+            disk_exact: false,
+            procs: 0,
+            rss_bytes: 0,
+            pr: None,
+            checks: None,
+            warming: Vec::new(),
+            branch: Some(record.branch),
+            locked: false,
+            hibernated: true,
+            path: record.path,
+            radar: radar::Row::unknown(),
         });
     }
     if json {
@@ -133,6 +167,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         for row in &rows {
             let branch = row.branch.as_deref().unwrap_or("(detached)");
+            if row.hibernated {
+                // `zz` is the marker of a sleeping klon: no HEAD flag, no radar,
+                // one word that says why the directory is missing.
+                println!("{} {branch} zz hibernated", row.path.display());
+                continue;
+            }
             let flag = if row.dirty { " *" } else { "" };
             println!(
                 "{} {branch} {}{flag} {} {}",
@@ -189,6 +229,15 @@ fn head_of(path: &Path, full: bool) -> String {
     git::run(path, args)
         .map(|out| out.trim().to_string())
         .unwrap_or_else(|_| "-".to_string())
+}
+
+/// The recorded HEAD of a hibernated klon: the full object name for JSON, the
+/// first seven characters for a person, as `git rev-parse --short` gives.
+fn short_head(head: &str, full: bool) -> String {
+    match full {
+        true => head.to_string(),
+        false => head[..head.len().min(7)].to_string(),
+    }
 }
 
 /// True when `git status --porcelain` prints a line. A broken klon lists clean.

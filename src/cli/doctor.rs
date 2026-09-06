@@ -273,6 +273,8 @@ fn op_key(op: Op) -> &'static str {
         Op::Rm => "rm",
         Op::Init => "init",
         Op::Merge => "merge",
+        Op::Hibernate => "hibernate",
+        Op::Wake => "wake",
     }
 }
 

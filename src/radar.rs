@@ -113,7 +113,7 @@ impl Row {
     }
 
     /// The row klon shows when it cannot reach the radar at all.
-    fn unknown() -> Row {
+    pub fn unknown() -> Row {
         Row {
             vs_base: "-".to_string(),
             vs_siblings: "-".to_string(),

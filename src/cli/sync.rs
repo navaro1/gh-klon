@@ -456,6 +456,11 @@ fn fresh(
             path_mode: None,
             no_fixup: false,
             no_spare: true,
+            // `sync --fresh` rebuilds one klon that the `rm` above just took
+            // away, so the count is the same and the disk budget has nothing
+            // to decide (C29).
+            evict: false,
+            no_budget: true,
             command: Vec::new(),
         },
         yes,
