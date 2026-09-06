@@ -39,6 +39,14 @@ fn add(fx: &Fixture, branch: &str) -> PathBuf {
     fx.klon_path(branch)
 }
 
+/// The last `n` lines of `text`. The `KLON_DEBUG` fence lines sit above the
+/// pasta errors, so a failure message prints the tail, not the whole stderr.
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 /// True when `program` sits in a PATH directory.
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
@@ -298,7 +306,7 @@ fn pasta_starts_under_the_write_fence() {
     assert!(
         out.status.success(),
         "run --netns failed under the fence: {}",
-        stderr(&out)
+        tail(&stderr(&out), 12)
     );
     assert_eq!(stdout(&out).trim(), "under the fence");
     let text = stderr(&out);

@@ -167,6 +167,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y passt
+      # Ubuntu 24.04 denies unprivileged user namespaces to AppArmor-unconfined
+      # binaries (kernel.apparmor_restrict_unprivileged_userns defaults to 1),
+      # and pasta needs one: its uid_map write fails with EPERM and the clone
+      # after it dies. The runner is ephemeral, so the job drops the guard
+      # for itself. pasta runs as a normal user; no privilege change happens.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo test --locked --test netns -- --nocapture
 
   nightly:
