@@ -6,6 +6,7 @@ mod branch;
 mod cli;
 mod config;
 mod envelope;
+mod fixup;
 mod gh;
 mod git;
 mod journal;

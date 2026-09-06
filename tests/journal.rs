@@ -76,6 +76,34 @@ fn spawn_paused(golden: &Path, state: &str, args: &[&str]) -> Child {
         .expect("start gh-klon")
 }
 
+/// True when the journal directory entry named `file` is a landed entry.
+///
+/// `journal::write` lands through a `.<name>.<pid>.tmp` file in the same
+/// directory, so a test that only asks for an extension can see the write in
+/// flight and kill the writer before the rename. The rule here is the one
+/// `journal::list` uses.
+fn is_entry(file: &std::ffi::OsStr) -> bool {
+    let name = file.to_string_lossy();
+    name.ends_with(".json") && !name.starts_with('.')
+}
+
+/// True when `inbox` holds a landed entry in `state`.
+///
+/// A command writes several states into one file name, so "a file exists" is
+/// not "the command reached the state I paused it at". `rm` writes `planned`
+/// first and `removing` second, and a test that waits for the file alone can
+/// kill the process between the two.
+fn entry_in_state(inbox: &Path, state: &str) -> bool {
+    let Ok(read) = fs::read_dir(inbox) else {
+        return false;
+    };
+    read.flatten()
+        .filter(|item| is_entry(&item.file_name()))
+        .filter_map(|item| fs::read_to_string(item.path()).ok())
+        .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+        .any(|entry| entry["state"] == state)
+}
+
 fn sigkill(child: &Child) {
     // SAFETY: `kill` takes a pid and a signal number and returns an error code.
     let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
@@ -387,11 +415,7 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
         let mut child = spawn_paused(&fx.golden, "removing", &["rm", "feature"]);
         let inbox = common.join("klon").join("journal");
         let reached = wait_until(
-            || {
-                fs::read_dir(&inbox)
-                    .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
-                    .unwrap_or(false)
-            },
+            || entry_in_state(&inbox, "removing"),
             Duration::from_secs(30),
         );
         sigkill(&child);
@@ -415,7 +439,7 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
         assert!(out.status.success(), "repair failed: {}", stderr(&out));
         assert!(
             !fs::read_dir(&inbox)
-                .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
+                .map(|read| read.flatten().any(|i| is_entry(&i.file_name())))
                 .unwrap_or(false),
             "the repair must close the entry"
         );

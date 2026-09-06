@@ -77,8 +77,8 @@ pub struct CopySection {
     pub reinstall: Option<BTreeMap<String, String>>,
 }
 
-/// The `[fixup]` table. Read by the fixup chunk.
-#[allow(dead_code)]
+/// The `[fixup]` table: gitignore-syntax globs that the path fixup pass leaves
+/// alone (R15). They resolve against the klon root.
 #[derive(Debug, Default, Deserialize)]
 pub struct Fixup {
     pub skip: Option<Vec<String>>,
@@ -117,8 +117,7 @@ pub struct Config {
     pub fence: Option<Fence>,
     /// Per-directory strategy of the copy backend. `reinstall` needs approval.
     pub copy: Option<CopySection>,
-    /// Paths the fixup pass must not rewrite. Read by the fixup chunk.
-    #[allow(dead_code)]
+    /// Paths the fixup pass must not rewrite.
     pub fixup: Option<Fixup>,
     /// Paths to hardlink in v2. Read by the hardlink backend.
     #[allow(dead_code)]
