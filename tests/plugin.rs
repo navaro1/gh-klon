@@ -235,6 +235,61 @@ fn the_sed_fallback_parses_the_hook_input() {
 }
 
 #[test]
+fn the_create_hook_lands_on_the_repository_root_from_a_subdirectory() {
+    let fx = Fixture::generate(SEED, 100, 10, 5, 5);
+    let (_shim_dir, shim) = gh_shim();
+    let subdirectory = fx.golden.join("d000");
+    let want = fx.golden.join(".claude").join("worktrees").join("subtest");
+
+    let out = run_hook(
+        "worktree-create.sh",
+        &shim,
+        &format!(
+            "{{\"hook_event_name\":\"WorktreeCreate\",\"cwd\":\"{}\",\"name\":\"subtest\"}}",
+            subdirectory.display()
+        ),
+        &[],
+    );
+    assert!(out.status.success(), "hook failed: {}", stderr(&out));
+    // The klon lives under the repository root, not under the subdirectory.
+    assert_eq!(stdout(&out).trim(), want.to_str().unwrap());
+    assert!(
+        registered_with(&fx.golden, &want, "refs/heads/worktree-subtest"),
+        "the klon is not registered"
+    );
+    assert!(
+        !subdirectory.join(".claude").exists(),
+        "the subdirectory must stay empty of klons"
+    );
+}
+
+#[test]
+fn a_missing_cwd_makes_the_create_hook_fail_loudly() {
+    let fx = Fixture::generate(SEED, 100, 10, 5, 5);
+    let (_shim_dir, shim) = gh_shim();
+    let absent = fx.golden.parent().unwrap().join("no-such-repo");
+
+    let out = run_hook(
+        "worktree-create.sh",
+        &shim,
+        &format!(
+            "{{\"hook_event_name\":\"WorktreeCreate\",\"cwd\":\"{}\",\"name\":\"ghost\"}}",
+            absent.display()
+        ),
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "a cwd without a repository must fail"
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("cannot find the git repository"),
+        "the hook must name the missing repository: {err}"
+    );
+}
+
+#[test]
 fn add_with_the_claude_path_mode_uses_the_claude_convention() {
     let fx = Fixture::generate(SEED, 100, 10, 5, 5);
     let want = fx.golden.join(".claude").join("worktrees").join("x");
