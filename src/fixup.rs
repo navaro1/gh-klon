@@ -231,11 +231,10 @@ impl Pass {
         let Ok(text) = String::from_utf8(bytes) else {
             return Ok(None);
         };
-        let count = text.matches(&self.needle).count();
+        let (rewritten, count) = replace_paths(&text, &self.needle, &self.replacement);
         if count == 0 {
             return Ok(None);
         }
-        let rewritten = text.replace(&self.needle, &self.replacement);
         replace_content(path, rewritten.as_bytes(), &meta)?;
         Ok(Some(format!("{relative} {count}")))
     }
@@ -261,9 +260,10 @@ impl Pass {
             return Ok(None);
         };
         // Only a target that starts at golden's root moves. A relative target
-        // already follows the klon.
+        // already follows the klon, and a sibling such as `<golden>-docs` is
+        // another tree.
         let rest = match text.strip_prefix(&self.needle) {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+            Some(rest) if !continues_name(rest) => rest,
             _ => return Ok(None),
         };
         let meta = fs::symlink_metadata(path).map_err(Error::io(format!("stat {relative}")))?;
@@ -364,6 +364,43 @@ fn replace_content(path: &Path, bytes: &[u8], meta: &fs::Metadata) -> Result<()>
         return Err(Error::io(format!("rewrite {}", path.display()))(err));
     }
     crate::backend::set_times(path, meta)
+}
+
+/// Replace every occurrence of `needle` in `text` that ends at a path
+/// boundary. The answer is the new text and the number of replacements.
+///
+/// A plain fixed-string replace is not safe here. Golden's path is a string
+/// prefix of every sibling that starts with the same name: with golden at
+/// `/w/proj`, a plain replace would turn `/w/proj-docs` into
+/// `<klon>-docs` and would rewrite the klon's own path inside golden's default
+/// worktree root `/w/proj.wt`. Only an occurrence that ends the path component
+/// names golden itself.
+fn replace_paths(text: &str, needle: &str, replacement: &str) -> (String, usize) {
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0usize;
+    let mut rest = text;
+    while let Some(at) = rest.find(needle) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + needle.len()..];
+        if continues_name(after) {
+            out.push_str(needle);
+        } else {
+            out.push_str(replacement);
+            count += 1;
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    (out, count)
+}
+
+/// True when `rest` opens with a character that a file name can continue with,
+/// so the text before it is only the start of another name. A separator, a
+/// quote, a space, or the end of the text closes the name instead.
+fn continues_name(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | '+' | '@'))
 }
 
 /// True when `path` is `.next/cache`, `.ninja_log`, or `.ninja_deps`.
@@ -491,6 +528,52 @@ mod tests {
         for name in ["a.json", "a.yaml", "a.d", "a.toml", "plain", "a.cfg"] {
             assert!(!skipped_extension(Path::new(name)), "{name} must be read");
         }
+    }
+
+    /// The klon path of the default template starts with golden's path plus
+    /// `.wt`, so a plain fixed-string replace would rewrite golden's own name
+    /// inside the replacement it just wrote. The boundary rule stops that.
+    #[test]
+    fn the_replace_moves_only_a_whole_path() {
+        let golden = "/w/proj";
+        let klon = "/w/proj.wt/feature";
+        let cases = [
+            ("dir: /w/proj/store\n", "dir: /w/proj.wt/feature/store\n", 1),
+            ("dir: /w/proj\n", "dir: /w/proj.wt/feature\n", 1),
+            ("\"/w/proj\"", "\"/w/proj.wt/feature\"", 1),
+            (
+                "a=/w/proj:b=/w/proj/x",
+                "a=/w/proj.wt/feature:b=/w/proj.wt/feature/x",
+                2,
+            ),
+            // A sibling directory keeps its name.
+            ("/w/proj-docs/readme", "/w/proj-docs/readme", 0),
+            ("/w/project/readme", "/w/project/readme", 0),
+            ("/w/proj.bak", "/w/proj.bak", 0),
+            // The klon path itself must survive a second pass unchanged.
+            ("/w/proj.wt/feature/x", "/w/proj.wt/feature/x", 0),
+            ("nothing here", "nothing here", 0),
+        ];
+        for (input, want, count) in cases {
+            let (out, found) = replace_paths(input, golden, klon);
+            assert_eq!((out.as_str(), found), (want, count), "input {input}");
+        }
+    }
+
+    #[test]
+    fn the_searcher_reports_a_needle_in_a_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.yaml");
+        fs::write(&file, "dir: /home/x/golden\nmore\n").unwrap();
+        let mut found = Found::default();
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(0))
+            .line_number(false)
+            .build();
+        let outcome = searcher.search_path(Fixed(b"/home/x/golden"), &file, &mut found);
+        assert!(outcome.is_ok(), "the search failed: {outcome:?}");
+        assert!(found.hit, "the searcher must report the needle");
+        assert!(!found.binary);
     }
 
     #[test]
