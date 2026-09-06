@@ -209,11 +209,17 @@ fn check_version(file: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The verdict for one klon: its HEAD, its branch, and the steps that are
-/// configured now.
+/// The verdict for one commit: the commit that `merge` will land, its branch,
+/// and the steps that are configured now.
+///
+/// Three things must agree before the answer is `Pass`: the `commit` field
+/// inside the receipt, its `steps_hash`, and its `status`. The name of the
+/// file is not proof of what it holds, so the content decides. A file whose
+/// name and `commit` disagree is a damaged or a planted receipt, and it reads
+/// as stale, which is the answer that asks for a fresh `check`.
 pub fn verdict(common: &Path, commit: &str, branch: &str, steps_hash: &str) -> Result<Verdict> {
     if let Some(receipt) = read(common, commit)? {
-        if receipt.steps_hash != steps_hash {
+        if receipt.commit != commit || receipt.steps_hash != steps_hash {
             return Ok(Verdict::Stale);
         }
         return Ok(match receipt.status {
@@ -386,6 +392,37 @@ mod tests {
         .unwrap();
         let err = read(common, "abc").expect_err("a future version must refuse");
         assert!(err.to_string().contains("unknown receipt version"), "{err}");
+    }
+
+    /// The file name is not proof of what the file holds. A receipt whose
+    /// `commit` field names another commit reads as stale, so `merge` refuses
+    /// and asks for a fresh check.
+    #[test]
+    fn a_receipt_that_names_another_commit_reads_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path();
+        let hash = steps_hash(&steps(&["true"]));
+        let mut record = build("elsewhere", "7ea", "feature", &hash, Vec::new(), 1);
+        // The file lands under the wanted commit; its content names another.
+        record.commit = "wanted".to_string();
+        write(common, &record).unwrap();
+        record.commit = "elsewhere".to_string();
+        fs::write(
+            path(common, "wanted"),
+            serde_json::to_string(&record).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdict(common, "wanted", "feature", &hash).unwrap(),
+            Verdict::Stale
+        );
+        // The same receipt under its own name passes.
+        write(common, &record).unwrap();
+        assert_eq!(
+            verdict(common, "elsewhere", "feature", &hash).unwrap(),
+            Verdict::Pass
+        );
     }
 
     #[test]
