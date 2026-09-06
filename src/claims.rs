@@ -313,8 +313,25 @@ fn save(common: &Path, table: &Table) -> Result<()> {
 /// of the same path is not an error. A path another klon holds, or one that
 /// covers or sits under another klon's path, refuses the whole call and writes
 /// nothing: a half-taken claim list would leave the caller guessing.
-pub fn acquire(common: &Path, klon: &str, wanted: &[(String, Kind)]) -> Result<Vec<Claim>> {
+///
+/// `root` is the klon directory, and it is checked again **inside** the lock.
+/// The caller found the klon before it asked for the lock, and a `rm` can run
+/// in that window: `rm` renames the tree away and then releases the claims, so
+/// a directory that is gone here means the append would write a claim for a
+/// klon that no longer exists, and nothing would ever release it.
+pub fn acquire(
+    common: &Path,
+    klon: &str,
+    root: &Path,
+    wanted: &[(String, Kind)],
+) -> Result<Vec<Claim>> {
     let lock = Lock::acquire(common)?;
+    if !root.exists() {
+        return Err(Error::klon(format!(
+            "{} is gone; the klon was removed while the claim waited for the lock",
+            root.display()
+        )));
+    }
     let mut table = load(common)?;
     for (path, _) in wanted {
         if let Some(other) = table
@@ -369,6 +386,29 @@ pub fn release(common: &Path, klon: &str, paths: &[String]) -> Result<Vec<String
 /// outlives the klon that took it.
 pub fn release_all(common: &Path, klon: &str) -> Result<Vec<String>> {
     remove(common, klon, |_| true)
+}
+
+/// Every name under which the klon at `path` can hold a claim: the branch it
+/// has checked out now, and the branch it was created with.
+///
+/// The two differ in two cases. An agent that detached HEAD leaves the klon
+/// with no branch at all, and `rm` would then find no name to release. An
+/// agent that renamed the branch leaves rows under the old name. Both sets of
+/// rows belong to this klon, so a removal releases both.
+///
+/// The call reads `<klon>/.klon/env`, so it must run before the tree moves.
+pub fn owners(path: &Path, branch: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let candidates = [
+        branch.map(str::to_string),
+        crate::envelope::env::value(path, "KLON_NAME"),
+    ];
+    for name in candidates.into_iter().flatten() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Drop every claim of `klon` that `wanted` accepts. The answer names the
@@ -524,14 +564,14 @@ mod tests {
     fn a_second_klon_cannot_take_a_held_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let common = tmp.path();
-        acquire(common, "left", &wanted(&["src/app"])).unwrap();
-        let err = acquire(common, "right", &wanted(&["src/app/main.rs"]))
+        acquire(common, "left", common, &wanted(&["src/app"])).unwrap();
+        let err = acquire(common, "right", common, &wanted(&["src/app/main.rs"]))
             .expect_err("a path under a held directory must refuse");
         assert!(err.to_string().contains("claim conflict"), "{err}");
         // The refused call wrote nothing.
         assert_eq!(load(common).unwrap().claims.len(), 1);
         // A path beside it is free.
-        acquire(common, "right", &wanted(&["src/apple"])).unwrap();
+        acquire(common, "right", common, &wanted(&["src/apple"])).unwrap();
         assert_eq!(load(common).unwrap().claims.len(), 2);
     }
 
@@ -539,8 +579,8 @@ mod tests {
     fn a_repeated_claim_of_one_path_is_not_a_second_row() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let common = tmp.path();
-        acquire(common, "left", &wanted(&["src/app"])).unwrap();
-        acquire(common, "left", &wanted(&["src/app"])).unwrap();
+        acquire(common, "left", common, &wanted(&["src/app"])).unwrap();
+        acquire(common, "left", common, &wanted(&["src/app"])).unwrap();
         assert_eq!(load(common).unwrap().claims.len(), 1);
     }
 
@@ -548,8 +588,8 @@ mod tests {
     fn release_takes_the_named_paths_and_release_all_takes_the_rest() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let common = tmp.path();
-        acquire(common, "left", &wanted(&["a", "b", "c"])).unwrap();
-        acquire(common, "right", &wanted(&["d"])).unwrap();
+        acquire(common, "left", common, &wanted(&["a", "b", "c"])).unwrap();
+        acquire(common, "right", common, &wanted(&["d"])).unwrap();
         assert_eq!(
             release(common, "left", &["b".to_string()]).unwrap(),
             vec!["b".to_string()]

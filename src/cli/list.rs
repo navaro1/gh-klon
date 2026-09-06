@@ -225,8 +225,14 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             let branch = row.branch.as_deref().unwrap_or("(detached)");
             if row.hibernated {
                 // `zz` is the marker of a sleeping klon: no HEAD flag, no radar,
-                // one word that says why the directory is missing.
-                println!("{} {branch} zz hibernated", row.path.display());
+                // one word that says why the directory is missing. A sleeping
+                // klon keeps its claims, so the claim column still prints:
+                // an overlap that only a sleeping klon carries must be visible.
+                let claims = match row.claims.is_empty() {
+                    true => String::new(),
+                    false => format!(" | {}", claim_column(row)),
+                };
+                println!("{} {branch} zz hibernated{claims}", row.path.display());
                 continue;
             }
             let flag = if row.dirty { " *" } else { "" };
@@ -272,17 +278,21 @@ fn extra_columns(row: &Row) -> String {
         .receipt
         .map(mark)
         .unwrap_or_else(|| receipt::Verdict::Missing.column());
-    // C27: the number of owned paths, and a `!` when one of them is also
-    // owned by another klon. A klon that claimed nothing shows a dash.
-    let claims = match (row.claims.len(), row.claim_overlap) {
-        (0, _) => "-".to_string(),
-        (count, false) => count.to_string(),
-        (count, true) => format!("{count}!"),
-    };
+    let claims = claim_column(row);
     format!(
         "| {disk} | {rss} | {} | {pr} | {checks} | {warm} | {receipt} | {claims}",
         row.procs
     )
+}
+
+/// The C27 column: the number of owned paths, and a `!` when one of them is
+/// also owned by another klon. A klon that claimed nothing shows a dash.
+fn claim_column(row: &Row) -> String {
+    match (row.claims.len(), row.claim_overlap) {
+        (0, _) => "-".to_string(),
+        (count, false) => count.to_string(),
+        (count, true) => format!("{count}!"),
+    }
 }
 
 /// The claim fields of one klon: the paths it owns, and whether one of them

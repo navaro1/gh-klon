@@ -93,6 +93,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         Guard::Strict
     };
+    // The C27 owner names are read before the tree moves: one of them lives in
+    // `<klon>/.klon/env`, and the removal takes that file with it.
+    let owners = claims::owners(&target, branch.as_deref());
     let trash = remove_target(
         &golden,
         &common,
@@ -107,7 +110,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // not in `remove_target`, because `hibernate` removes a tree that comes
     // back and must keep its paths. A failure costs one stderr line, never the
     // removal, and a repository with no claim table pays one `stat`.
-    if let Some(name) = branch.as_deref() {
+    for name in &owners {
         if let Err(err) = claims::release_all(&common, name) {
             eprintln!("{err}");
         }

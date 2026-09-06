@@ -588,6 +588,9 @@ fn remove(
         );
         return Ok(false);
     }
+    // The owner names are read before the tree moves: one of them lives in
+    // `<klon>/.klon/env`, and the removal takes that file with it.
+    let owners = claims::owners(klon, Some(branch));
     rm::remove_target(
         golden,
         common,
@@ -599,8 +602,10 @@ fn remove(
     )?;
     // The branch landed and the klon is gone, so its C27 claims go too. A
     // stale claim would block the next klon that wants those paths forever.
-    if let Err(err) = claims::release_all(common, branch) {
-        eprintln!("{err}");
+    for name in &owners {
+        if let Err(err) = claims::release_all(common, name) {
+            eprintln!("{err}");
+        }
     }
     Ok(true)
 }

@@ -255,6 +255,27 @@ fn check_records_every_changed_path_outside_the_claims() {
     );
 }
 
+/// A move out of an unclaimed directory into a claimed one changes both paths.
+/// Rename detection would name the destination only, and the escape list would
+/// then hide the file the klon took away from a path it does not own.
+#[test]
+fn check_names_the_source_of_a_move_out_of_an_unclaimed_path() {
+    let fx = proof_fixture();
+    let work = add(&fx, "work");
+    git_ok(&work, &["mv", "d001/f1.txt", "d000/f1.txt"]);
+    git_ok(&work, &["commit", "-qm", "move one file into d000"]);
+    ok(&fx, &["claim", "work", "d000"]);
+
+    let out = check(&fx, "work");
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    let record = receipt(&fx, &head(&work));
+    assert_eq!(
+        record["claim_escape"],
+        serde_json::json!(["d001/f1.txt"]),
+        "the source of the move escaped the claims"
+    );
+}
+
 /// A klon that claimed nothing owns nothing, so nothing it changed escapes.
 #[test]
 fn a_klon_with_no_claim_has_no_escape() {
@@ -353,6 +374,46 @@ fn a_claim_refuses_a_path_that_leaves_the_klon() {
     assert_eq!(table(&fx)["claims"][1]["kind"], "file");
 }
 
+/// A claim for a klon whose directory is gone must refuse. `rm` renames the
+/// tree away before it releases the claims, so a claim that started before
+/// that removal would otherwise write a row nothing ever releases.
+#[test]
+fn a_claim_refuses_a_klon_whose_tree_is_gone() {
+    let fx = fixture();
+    let work = add(&fx, "work");
+    // Move the tree away without a prune, the way `rm` does for a moment.
+    // git still lists the worktree, so `claim` reaches the append.
+    fs::rename(&work, work.with_extension("moved")).expect("move the klon");
+
+    let out = klon(&fx.golden, &["claim", "work", "src/app"]);
+    assert!(!out.status.success(), "a claim needs a klon on disk");
+    assert!(
+        stderr(&out).contains("is gone"),
+        "the message must say the klon is gone: {}",
+        stderr(&out)
+    );
+    assert_eq!(rows(&fx), 0, "a klon that is gone writes no claim");
+}
+
+/// `rm` releases the claims of a klon whose HEAD an agent detached. The klon
+/// then has no branch, and only `KLON_NAME` still names the owner.
+#[test]
+fn rm_releases_the_claims_of_a_detached_klon() {
+    let fx = fixture();
+    let work = add(&fx, "work");
+    ok(&fx, &["claim", "work", "src/app"]);
+    git_ok(&work, &["checkout", "-q", "--detach"]);
+
+    ok(
+        &fx,
+        &["rm", "--path", work.to_str().expect("a path"), "--force"],
+    );
+    assert!(
+        paths_of(&fx, "work").is_empty(),
+        "rm must release the claims of a klon that has no branch left"
+    );
+}
+
 /// `--release` gives back the named paths, or every claim of the klon when it
 /// names none.
 #[test]
@@ -437,4 +498,15 @@ fn list_marks_an_overlap_and_carries_the_claims() {
             "each klon owns one path: {row}"
         );
     }
+
+    // A sleeping klon keeps its claims, so its line keeps the mark. The work
+    // commit needs a committer identity.
+    identity(&fx.golden);
+    ok(&fx, &["hibernate", "right"]);
+    let out = ok(&fx, &["list", "--no-gh"]);
+    let line = line_for(&stdout(&out), "right");
+    assert!(
+        line.contains("zz hibernated | 1!"),
+        "a sleeping klon still shows its claims: {line}"
+    );
 }

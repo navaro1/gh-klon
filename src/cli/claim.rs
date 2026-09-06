@@ -103,8 +103,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         })
         .collect();
 
-    // Step 3.
-    let taken = claims::acquire(&common, &args.branch, &wanted)?;
+    // Step 3. `acquire` looks for the klon directory again inside the lock: a
+    // `rm` can start between step 1 and the append, and a claim for a klon
+    // that no longer exists would hold its paths forever.
+    let taken = claims::acquire(&common, &args.branch, &root, &wanted)?;
     let held: Vec<Held> = taken
         .iter()
         .map(|claim| Held {
