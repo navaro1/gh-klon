@@ -718,19 +718,34 @@ fn throughput_command(fixture: &Fixture, tool: Tool, tree: &Path) -> Result<Comm
 
 // --- M2: the time to a warm tree ------------------------------------------------
 
-/// How often the M2 poll looks at the ignored state.
-const POLL: std::time::Duration = std::time::Duration::from_millis(20);
+/// The first wait between two looks at the ignored state.
+const POLL_FIRST: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest wait between two looks. The poll walks the ignored state, so a
+/// fixed short interval would spend real CPU beside the copy it is timing. The
+/// wait grows to this ceiling, which bounds the error of one sample.
+const POLL_LAST: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How long the M2 poll waits before it calls the warm state unreachable.
-const WARM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+const WARM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// M2: the time from the start of `add` until the tree holds golden's ignored
 /// state.
 ///
-/// The timer starts before the child does and stops when the poll first sees
-/// the two manifests agree. The measurement therefore holds whether the copy
-/// runs inside `add` or behind it in the background: it asks when the tree is
-/// usable, not when the command returned.
+/// The timer starts before the child does and stops when the tree first holds
+/// the same ignored state as golden. The measurement therefore holds whether
+/// the copy runs inside `add` or behind it in the background: it asks when the
+/// tree is usable, not when the command returned.
+///
+/// The poll is in two steps, because the full comparison hashes every byte and
+/// a fixed 20 ms loop over a 2 GB state would cost more than the copy it times:
+///
+/// 1. Each look compares a cheap fingerprint: the entry count and the total
+///    apparent size. That is one `stat` per entry and no read.
+/// 2. The first look whose fingerprint agrees stops the clock, and the full
+///    byte-for-byte and time-for-time comparison then confirms it, outside the
+///    timer. A fingerprint that agreed over wrong content fails that
+///    confirmation, and the poll goes on with the clock still running.
 ///
 /// Plain `git worktree add` copies no ignored state, so it never reaches the
 /// warm state. Its row measures the command instead and says `warm_reached:
@@ -746,6 +761,10 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
         });
     }
     let kind = fixture.kind();
+    // golden does not change while the sample runs, so its fingerprint is read
+    // once and outside the timer.
+    let want = signature(golden, kind);
+    let mut wait = POLL_FIRST;
     let started = Instant::now();
     let mut child = create_command(tool, golden, path, fixture::BRANCH)
         // The poll, not the report, ends this timer. The `add --json` document
@@ -756,8 +775,13 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
         .map_err(Error::io("start the measured add"))?;
     let mut warm: Option<f64> = None;
     loop {
-        if warm.is_none() && compare_ignored(golden, path, kind)?.is_none() {
-            warm = Some(started.elapsed().as_secs_f64() * 1000.0);
+        if warm.is_none() && signature(path, kind) == want {
+            let reached = started.elapsed().as_secs_f64() * 1000.0;
+            // The confirmation is outside the timer: the tree was equal when
+            // the fingerprints agreed, not when the hash finished.
+            if is_warm(golden, path, kind) {
+                warm = Some(reached);
+            }
         }
         match child.try_wait().map_err(Error::io("wait for the add"))? {
             Some(status) if !status.success() => {
@@ -769,7 +793,7 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
             // The command has finished. One more look closes the race between
             // the last poll and the exit.
             Some(_) => {
-                if warm.is_none() && compare_ignored(golden, path, kind)?.is_none() {
+                if warm.is_none() && is_warm(golden, path, kind) {
                     warm = Some(started.elapsed().as_secs_f64() * 1000.0);
                 }
                 break;
@@ -787,7 +811,8 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
                 WARM_DEADLINE.as_secs()
             )));
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(POLL_LAST);
     }
     // The timer is closed. Let the command finish before the teardown.
     let status = child.wait().map_err(Error::io("wait for the add"))?;
@@ -808,6 +833,49 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
             path.display()
         ))),
     }
+}
+
+/// True when `tree` holds the same ignored state as golden, byte for byte and
+/// time for time.
+///
+/// A tree that is still being filled can make the walk itself fail: a file that
+/// `read_dir` listed can be gone by the time `stat` reaches it. That is not
+/// warm, and it is not a fault of the run either, so the answer is false and
+/// the poll goes on.
+fn is_warm(golden: &Path, tree: &Path, kind: fixture::Kind) -> bool {
+    matches!(compare_ignored(golden, tree, kind), Ok(None))
+}
+
+/// The cheap fingerprint of an ignored state: how many entries it holds and how
+/// many bytes those entries claim. One `stat` per entry, no read.
+///
+/// Two states with one fingerprint are usually equal; `is_warm` decides. A
+/// state that cannot be read at all answers with the count it reached, which
+/// never equals a filled golden's.
+fn signature(root: &Path, kind: fixture::Kind) -> (usize, u64) {
+    fn walk(dir: &Path, count: &mut usize, bytes: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            *count += 1;
+            if meta.is_dir() {
+                walk(&path, count, bytes);
+            } else if meta.is_file() {
+                *bytes += meta.len();
+            }
+        }
+    }
+    let mut count = 0;
+    let mut bytes = 0;
+    for dir in kind.ignored_dirs() {
+        walk(&root.join(dir), &mut count, &mut bytes);
+    }
+    (count, bytes)
 }
 
 // --- M3: the units a first build compiles ---------------------------------------
