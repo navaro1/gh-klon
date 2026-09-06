@@ -96,6 +96,24 @@ const SYNC: Fields = &[
     ("message", Ty::Str),
 ];
 
+/// C29. `work` names the commit that holds the saved tracked changes and the
+/// untracked files.
+const HIBERNATE: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("branch", Ty::Str),
+    ("head", Ty::Str),
+    ("work", Ty::Str),
+];
+
+/// C29.
+const WAKE: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("branch", Ty::Str),
+    ("head", Ty::Str),
+];
+
 const RM: Fields = &[
     ("schema", Ty::Str),
     ("path", Ty::Str),
@@ -387,6 +405,27 @@ fn every_command_matches_its_documented_schema() {
         check_ok(&row, SYNC);
         assert_eq!(row["schema"], "klon.sync/1");
     }
+
+    // C29. The round trip leaves the klon where it was, so the rows below
+    // still find it.
+    let out = klon(&fx.golden, &["hibernate", "--json", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+    let hibernate = parse(&stdout(&out));
+    check_ok(&hibernate, HIBERNATE);
+    assert_eq!(hibernate["schema"], "klon.hibernate/1");
+    assert_eq!(hibernate["branch"], "feature");
+
+    let out = klon(&fx.golden, &["--json", "list"]);
+    let listed = parse(&stdout(&out));
+    check_rows(&listed, "klons", LIST_ROW);
+    assert_eq!(listed["klons"][0]["hibernated"], serde_json::json!(true));
+
+    let out = klon(&fx.golden, &["wake", "--json", "feature"]);
+    assert!(out.status.success(), "wake failed: {}", stderr(&out));
+    let wake = parse(&stdout(&out));
+    check_ok(&wake, WAKE);
+    assert_eq!(wake["schema"], "klon.wake/1");
+    assert_eq!(wake["branch"], "feature");
 
     let out = klon(&fx.golden, &["stop", "--json", "feature"]);
     assert!(out.status.success(), "stop failed: {}", stderr(&out));
