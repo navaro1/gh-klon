@@ -140,3 +140,164 @@ fn field(value: &Value, keys: &[&str], path: &str) -> Result<String> {
         ))
     })
 }
+
+// --- list (C30) ---------------------------------------------------------------
+
+/// The pull request facts `list` shows for one branch.
+pub struct PrFacts {
+    /// The pull request number.
+    pub number: u64,
+    /// `pass`, `fail`, `pending`, or `none` when the pull request runs no
+    /// check. None when the answer named no rollup at all.
+    pub checks: Option<String>,
+}
+
+/// `gh pr list --head <branch> --json number,statusCheckRollup --state all`.
+/// The answer is the parsed array, so the caller can cache it verbatim for 60 s.
+pub fn branch_pr_payload(cwd: &Path, branch: &str) -> Result<Value> {
+    let args = [
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--json",
+        "number,statusCheckRollup",
+        "--state",
+        "all",
+    ];
+    let out = run(cwd, &args)?;
+    serde_json::from_str(out.trim())
+        .map_err(|_| Error::klon("gh pr list --json did not return a JSON document"))
+}
+
+/// The facts in a `branch_pr_payload` answer: the pull request with the
+/// highest number, which is the newest one for the branch. An empty array, a
+/// branch without a pull request, answers None.
+pub fn pr_from_payload(payload: &Value) -> Option<PrFacts> {
+    let rows = payload.as_array()?;
+    let row = rows
+        .iter()
+        .max_by_key(|row| row["number"].as_u64().unwrap_or(0))?;
+    Some(PrFacts {
+        number: row["number"].as_u64()?,
+        checks: checks_from_rollup(&row["statusCheckRollup"]),
+    })
+}
+
+/// The verdict over one `statusCheckRollup` array. A failure answers `fail`
+/// even when other checks still run, a not-yet-finished check answers
+/// `pending`, and completed successes (with skipped and neutral ones) answer
+/// `pass`. A rollup with no check answers `none`.
+fn checks_from_rollup(rollup: &Value) -> Option<String> {
+    const FAILING: [&str; 7] = [
+        "FAILURE",
+        "ERROR",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "CANCELLED",
+        "STARTUP_FAILURE",
+        "STALE",
+    ];
+    const WAITING: [&str; 4] = ["QUEUED", "IN_PROGRESS", "PENDING", "EXPECTED"];
+    let items = rollup.as_array()?;
+    if items.is_empty() {
+        return Some("none".to_string());
+    }
+    let mut waiting = false;
+    for item in items {
+        let conclusion = item["conclusion"].as_str().unwrap_or("");
+        let state = item["state"].as_str().unwrap_or("");
+        let status = item["status"].as_str().unwrap_or("");
+        if FAILING.contains(&conclusion) || FAILING.contains(&state) {
+            return Some("fail".to_string());
+        }
+        if WAITING.contains(&status) || WAITING.contains(&state) {
+            waiting = true;
+        }
+    }
+    Some(if waiting { "pending" } else { "pass" }.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rollup(text: &str) -> Option<String> {
+        checks_from_rollup(&serde_json::from_str(text).expect("rollup JSON"))
+    }
+
+    #[test]
+    fn the_rollup_reads_each_state() {
+        assert_eq!(rollup("[]").as_deref(), Some("none"));
+        assert_eq!(
+            rollup(r#"[{"status": "COMPLETED", "conclusion": "SUCCESS"}]"#).as_deref(),
+            Some("pass")
+        );
+        assert_eq!(
+            rollup(r#"[{"status": "COMPLETED", "conclusion": "SKIPPED"}]"#).as_deref(),
+            Some("pass")
+        );
+        assert_eq!(rollup(r#"[{"state": "SUCCESS"}]"#).as_deref(), Some("pass"));
+        assert_eq!(
+            rollup(r#"[{"status": "COMPLETED", "conclusion": "FAILURE"}]"#).as_deref(),
+            Some("fail")
+        );
+        assert_eq!(rollup(r#"[{"state": "ERROR"}]"#).as_deref(), Some("fail"));
+        assert_eq!(
+            rollup(r#"[{"status": "COMPLETED", "conclusion": "TIMED_OUT"}]"#).as_deref(),
+            Some("fail")
+        );
+        assert_eq!(
+            rollup(r#"[{"status": "QUEUED"}]"#).as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            rollup(r#"[{"state": "PENDING"}]"#).as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            rollup(
+                r#"[{"status": "IN_PROGRESS"}, {"status": "COMPLETED", "conclusion": "SUCCESS"}]"#
+            )
+            .as_deref(),
+            Some("pending")
+        );
+        // A failure wins over a waiting check, whichever comes first.
+        assert_eq!(
+            rollup(r#"[{"status": "IN_PROGRESS"}, {"state": "FAILURE"}]"#).as_deref(),
+            Some("fail")
+        );
+        assert_eq!(
+            rollup(r#"[{"state": "FAILURE"}, {"status": "IN_PROGRESS"}]"#).as_deref(),
+            Some("fail")
+        );
+    }
+
+    #[test]
+    fn no_rollup_is_no_verdict() {
+        assert_eq!(checks_from_rollup(&Value::Null), None);
+        assert_eq!(checks_from_rollup(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn the_newest_pull_request_of_the_payload_wins() {
+        let payload: Value = serde_json::from_str(
+            r#"[{"number": 3, "statusCheckRollup": []},
+                {"number": 5, "statusCheckRollup": [{"state": "SUCCESS"}]}]"#,
+        )
+        .expect("payload JSON");
+        let facts = pr_from_payload(&payload).expect("a pull request");
+        assert_eq!(
+            facts.number, 5,
+            "the newest pull request has the highest number"
+        );
+        assert_eq!(facts.checks.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn an_empty_payload_names_no_pull_request() {
+        let payload: Value = serde_json::from_str("[]").expect("payload JSON");
+        assert!(pr_from_payload(&payload).is_none());
+        assert!(pr_from_payload(&Value::Null).is_none());
+    }
+}
