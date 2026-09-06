@@ -85,8 +85,8 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
 
     // --- Step 4: the run -----------------------------------------------------
     // The commit is read before the first step, so the receipt names the tree
-    // that the steps saw. A commit inside the klon while the steps run leaves
-    // the receipt bound to the older commit, and `merge` then calls it stale.
+    // that the steps started on. The same id is read again after the last
+    // step, and a klon that moved between the two writes no receipt at all.
     let commit = rev(&klon, "HEAD")?;
     let tree = rev(&klon, "HEAD^{tree}")?;
     let started = Instant::now();
