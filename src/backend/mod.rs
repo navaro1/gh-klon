@@ -166,11 +166,17 @@ pub fn make_removable(path: &Path) -> Result<()> {
     if !meta.is_dir() {
         return Ok(());
     }
-    fs::set_permissions(
-        path,
-        fs::Permissions::from_mode(meta.permissions().mode() | 0o700),
-    )
-    .map_err(Error::io("restore directory access for cleanup"))?;
+    // Only a narrow mode needs the call. A directory that already grants the
+    // owner all three bits skips it, which saves one syscall per directory and
+    // keeps a path that refuses `chmod` out of the way: btrfs stands a nested
+    // subvolume of the source in a snapshot as a stub that answers `EPERM`, and
+    // `rmdir` still removes it (C7, S1 §8).
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700)).map_err(Error::io(
+            format!("restore access to {} for cleanup", path.display()),
+        ))?;
+    }
     for entry in fs::read_dir(path).map_err(Error::io("read the failed clone"))? {
         let entry = entry.map_err(Error::io("read the failed clone"))?;
         make_removable(&entry.path())?;

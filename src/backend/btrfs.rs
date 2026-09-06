@@ -73,22 +73,24 @@ impl Backend for BtrfsSnapshot {
         // `git worktree add --no-checkout` left must go first. `add` reads the
         // `.git` file before the clone and writes it again after, so removing
         // it here loses nothing.
-        clear_destination(dst)?;
-        snapshot(src, dst)?;
-        // The snapshot copied every path, golden's `.git` directory included.
-        // `add` writes a `.git` file at that path next, and R3 keeps `.git` out
-        // of a klon, so the excluded paths are removed from the copy.
-        let mut walk = Walk {
-            src_root: src,
-            dst_root: dst,
-            device: device_of(src)?,
-            excludes,
-        };
-        let entries = walk.prune(dst)?;
-        Ok(Timing {
-            duration: started.elapsed(),
-            entries,
-        })
+        let git_file = clear_destination(dst)?;
+        match fill(src, dst, excludes) {
+            Ok(entries) => Ok(Timing {
+                duration: started.elapsed(),
+                entries,
+            }),
+            Err(err) => {
+                // Hand the destination back the way the caller gave it: an
+                // empty directory with its `.git` file. The rollback in `add`
+                // runs `git worktree remove`, which needs that file to know the
+                // path as the worktree it registered.
+                if let Err(why) = restore_destination(dst, git_file.as_deref()) {
+                    eprintln!("klon: {why}");
+                    eprintln!("klon: run gh klon doctor --repair to finish the cleanup");
+                }
+                Err(err)
+            }
+        }
     }
 
     /// One `btrfs subvolume delete` when the mount allows it, else the
@@ -288,14 +290,32 @@ fn run(args: &[&str], paths: &[&Path]) -> Result<()> {
 
 // --- The destination ------------------------------------------------------------
 
+/// The snapshot and the exclusions. It runs between the two halves of the
+/// destination swap, so one caller owns the cleanup.
+fn fill(src: &Path, dst: &Path, excludes: &Exclusions) -> Result<u64> {
+    snapshot(src, dst)?;
+    // The snapshot copied every path, golden's `.git` directory included.
+    // `add` writes a `.git` file at that path next, and R3 keeps `.git` out of
+    // a klon, so the excluded paths are removed from the copy.
+    let mut walk = Walk {
+        src_root: src,
+        dst_root: dst,
+        device: device_of(src)?,
+        excludes,
+    };
+    walk.prune(dst)
+}
+
 /// Remove the empty destination directory that the caller created, so the
-/// snapshot can take its place.
+/// snapshot can take its place. The answer is the content of the `.git` file
+/// that stood there, which `restore_destination` writes back on a failure.
 ///
 /// `add` hands over a directory that holds the `.git` file of
 /// `git worktree add --no-checkout`, and the probe hands over an empty one.
 /// Anything else is a directory klon did not make, so the clone refuses rather
 /// than delete it.
-fn clear_destination(dst: &Path) -> Result<()> {
+fn clear_destination(dst: &Path) -> Result<Option<Vec<u8>>> {
+    let mut git_file = None;
     let entries = fs::read_dir(dst).map_err(Error::io(format!("read {}", dst.display())))?;
     for entry in entries {
         let entry = entry.map_err(Error::io(format!("read {}", dst.display())))?;
@@ -308,9 +328,32 @@ fn clear_destination(dst: &Path) -> Result<()> {
                 dst.display()
             )));
         }
+        git_file = Some(fs::read(&path).map_err(Error::io(format!("read {}", path.display())))?);
         fs::remove_file(&path).map_err(Error::io(format!("delete {}", path.display())))?;
     }
-    fs::remove_dir(dst).map_err(Error::io(format!("delete {}", dst.display())))
+    fs::remove_dir(dst).map_err(Error::io(format!("delete {}", dst.display())))?;
+    Ok(git_file)
+}
+
+/// Undo `clear_destination` and whatever the clone wrote after it.
+///
+/// `remove_dir_all` removes a subvolume too: it unlinks every file and then
+/// removes the empty directories, and the kernel lets an unprivileged user
+/// remove an empty subvolume (S1 §8).
+fn restore_destination(dst: &Path, git_file: Option<&[u8]>) -> Result<()> {
+    if dst.exists() {
+        super::make_removable(dst)?;
+        fs::remove_dir_all(dst).map_err(Error::io(format!(
+            "delete the failed clone {}",
+            dst.display()
+        )))?;
+    }
+    fs::create_dir(dst).map_err(Error::io(format!("recreate {}", dst.display())))?;
+    if let Some(bytes) = git_file {
+        let path = dst.join(".git");
+        fs::write(&path, bytes).map_err(Error::io(format!("restore {}", path.display())))?;
+    }
+    Ok(())
 }
 
 /// The state of the walk that finishes a snapshot.

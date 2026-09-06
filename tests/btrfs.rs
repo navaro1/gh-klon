@@ -845,7 +845,7 @@ fn a_nested_subvolume_stops_the_snapshot_clone() {
     );
     assert!(
         !fx.default_klon_path().exists(),
-        "the rollback must remove the half-made klon"
+        "the rollback must remove the half-made klon; stderr: {text}"
     );
     // `.klonignore` is the documented way out, and it makes `add` work again.
     fs::write(fx.golden.join(".klonignore"), "/build/cache/\n").unwrap();
