@@ -6,6 +6,7 @@ mod common;
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -201,6 +202,51 @@ fn one_more_commit_makes_the_receipt_stale_and_no_check_proceeds() {
     );
     assert_ne!(head(&fx.golden), before, "base must take the branch");
     assert!(!klon_dir.exists(), "the merge removes the klon");
+}
+
+/// The gate must judge the commit that `merge` lands, not the klon's live
+/// HEAD. A `pre_merge` hook runs before the receipt gate and can detach the
+/// klon onto the checked commit, while the branch tip that step 5 merges has
+/// moved on. The gate reads the branch tip, so it still refuses.
+#[test]
+fn a_detached_klon_cannot_pass_the_gate_with_an_old_receipt() {
+    let fx = repo("\"true\"");
+    let klon_dir = add(&fx, "feature");
+
+    let out = run(&fx, &["check", "feature"]);
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    let checked = head(&klon_dir);
+    let before = head(&fx.golden);
+
+    // The branch moves past the receipt.
+    commit(&klon_dir, "after.txt", "unchecked work\n", "one more");
+    let tip = head(&klon_dir);
+    assert_ne!(tip, checked, "the branch must have moved");
+
+    // A hook that puts the klon back on the checked commit. The branch tip
+    // stays where it is, so `merge` would still land the unchecked commit.
+    let hooks = klon_dir.join(".klon").join("hooks");
+    fs::create_dir_all(&hooks).expect("create the hook directory");
+    let hook = hooks.join("pre_merge");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ngit checkout -q --detach {checked}\n"),
+    )
+    .expect("write the hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("make the hook run");
+
+    let out = run(&fx, &["merge", "feature"]);
+    assert!(
+        !out.status.success(),
+        "a detached klon must not pass the gate: {}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains("receipt stale"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_eq!(head(&fx.golden), before, "base HEAD must not move");
 }
 
 /// A changed `[proof] steps` list makes an existing receipt stale too: the

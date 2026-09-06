@@ -186,7 +186,15 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // and the agent that owns the klon can commit inside that window, so klon
     // reads the branch tip before and after and refuses a tip that moved.
     let tested = tip(&golden, &full)?;
-    let hook = gate(&klon, &common, &args.branch, &cfg, args.no_check, json)?;
+    let hook = gate(
+        &klon,
+        &common,
+        &args.branch,
+        &tested,
+        &cfg,
+        args.no_check,
+        json,
+    )?;
     let now = tip(&golden, &full)?;
     if now != tested {
         return Err(Error::klon(format!(
@@ -307,6 +315,7 @@ fn gate(
     klon: &Path,
     common: &Path,
     branch: &str,
+    tested: &str,
     cfg: &config::Config,
     no_check: bool,
     json: bool,
@@ -334,31 +343,44 @@ fn gate(
         eprintln!("klon: --no-check: merge lands {branch} without a check receipt");
         return Ok(hook);
     }
-    receipt_gate(klon, common, branch, &steps)?;
+    receipt_gate(klon, common, branch, tested, &steps)?;
     Ok(Some(GATE_PROOF))
 }
 
-/// The C26 receipt gate: the klon's HEAD needs a receipt of its own, for the
-/// steps that `.klon.toml` names now, whose verdict is `pass`.
+/// The C26 receipt gate: the commit that `merge` will land needs a receipt of
+/// its own, for the steps that `.klon.toml` names now, whose verdict is `pass`.
+///
+/// The gate names `tested`, the branch tip that step 5 merges, and never the
+/// klon's live HEAD. The two are the same for an idle klon, because `check`
+/// only ever runs in a klon that has the branch checked out. They part where a
+/// `pre_merge` hook, or any other process, detaches the klon between the
+/// check and the merge: a HEAD read here would then prove an old commit while
+/// step 5 lands a newer one. The tip is also re-read after the gate, so a
+/// branch that moves during a long gate stops the merge (see `run`).
 ///
 /// Each refusal names what to do next. `receipt missing` means nobody ran
-/// `check` here; `receipt stale` means the klon moved on, or the steps
+/// `check` here; `receipt stale` means the branch moved on, or the steps
 /// changed, since the last one; `receipt failed` means the proof ran and said
 /// no.
-fn receipt_gate(klon: &Path, common: &Path, branch: &str, steps: &[String]) -> Result<()> {
-    let head = head(klon)?;
+fn receipt_gate(
+    klon: &Path,
+    common: &Path,
+    branch: &str,
+    tested: &str,
+    steps: &[String],
+) -> Result<()> {
     let again = format!("run gh klon check {branch} again, or pass --no-check");
-    match receipt::verdict(common, &head, branch, &receipt::steps_hash(steps))? {
+    match receipt::verdict(common, tested, branch, &receipt::steps_hash(steps))? {
         Verdict::Pass => Ok(()),
         Verdict::Failed => Err(Error::klon(format!(
             "receipt failed: the [proof] steps did not pass at {} in {}; \
              fix the branch and {again}",
-            short(&head),
+            short(tested),
             klon.display()
         ))),
         Verdict::Stale => Err(Error::klon(format!(
             "receipt stale: no passing receipt covers {} with the current [proof] steps; {again}",
-            short(&head)
+            short(tested)
         ))),
         Verdict::Missing => Err(Error::klon(format!(
             "receipt missing: nothing has checked {branch}; \
