@@ -6,7 +6,7 @@ use crate::backend::{self, copy, Backend, Exclusions};
 use crate::branch;
 use crate::envelope::{env, slots};
 use crate::journal::{self, State};
-use crate::{config, fixup, git, paths, repair, space, spare, warm, Error, Result};
+use crate::{config, fixup, git, hooks, paths, repair, space, spare, warm, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -583,12 +583,26 @@ fn fill(
         steps.mark("fixup");
     }
 
+    // Step 10a (C22, R20): the per-tree hooks. The copy is the klon's own
+    // snapshot of the repository hooks, so an edit in this klon never runs in
+    // golden or a sibling. A failure costs one line: the klon is still good,
+    // it just runs without hooks. This runs before the env write, so an `add`
+    // that dies here leaves no half-env klon behind.
+    hooks::copy_repository_hooks(golden, path);
+    steps.mark("hooks");
+
     // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
     // `info/exclude`, so the new directory keeps the klon clean for git. It is
     // written before the status below, so the untracked cache already knows it.
     let ip = slots::allocate(common, branch, path)?;
     env::write(path, branch, &ip)?;
     steps.mark("env");
+
+    // Step 10c (C22): plain git in this klon uses the copy too, when the
+    // repository already turned the worktree-config extension on. klon never
+    // turns it on, and a failure costs one line.
+    hooks::export_to_plain_git(golden, path);
+    steps.mark("hooks-export");
 
     // The state comes after the envelope, not before it. `doctor --repair`
     // reads `checked-out` as "only the unlock is left" and finishes there, so a
