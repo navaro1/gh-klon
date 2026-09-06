@@ -108,9 +108,12 @@ extern "C" fn relay(signal: libc::c_int) {
 /// microseconds between the fork and the store above.
 fn relay_signals() {
     for signal in RELAYED {
-        // SAFETY: `relay` is a plain function pointer with the C signature the
-        // call expects, and it touches only an atomic and `killpg`.
-        unsafe { libc::signal(*signal, relay as libc::sighandler_t) };
+        // The cast goes through a pointer: a direct cast of a function item to
+        // an integer is a clippy error. SAFETY: `relay` is a plain function
+        // with the C signature the call expects, and it touches only an atomic
+        // and `killpg`.
+        let handler = relay as *const () as libc::sighandler_t;
+        unsafe { libc::signal(*signal, handler) };
     }
 }
 
