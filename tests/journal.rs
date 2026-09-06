@@ -76,6 +76,17 @@ fn spawn_paused(golden: &Path, state: &str, args: &[&str]) -> Child {
         .expect("start gh-klon")
 }
 
+/// True when the journal directory entry named `file` is a landed entry.
+///
+/// `journal::write` lands through a `.<name>.<pid>.tmp` file in the same
+/// directory, so a test that only asks for an extension can see the write in
+/// flight and kill the writer before the rename. The rule here is the one
+/// `journal::list` uses.
+fn is_entry(file: &std::ffi::OsStr) -> bool {
+    let name = file.to_string_lossy();
+    name.ends_with(".json") && !name.starts_with('.')
+}
+
 fn sigkill(child: &Child) {
     // SAFETY: `kill` takes a pid and a signal number and returns an error code.
     let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGKILL) };
@@ -389,7 +400,7 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
         let reached = wait_until(
             || {
                 fs::read_dir(&inbox)
-                    .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
+                    .map(|read| read.flatten().any(|i| is_entry(&i.file_name())))
                     .unwrap_or(false)
             },
             Duration::from_secs(30),
@@ -415,7 +426,7 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
         assert!(out.status.success(), "repair failed: {}", stderr(&out));
         assert!(
             !fs::read_dir(&inbox)
-                .map(|read| read.flatten().any(|i| i.path().extension().is_some()))
+                .map(|read| read.flatten().any(|i| is_entry(&i.file_name())))
                 .unwrap_or(false),
             "the repair must close the entry"
         );

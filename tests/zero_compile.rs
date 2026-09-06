@@ -175,7 +175,14 @@ fn cargo_build_in_a_fresh_klon_compiles_nothing() {
     );
 
     // Warm golden. `--offline` proves that the fixture needs no registry.
-    let warm = run(&cargo, &project.golden, &["build", "--offline"], &[]);
+    // `-j 2` keeps the nested build from claiming every core: this suite runs
+    // beside its own other tests and beside the timing budgets of C24 and C8.
+    let warm = run(
+        &cargo,
+        &project.golden,
+        &["build", "--offline", "-j", "2"],
+        &[],
+    );
     assert!(
         warm.status.success(),
         "the warm build failed: {}",
@@ -188,7 +195,7 @@ fn cargo_build_in_a_fresh_klon_compiles_nothing() {
     );
 
     let klon_path = project.klon();
-    let cold = run(&cargo, &klon_path, &["build", "--offline"], &[]);
+    let cold = run(&cargo, &klon_path, &["build", "--offline", "-j", "2"], &[]);
     assert!(
         cold.status.success(),
         "the klon build failed: {}",
@@ -316,8 +323,8 @@ fn pnpm_install_in_a_fresh_klon_changes_nothing() {
     let warm = run(
         &pnpm,
         &project.golden,
-        &["install", "--offline"],
-        &[("CI", "1")],
+        &["install", "--offline", "--child-concurrency=1"],
+        &[("CI", "1"), ("UV_THREADPOOL_SIZE", "2")],
     );
     assert!(
         warm.status.success(),
@@ -340,8 +347,13 @@ fn pnpm_install_in_a_fresh_klon_changes_nothing() {
     let cold = run(
         &pnpm,
         &klon_path,
-        &["install", "--frozen-lockfile", "--offline"],
-        &[("CI", "1")],
+        &[
+            "install",
+            "--frozen-lockfile",
+            "--offline",
+            "--child-concurrency=1",
+        ],
+        &[("CI", "1"), ("UV_THREADPOOL_SIZE", "2")],
     );
     assert!(
         cold.status.success(),
