@@ -4,6 +4,7 @@ pub mod add;
 pub mod bench;
 pub mod doctor;
 pub mod init;
+pub mod init_volume;
 pub mod list;
 pub mod pr;
 pub mod prune;

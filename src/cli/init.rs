@@ -57,20 +57,37 @@ pub struct Args {
     /// Convert a subvolume golden back into a plain directory.
     #[arg(long)]
     pub undo: bool,
+    /// Move golden onto a btrfs loop volume of this size, for example 4G.
+    /// Use it on a filesystem without snapshots. `--volume --undo` moves
+    /// golden back and detaches the volume.
+    #[arg(long, value_name = "SIZE", num_args = 0..=1, default_missing_value = "")]
+    pub volume: Option<String>,
+    /// `--volume --undo` with live klons: remove the volume anyway. The klons
+    /// live on it and go with it.
+    #[arg(long, requires = "volume")]
+    pub force: bool,
 }
 
 /// The `init --json` document.
 #[derive(Serialize)]
-struct Report<'a> {
-    schema: &'static str,
-    golden: &'a Path,
+pub(super) struct Report<'a> {
+    pub schema: &'static str,
+    pub golden: &'a Path,
     /// `subvolume` after `init`, `directory` after `init --undo`.
-    shape: &'static str,
+    pub shape: &'static str,
     /// True when `init` changed nothing because golden already had that shape.
-    unchanged: bool,
+    pub unchanged: bool,
+    /// The btrfs loop volume that `init --volume` built (C15). It is absent
+    /// for every other form of the command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<&'a crate::volume::Volume>,
 }
 
 pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
+    // C15 owns `--volume`. It converts no filesystem: it builds one.
+    if let Some(size) = args.volume.clone() {
+        return super::init_volume::run(&size, &args, yes, json);
+    }
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     let golden = git::main_worktree(&cwd)?;
     let common = git::common_dir(&cwd)?;
@@ -171,7 +188,15 @@ fn convert(
     // be gone for good.
     let before = fingerprint(golden, common)?;
     let skip = skip_rule(golden);
-    reflink::copy_tree(golden, staging, &skip, OnSpecial::Refuse)?;
+    reflink::copy_tree(
+        golden,
+        staging,
+        &skip,
+        OnSpecial::Refuse,
+        // Both ends sit on one btrfs filesystem here, so a refusal to share
+        // blocks is a real error.
+        crate::backend::reflink::OnCrossDevice::Refuse,
+    )?;
     copy_root_metadata(golden, staging)?;
     verify(staging)?;
     tear_check(golden, common, &before)?;
@@ -215,7 +240,7 @@ fn convert(
 ///
 /// After `--undo` the replaced golden is a subvolume, so the btrfs backend can
 /// drop it in one ioctl where the mount allows that.
-fn delete_old(old: &Path, undo: bool) -> Result<()> {
+pub(super) fn delete_old(old: &Path, undo: bool) -> Result<()> {
     let victim = free_name(old)?;
     rename(old, &victim)?;
     if undo {
@@ -249,7 +274,7 @@ fn free_name(old: &Path) -> Result<PathBuf> {
 /// directory before that pack lands. `fsck --connectivity-only` reads every
 /// reachable object without hashing its content, so it names a gap in seconds
 /// and `init` stops while golden is still untouched.
-fn verify(staging: &Path) -> Result<()> {
+pub(super) fn verify(staging: &Path) -> Result<()> {
     git::run(
         staging,
         &[
@@ -283,7 +308,7 @@ fn verify(staging: &Path) -> Result<()> {
 /// the walk saw, which is `planned`. That is the right answer for a kill
 /// between the second rename and the `ready` write: the repair then reads
 /// `planned` with golden in place and only removes the leftovers.
-fn skip_rule(golden: &Path) -> impl Fn(&Path, bool) -> bool {
+pub(super) fn skip_rule(golden: &Path) -> impl Fn(&Path, bool) -> bool {
     let cache = golden.join(".git").join("klon").join("probe.json");
     move |path: &Path, _is_dir: bool| path == cache
 }
@@ -296,7 +321,7 @@ fn skip_rule(golden: &Path) -> impl Fn(&Path, bool) -> bool {
 /// accepts the older but consistent staged repository, and the swap would drop
 /// the new commit together with the replaced tree. The handoff calls the same
 /// rule a tear check (§4, "Hot spare").
-fn fingerprint(golden: &Path, common: &Path) -> Result<String> {
+pub(super) fn fingerprint(golden: &Path, common: &Path) -> Result<String> {
     let mut text = git::run(
         golden,
         &["for-each-ref", "--format=%(refname) %(objectname)"],
@@ -326,7 +351,7 @@ fn fingerprint(golden: &Path, common: &Path) -> Result<String> {
 }
 
 /// Refuse the swap when the repository moved under the copy.
-fn tear_check(golden: &Path, common: &Path, before: &str) -> Result<()> {
+pub(super) fn tear_check(golden: &Path, common: &Path, before: &str) -> Result<()> {
     if fingerprint(golden, common)? == before {
         return Ok(());
     }
@@ -340,7 +365,7 @@ fn tear_check(golden: &Path, common: &Path, before: &str) -> Result<()> {
 
 /// Give the staging copy golden's mode and mtime. `copy_tree` sets them for
 /// every child; the root belongs to the caller that created it.
-fn copy_root_metadata(golden: &Path, staging: &Path) -> Result<()> {
+pub(super) fn copy_root_metadata(golden: &Path, staging: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(golden)
         .map_err(Error::io(format!("stat {}", golden.display())))?;
     std::fs::set_permissions(staging, meta.permissions())
@@ -349,7 +374,7 @@ fn copy_root_metadata(golden: &Path, staging: &Path) -> Result<()> {
 }
 
 /// One rename inside the parent directory of golden.
-fn rename(from: &Path, to: &Path) -> Result<()> {
+pub(super) fn rename(from: &Path, to: &Path) -> Result<()> {
     std::fs::rename(from, to).map_err(Error::io(format!(
         "rename {} to {}",
         from.display(),
@@ -410,7 +435,7 @@ fn confirmed(golden: &Path, staging: &Path, undo: bool, yes: bool) -> Result<boo
     ))
 }
 
-fn shape(subvolume: bool) -> &'static str {
+pub(super) fn shape(subvolume: bool) -> &'static str {
     if subvolume {
         "subvolume"
     } else {
@@ -419,15 +444,20 @@ fn shape(subvolume: bool) -> &'static str {
 }
 
 fn print_json(golden: &Path, shape: &'static str, unchanged: bool) -> Result<()> {
-    let report = Report {
+    print_report(&Report {
         schema: SCHEMA,
         golden,
         shape,
         unchanged,
-    };
+        volume: None,
+    })
+}
+
+/// Print one `klon.init/1` document.
+pub(super) fn print_report(report: &Report) -> Result<()> {
     println!(
         "{}",
-        serde_json::to_string(&report)
+        serde_json::to_string(report)
             .map_err(|err| Error::klon(format!("serialize the report: {err}")))?
     );
     Ok(())

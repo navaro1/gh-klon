@@ -50,6 +50,7 @@ const FEATURES: &[(&str, Probe)] = &[
     ("scope", scope_mechanism),
     ("slots", slots_in_use),
     ("systemd-run", systemd_run),
+    ("volume", klon_volume),
 ];
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -392,6 +393,42 @@ fn fence_residual(host: &Host) -> probe::Status {
              hooks and config stay read-only"
         )),
         Err(err) => probe::Status::Broken(err.to_string()),
+    }
+}
+
+/// The btrfs loop volume of this repository (C15, R33). The row names the
+/// image and says whether it is mounted; the next `add` mounts it again when
+/// it is not, so a detached volume is a state and not a fault.
+fn klon_volume(host: &Host) -> probe::Status {
+    let record = match crate::volume::read(host.common) {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return probe::Status::Absent(
+                "no klon volume; gh klon init --volume <size> makes one".to_string(),
+            )
+        }
+        Err(err) => return probe::Status::Broken(err.to_string()),
+    };
+    if !record.image.is_file() {
+        return probe::Status::Broken(format!(
+            "the image {} is gone; run gh klon init --volume --undo",
+            record.image.display()
+        ));
+    }
+    let device = match crate::volume::loop_device(&record.image) {
+        Ok(device) => device,
+        Err(err) => return probe::Status::Broken(err.to_string()),
+    };
+    match device.as_deref().and_then(crate::volume::mount_point) {
+        Some(mount) => probe::Status::Present(format!(
+            "{} mounted at {}",
+            record.image.display(),
+            mount.display()
+        )),
+        None => probe::Status::Present(format!(
+            "{} is not mounted; the next gh klon add attaches it",
+            record.image.display()
+        )),
     }
 }
 

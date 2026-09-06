@@ -17,6 +17,7 @@ mod radar;
 mod repair;
 mod spare;
 mod time;
+mod volume;
 
 use clap::{Parser, Subcommand};
 use std::fmt;
@@ -105,7 +106,7 @@ enum Command {
     List,
     /// Report the host features and the open journal entries.
     Doctor(cli::doctor::Args),
-    /// Convert golden into a btrfs subvolume so add can snapshot it.
+    /// Convert golden into a btrfs subvolume, or move it onto a btrfs loop volume.
     Init(cli::init::Args),
     /// Bring a klon up to date. C24 ships the `--check` dry run only.
     Sync(cli::sync::Args),

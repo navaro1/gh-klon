@@ -124,6 +124,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let started = Instant::now();
     let mut steps = Steps::new();
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    // A reboot takes a klon volume down and leaves golden's symlink dangling,
+    // so the image goes back up before the first `git` call (C15, S1 §9.4). A
+    // repository without a volume pays one failed stat per ancestor of the
+    // working directory and starts no process.
+    crate::volume::ensure_attached(&cwd)?;
     let common = git::common_dir(&cwd)?;
     check_git_path(&common)?;
     let worktrees = git::worktree_list(&cwd)?;

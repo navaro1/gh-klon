@@ -135,10 +135,35 @@ impl Backend for BtrfsSnapshot {
 /// directory, else the one on PATH. The S1 spike unpacks `btrfs-progs` into a
 /// user directory, because the development laptop has none on PATH.
 pub fn tool() -> Option<PathBuf> {
+    resolve("btrfs")
+}
+
+/// The `mkfs.btrfs` binary, resolved the same way. `gh klon init --volume`
+/// (C15) builds the image with it.
+pub fn mkfs_tool() -> Option<PathBuf> {
+    resolve("mkfs.btrfs")
+}
+
+/// One binary of `btrfs-progs`: under `$KLON_BTRFS_TOOLS` when that variable
+/// names a directory, else on PATH.
+fn resolve(name: &str) -> Option<PathBuf> {
     match std::env::var_os("KLON_BTRFS_TOOLS") {
-        Some(dir) => probe::executable(&Path::new(&dir).join("btrfs")),
-        None => probe::tool_path("btrfs"),
+        Some(dir) => probe::executable(&Path::new(&dir).join(name)),
+        None => probe::tool_path(name),
     }
+}
+
+/// What klon prints when `btrfs-progs` is absent (S1 §12). The spike decided
+/// against a bundled `mkfs.btrfs`: the package is GPLv2, it links six shared
+/// libraries, and every target distribution carries it.
+pub fn install_lines() -> String {
+    "btrfs-progs is not installed, and gh klon init --volume needs mkfs.btrfs.\n\
+     \x20 Debian, Ubuntu:  sudo apt install btrfs-progs\n\
+     \x20 Fedora, RHEL:    sudo dnf install btrfs-progs\n\
+     \x20 Arch:            sudo pacman -S btrfs-progs\n\
+     Set KLON_BTRFS_TOOLS to a directory that holds btrfs and mkfs.btrfs to use \
+     an unpacked copy instead."
+        .to_string()
 }
 
 /// Why this host cannot take the backend, or None when it can.

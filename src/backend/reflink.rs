@@ -69,6 +69,7 @@ impl Backend for Reflink {
             dst,
             &|path, is_dir| excludes.excludes(path, is_dir),
             OnSpecial::Skip,
+            OnCrossDevice::Refuse,
         )
     }
 }
@@ -85,6 +86,19 @@ pub enum OnSpecial {
     Refuse,
 }
 
+/// What the walk does when the destination sits on another filesystem, where
+/// `FICLONE` answers `EXDEV` and no block can be shared.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnCrossDevice {
+    /// Fail. The `reflink-walk` backend proved `FICLONE` in its probe (R35), so
+    /// a refusal there is a real error and never a silent byte copy: `bench`
+    /// and `--json` would otherwise report a backend that did not run.
+    Refuse,
+    /// Copy the bytes. `gh klon init --volume` (C15) moves golden from ext4
+    /// onto a btrfs loop volume, where no clone can share a block.
+    CopyBytes,
+}
+
 /// Clone every child of `src` into the existing directory `dst`, with the modes
 /// and the mtimes of the source. `skip` answers whether one path stays out; it
 /// receives the source path and whether that path is a directory.
@@ -97,6 +111,7 @@ pub fn copy_tree(
     dst: &Path,
     skip: &dyn Fn(&Path, bool) -> bool,
     on_special: OnSpecial,
+    on_cross_device: OnCrossDevice,
 ) -> Result<Timing> {
     let started = Instant::now();
     let mut plan = Plan::default();
@@ -105,7 +120,11 @@ pub fn copy_tree(
         .num_threads(WORKERS)
         .build()
         .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
-    pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
+    pool.install(|| {
+        plan.files
+            .par_iter()
+            .try_for_each(|pair| clone_one(pair, on_cross_device))
+    })?;
     // Deepest first: a directory keeps its mtime only after its children are
     // complete. A source directory that vanished since phase 1 keeps the
     // default mode and time on its empty copy; `vanished` explains why.
@@ -230,8 +249,15 @@ fn vanished(path: &Path) -> bool {
 }
 
 /// Phase 2: one `FICLONE` for one file, then its mode and its source mtime.
-fn clone_one(pair: &Pair) -> Result<()> {
-    if let Err(err) = reflink_copy::reflink(&pair.from, &pair.to) {
+///
+/// `reflink_or_copy` still tries `FICLONE` first, so a pair that can share
+/// blocks shares them whatever the mode says. Only the fallback differs.
+fn clone_one(pair: &Pair, on_cross_device: OnCrossDevice) -> Result<()> {
+    let cloned = match on_cross_device {
+        OnCrossDevice::Refuse => reflink_copy::reflink(&pair.from, &pair.to),
+        OnCrossDevice::CopyBytes => reflink_copy::reflink_or_copy(&pair.from, &pair.to).map(|_| ()),
+    };
+    if let Err(err) = cloned {
         if vanished(&pair.from) {
             return Ok(());
         }
@@ -453,8 +479,14 @@ mod tests {
 
         let strict = tmp.path().join("strict");
         fs::create_dir(&strict).unwrap();
-        let err = copy_tree(&src, &strict, &keep_all, OnSpecial::Refuse)
-            .expect_err("a strict copy must refuse a FIFO");
+        let err = copy_tree(
+            &src,
+            &strict,
+            &keep_all,
+            OnSpecial::Refuse,
+            OnCrossDevice::Refuse,
+        )
+        .expect_err("a strict copy must refuse a FIFO");
         assert!(
             err.to_string().contains("FIFO"),
             "the error must name the shape: {err}"
@@ -462,7 +494,13 @@ mod tests {
 
         let lenient = tmp.path().join("lenient");
         fs::create_dir(&lenient).unwrap();
-        match copy_tree(&src, &lenient, &keep_all, OnSpecial::Skip) {
+        match copy_tree(
+            &src,
+            &lenient,
+            &keep_all,
+            OnSpecial::Skip,
+            OnCrossDevice::Refuse,
+        ) {
             Ok(_) => assert!(!lenient.join("pipe").exists(), "the FIFO stays out"),
             // ext4 answers no `FICLONE`, so the plain file cannot be cloned
             // here. The walk still proved that it did not refuse the FIFO.
