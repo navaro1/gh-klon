@@ -164,7 +164,7 @@ fn tagged_processes_os(tags: &[(String, String)]) -> Vec<u32> {
         let items: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
         if needles
             .iter()
-            .all(|needle| items.iter().any(|item| *item == needle.as_slice()))
+            .all(|needle| items.contains(&needle.as_slice()))
         {
             pids.push(pid);
         }

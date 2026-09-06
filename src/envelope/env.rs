@@ -54,10 +54,8 @@ impl GitConfig {
     /// The set that `vars` already carries. A pair with a missing key or value
     /// stops the read, so a truncated set never shifts the later indexes.
     pub fn from_vars(vars: &[(String, String)]) -> GitConfig {
-        let map: BTreeMap<&str, &str> = vars
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let map: BTreeMap<&str, &str> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let count: usize = map
             .get("GIT_CONFIG_COUNT")
             .and_then(|text| text.parse().ok())
@@ -271,7 +269,10 @@ mod tests {
         assert_eq!(map.get("GIT_CONFIG_VALUE_1"), Some(&"0"));
         // The append never duplicates a variable.
         assert_eq!(
-            grown.iter().filter(|(k, _)| k == "GIT_CONFIG_COUNT").count(),
+            grown
+                .iter()
+                .filter(|(k, _)| k == "GIT_CONFIG_COUNT")
+                .count(),
             1
         );
     }

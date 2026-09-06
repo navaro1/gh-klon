@@ -44,6 +44,8 @@ const LIST_ROW: Fields = &[
     ("head", Ty::Str),
     ("dirty", Ty::Bool),
     ("locked", Ty::Bool),
+    // The C16 loopback address. It is null for a klon with no `.klon/env`.
+    ("ip", Ty::StrOrNull),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -55,6 +57,16 @@ const RM: Fields = &[
     ("path", Ty::Str),
     ("branch", Ty::StrOrNull),
     ("trash", Ty::StrOrNull),
+];
+
+const STOP: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("name", Ty::Str),
+    ("found", Ty::Num),
+    ("terminated", Ty::Num),
+    ("killed", Ty::Num),
+    ("survivors", Ty::Arr),
 ];
 
 const DOCTOR: Fields = &[
@@ -178,6 +190,13 @@ fn every_command_matches_its_documented_schema() {
     check_rows(&doctor, "journal", DOCTOR_JOURNAL_ROW);
     check_rows(&doctor, "repaired", DOCTOR_REPAIR_ROW);
 
+    let out = klon(&fx.golden, &["stop", "--json", "feature"]);
+    assert!(out.status.success(), "stop failed: {}", stderr(&out));
+    let stop = parse(&stdout(&out));
+    check_ok(&stop, STOP);
+    assert_eq!(stop["schema"], "klon.stop/1");
+    assert_eq!(stop["name"], "feature");
+
     let out = klon(&fx.golden, &["rm", "--json", "feature"]);
     assert!(out.status.success(), "rm failed: {}", stderr(&out));
     let rm = parse(&stdout(&out));
@@ -277,6 +296,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "ip": "127.0.0.2",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
@@ -291,6 +311,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "ip": "127.0.0.2",
         "vs_base": "-",
         "vs_siblings": "-",
         "behind": Value::Null,
@@ -303,6 +324,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "ip": "127.0.0.2",
         "vs_base": Value::Null,
         "vs_siblings": "clean",
         "behind": 0,
@@ -316,6 +338,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "head": "0f0f",
         "dirty": false,
         "locked": false,
+        "ip": "127.0.0.2",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,

@@ -370,15 +370,16 @@ fn fill(
     git::run(path, &["checkout", "-q", "--force", branch])?;
     git::run(path, &["clean", "-fdq"])?;
     record.reach(State::CheckedOut)?;
-    // One status builds the untracked cache in the fresh index. Without it,
-    // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
-    git::run(path, &["status", "--porcelain"])?;
 
     // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
-    // `info/exclude`, so the new directory keeps the klon clean for git.
+    // `info/exclude`, so the new directory keeps the klon clean for git. It is
+    // written before the status below, so the untracked cache already knows it.
     let ip = slots::allocate(common, branch, path)?;
     env::write(path, branch, &ip)?;
 
+    // One status builds the untracked cache in the fresh index. Without it,
+    // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
+    git::run(path, &["status", "--porcelain"])?;
     git::run(
         golden,
         &["worktree", "unlock", path.to_str().unwrap_or_default()],

@@ -60,10 +60,7 @@ impl Envelope {
             .find(|(key, _)| key == "KLON_NAME")
             .map(|(_, value)| value.clone())
             .ok_or_else(|| {
-                Error::klon(format!(
-                    "{} holds no KLON_NAME",
-                    env::file(klon).display()
-                ))
+                Error::klon(format!("{} holds no KLON_NAME", env::file(klon).display()))
             })?;
         Ok(Envelope {
             klon: klon.to_path_buf(),
@@ -76,7 +73,9 @@ impl Envelope {
         })
     }
 
-    /// The value of one variable of the env file.
+    /// The value of one variable of the env file. C17 reads `KLON_JOBSERVER`
+    /// and C18 reads `TMPDIR` through it; C16 needs none of them.
+    #[allow(dead_code)]
     pub fn var(&self, key: &str) -> Option<&str> {
         self.vars
             .iter()
@@ -87,15 +86,20 @@ impl Envelope {
     /// The tags that mark a process as a member of this klon. `stop` and, from
     /// C30, `list` look for all of them in `/proc/<pid>/environ`.
     ///
-    /// `KLON_ID` alone is the branch, and two repositories can hold one branch
-    /// name. The address narrows the match to one klon of one repository,
-    /// because a repository hands out each address once.
+    /// `KLON_ID` is the branch, which is what a person and a script read.
+    /// `KLON_DIR` is the klon directory, which is unique on the host: two
+    /// repositories can hold one branch name, and each also hands out
+    /// `127.0.0.2`, so the branch and the address together still match the
+    /// wrong tree. Only the directory makes `stop` exact. No build tool
+    /// rewrites a `KLON_` variable, so neither tag is ever lost.
     pub fn tags(&self) -> Vec<(String, String)> {
-        let mut tags = vec![("KLON_ID".to_string(), self.name.clone())];
-        if let Some(ip) = self.var("KLON_IP") {
-            tags.push(("KLON_IP".to_string(), ip.to_string()));
-        }
-        tags
+        vec![
+            ("KLON_ID".to_string(), self.name.clone()),
+            (
+                "KLON_DIR".to_string(),
+                self.klon.to_string_lossy().into_owned(),
+            ),
+        ]
     }
 
     /// The parts in the order they wrap the command: the scope holds the
