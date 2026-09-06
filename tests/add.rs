@@ -402,7 +402,11 @@ fn add_preserves_non_utf8_exclude_patterns() {
     fs::write(&exclude, b"/local-\xff").unwrap();
     let out = klon(&fx.golden, &["add", "feature"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
-    assert_eq!(fs::read(exclude).unwrap(), b"/local-\xff\n/.klon/\n");
+    // C12 appends the staging name of the warm process beside `/.klon/`.
+    assert_eq!(
+        fs::read(exclude).unwrap(),
+        b"/local-\xff\n/.klon/\n/*.klon-warming/\n"
+    );
 }
 
 #[test]

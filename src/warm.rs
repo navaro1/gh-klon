@@ -168,7 +168,7 @@ pub fn plan(
 /// inside it names a directory below the top level, which the strategy does
 /// not cover; klon's own `.klon` state never joins the list either.
 fn ignored_dirs(golden: &Path) -> Result<Vec<String>> {
-    let (_, out) = git::run_input(
+    let listed = git::run_input(
         golden,
         &[
             "ls-files",
@@ -180,7 +180,19 @@ fn ignored_dirs(golden: &Path) -> Result<Vec<String>> {
         ],
         b"",
         &[0],
-    )?;
+    );
+    // The plan is an optimization, never a rule. A repository that cannot list
+    // its ignored directories still gets a klon: klon copies every one of them
+    // inline, which is what it did before this strategy existed. One stderr
+    // line reports the loss (spec §5).
+    let out = match listed {
+        Ok((_, out)) => out,
+        Err(err) => {
+            eprintln!("klon: cannot plan the copy strategy: {err}");
+            eprintln!("klon: every ignored directory is copied before add returns");
+            return Ok(Vec::new());
+        }
+    };
     let mut dirs = Vec::new();
     for record in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
         let Ok(name) = std::str::from_utf8(record) else {
