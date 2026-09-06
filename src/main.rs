@@ -119,11 +119,7 @@ fn main() -> ExitCode {
     if json
         && matches!(
             command,
-            Command::Up
-                | Command::Prune
-                | Command::Pr(_)
-                | Command::Run(_)
-                | Command::Shell(_)
+            Command::Up | Command::Prune | Command::Pr(_) | Command::Run(_) | Command::Shell(_)
         )
     {
         eprintln!(

@@ -93,9 +93,17 @@ pub fn allocate(common: &Path, name: &str, path: &Path) -> Result<String> {
 
 /// Give back the address of the klon at `path`. The answer is the freed slot
 /// number, or None when the klon held none. A missing table is not an error.
+///
+/// The call writes nothing when it changes nothing. `rm` must return inside
+/// 100 ms (R8), and a repository with no table at all then pays no syscall
+/// beyond the one `stat` below.
 pub fn release(common: &Path, path: &Path) -> Result<Option<u8>> {
+    if !table_path(common).exists() {
+        return Ok(None);
+    }
     let lock = Lock::acquire(common)?;
     let mut table = load(common)?;
+    let before = table.slots.len();
     let freed = table
         .slots
         .iter()
@@ -105,7 +113,9 @@ pub fn release(common: &Path, path: &Path) -> Result<Option<u8>> {
         table.slots.remove(&n);
     }
     prune(&mut table);
-    save(common, &table)?;
+    if table.slots.len() != before {
+        save(common, &table)?;
+    }
     drop(lock);
     Ok(freed)
 }
