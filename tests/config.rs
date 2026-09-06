@@ -56,6 +56,15 @@ impl Fixture {
         let golden = root.join("golden");
         fs::create_dir(&golden).unwrap();
         fs::write(golden.join("readme.txt"), "readme\n").unwrap();
+        // Every file these tests add later is ignored: `.klon.toml` itself and
+        // the marker files the warm steps touch. `up` refuses a dirty golden
+        // (C14), and these tests measure the approval gate, not cleanliness.
+        // A tracked file stays tracked, so `readme.txt` still reports a change.
+        fs::write(
+            golden.join(".gitignore"),
+            "/*\n!/readme.txt\n!/.gitignore\n",
+        )
+        .unwrap();
         git_ok(&golden, &["init", "-q", "-b", "main"]);
         git_ok(&golden, &["add", "-A"]);
         git_ok(&golden, &["commit", "-qm", "base"]);

@@ -460,8 +460,9 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
 /// document refuses the flag instead of ignoring it.
 #[test]
 fn json_is_refused_where_no_document_exists() {
+    // C14 gave `up` a document of its own, so only `prune` is left here.
     let fx = Fixture::generate(SEED, 20, 2, 2, 2);
-    for command in ["up", "prune"] {
+    for command in ["prune"] {
         let out = klon(&fx.golden, &[command, "--json"]);
         assert!(!out.status.success(), "{command} --json must fail");
         assert!(
@@ -472,7 +473,7 @@ fn json_is_refused_where_no_document_exists() {
         assert_eq!(stdout(&out), "", "{command} --json must print no document");
     }
     // The same commands still work without the flag.
-    for command in ["up", "prune"] {
+    for command in ["prune"] {
         let out = klon(&fx.golden, &[command]);
         assert!(out.status.success(), "{command} failed: {}", stderr(&out));
     }

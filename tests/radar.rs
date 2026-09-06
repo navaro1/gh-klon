@@ -324,22 +324,17 @@ fn sync_check_prints_the_radar_row_of_one_klon() {
 }
 
 #[test]
-fn sync_without_check_refuses_until_c14() {
+fn sync_of_an_unknown_branch_refuses() {
     let fx = Fixture::generate(SEED, 20, 4, 4, 0);
     branch_with(&fx.golden, "left", &[("f2.txt", "left edit\n")]);
     add_klon(&fx.golden, "left");
 
-    let out = klon(&fx.golden, &["sync", "left"]);
-    assert!(!out.status.success(), "sync must refuse before C14");
-    assert!(
-        stderr(&out).contains("not implemented until C14"),
-        "sync must name the chunk that finishes it: {}",
-        stderr(&out)
-    );
     // A branch with no klon is a plain refusal, not a panic.
-    let out = klon(&fx.golden, &["sync", "nosuch", "--check"]);
-    assert!(!out.status.success());
-    assert!(stderr(&out).contains("no klon has branch nosuch"));
+    for args in [&["sync", "nosuch", "--check"][..], &["sync", "nosuch"][..]] {
+        let out = klon(&fx.golden, args);
+        assert!(!out.status.success(), "{args:?} must refuse");
+        assert!(stderr(&out).contains("no klon has branch nosuch"));
+    }
 }
 
 // --- The cache -----------------------------------------------------------------
