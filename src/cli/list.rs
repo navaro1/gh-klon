@@ -3,6 +3,7 @@
 //! <vs-siblings> | behind <n>`. The main worktree is not a klon and never appears.
 //! `--json` prints the same rows with the full HEAD.
 
+use crate::envelope::env;
 use crate::paths;
 use crate::radar;
 use crate::{git, Error, Result};
@@ -28,6 +29,9 @@ struct Row {
     head: String,
     dirty: bool,
     locked: bool,
+    /// The loopback address of the klon, from `<klon>/.klon/env` (R21). It is
+    /// null for a klon that an older klon version created.
+    ip: Option<String>,
     #[serde(flatten)]
     radar: radar::Row,
 }
@@ -55,6 +59,7 @@ pub fn run(json: bool) -> Result<()> {
         rows.push(Row {
             head: head_of(&path, json),
             dirty: dirty(&path),
+            ip: env::value(&path, "KLON_IP"),
             branch,
             locked: worktree.locked,
             path,

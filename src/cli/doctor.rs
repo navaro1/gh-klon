@@ -2,6 +2,7 @@
 //! (handoff §7, spec R31). Every host feature is one row from one probe. A later
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
+use crate::envelope::slots;
 use crate::journal::{self, Entry, Op, State};
 use crate::{backend, git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
@@ -37,11 +38,13 @@ const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("inotify.max_user_instances", inotify_instances),
     ("inotify.max_user_watches", inotify_watches),
+    ("loopback", loopback),
     ("make", make_version),
     ("ninja", ninja_version),
     ("pasta", pasta_version),
     ("radar", radar_form),
     ("reflink", reflink_support),
+    ("slots", slots_in_use),
 ];
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -284,6 +287,34 @@ fn sysctl(path: &str) -> probe::Status {
             probe::Status::Absent(format!("{path} does not exist on this system"))
         }
         Err(err) => probe::Status::Broken(format!("cannot read {path}: {err}")),
+    }
+}
+
+/// How many loopback addresses the repository hands out right now (R21).
+fn slots_in_use(host: &Host) -> probe::Status {
+    match slots::in_use(host.common) {
+        Ok(0) => probe::Status::Present("no address in use".to_string()),
+        Ok(1) => probe::Status::Present("1 address in use".to_string()),
+        Ok(count) => probe::Status::Present(format!("{count} addresses in use")),
+        Err(err) => probe::Status::Broken(err.to_string()),
+    }
+}
+
+/// A real bind on the first klon address. `lo` owns all of `127/8` on Linux, so
+/// the bind needs no configuration. macOS gives `lo0` only `127.0.0.1` and the
+/// alias needs a privilege klon never takes, so the row names the command a
+/// person can run. `doctor` reports either state before the first `run`.
+fn loopback(_host: &Host) -> probe::Status {
+    let address = slots::ip(2);
+    match std::net::TcpListener::bind((address.as_str(), 0)) {
+        Ok(_) => probe::Status::Present(format!("{address} accepts a bind")),
+        Err(err) if cfg!(target_os = "linux") => {
+            probe::Status::Broken(format!("cannot bind {address}: {err}"))
+        }
+        Err(err) => probe::Status::Broken(format!(
+            "cannot bind {address}: {err}; add the alias with \
+             sudo ifconfig lo0 alias {address} up"
+        )),
     }
 }
 

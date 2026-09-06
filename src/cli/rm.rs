@@ -4,6 +4,7 @@
 //! with `--merged`, and only after klon proved it is merged.
 
 use crate::branch;
+use crate::envelope::slots;
 use crate::journal::{self, State};
 use crate::paths;
 use crate::process;
@@ -101,6 +102,14 @@ pub fn run(args: Args, json: bool) -> Result<()> {
                 target.display()
             )));
         }
+        // The scan reads the current directory of every process. A `run`
+        // command that changed directory escapes it, so `rm` can remove its
+        // klon and hand the loopback address to the next one; the new klon
+        // then reports EADDRINUSE. The `run` tags would catch that command,
+        // but reading `/proc/<pid>/environ` for every process measured 165 ms
+        // on this host against the 100 ms budget of R8 (113 ms without the
+        // read, 280 ms with it, same load). C20 puts the tree in a cgroup and
+        // answers the same question with one read.
         if let Some(pid) = process::live_process(&target) {
             return Err(Error::klon(format!(
                 "{} has a live process (pid {pid}); use --force to remove it",
@@ -115,6 +124,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let mut record = journal::Record::start(&common, journal::Op::Rm, &target, branch.as_deref())?;
     record.reach(State::Removing)?;
     let trash = remove_worktree(&golden, &target)?;
+    // Step 7: the loopback address goes back to the pool, so the next `add`
+    // takes it again. A failure here costs an address, never the removal, and
+    // `rm` must still return inside 100 ms (R8).
+    if let Err(err) = slots::release(&common, &target) {
+        eprintln!("klon: {err}");
+    }
     record.close()?;
 
     if let Some((name, evidence)) = merged_branch {
