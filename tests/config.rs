@@ -261,3 +261,32 @@ fn copy_reinstall_needs_its_own_approval_key() {
     );
     assert!(!fx.golden.join("reinstalled").exists());
 }
+
+#[test]
+fn netns_ports_is_a_known_key_and_an_unknown_one_warns() {
+    let fx = Fixture::generate();
+    fx.write_config("[netns]\nports = [3000, 5173]\n");
+    let out = klon(&fx.golden, &fx.home, &["add", "feature"]);
+    assert!(
+        out.status.success(),
+        "add with [netns] failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        !stderr(&out).contains("unknown"),
+        "the known table must not warn: {}",
+        stderr(&out)
+    );
+    let fx2 = Fixture::generate();
+    fx2.write_config("[netns]\nbogus = 1\n");
+    let out = klon(&fx2.golden, &fx2.home, &["add", "feature"]);
+    assert!(
+        out.status.success(),
+        "add with an unknown key must not fail"
+    );
+    assert!(
+        stderr(&out).contains("netns.bogus"),
+        "the warning must name the table key: {}",
+        stderr(&out)
+    );
+}

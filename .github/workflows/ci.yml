@@ -14,6 +14,10 @@
 # subvolume delete, because the development laptop runs ext4 and its udisks
 # refuses `user_subvol_rm_allowed` (S1 §8).
 #
+# The `netns` job installs pasta and runs the `run --netns` tests. It is the
+# only proof for those acceptance lines, because the development laptop and
+# ubuntu-22.04 do not package pasta.
+#
 # Later chunks extend this file: C32 adds a release workflow beside it.
 
 name: ci
@@ -146,6 +150,24 @@ jobs:
           KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
           SUDO_ASKPASS: /bin/false
         run: cargo test --locked --release --test btrfs -- --nocapture add_of_the_100k
+
+  # `run --netns` wraps a command in a pasta namespace (C23). pasta is
+  # packaged on ubuntu-24.04 and absent on the development laptop and on
+  # ubuntu-22.04, so this job is the only runner for those acceptance lines.
+  # The tests that need pasta skip with a printed reason everywhere else.
+  netns:
+    name: netns tests with pasta (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pasta
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y passt
+      - run: cargo test --locked --test netns -- --nocapture
 
   nightly:
     name: nightly, 100k fixture (ubuntu-22.04)
