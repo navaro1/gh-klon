@@ -81,6 +81,26 @@ pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
     run_roots(golden, klon, config, &roots, None)
 }
 
+/// `run`, with the top-level ignored entries given as the names that `git
+/// ls-files --others --ignored --directory` prints, instead of asked from git.
+///
+/// A spare-served `add` has that list in the spare record (G1): the builder
+/// asked git for it when it recorded the directory mtimes, and the spare holds
+/// exactly those directories. Asking again would walk the whole tree once
+/// more, 100 to 250 ms on 100k files. An entry that is not there is skipped.
+pub fn run_named<'a>(
+    golden: &Path,
+    klon: &Path,
+    config: &Config,
+    names: impl Iterator<Item = &'a String>,
+) -> Result<Summary> {
+    let roots: Vec<PathBuf> = roots_from_names(klon, names.map(|name| name.as_bytes()))
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect();
+    run_roots(golden, klon, config, &roots, None)
+}
+
 /// Rewrite golden's path inside one staged directory that the warm process is
 /// about to rename into place (C12).
 ///
@@ -490,7 +510,6 @@ fn holds_needle(
 /// ignored directory into one name, so the walk starts at `target/` instead of
 /// at every file below it.
 fn ignored_roots(klon: &Path) -> Result<Vec<PathBuf>> {
-    use std::os::unix::ffi::OsStrExt;
     let (_, out) = git::run_input(
         klon,
         &[
@@ -504,8 +523,15 @@ fn ignored_roots(klon: &Path) -> Result<Vec<PathBuf>> {
         b"",
         &[0],
     )?;
+    Ok(roots_from_names(klon, out.split(|b| *b == 0)))
+}
+
+/// The roots below `klon` for the names git printed, minus klon's own state
+/// and the staging directories of the warm process.
+fn roots_from_names<'a>(klon: &Path, names: impl Iterator<Item = &'a [u8]>) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
     let mut roots = Vec::new();
-    for name in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+    for name in names.filter(|s| !s.is_empty()) {
         let name = Path::new(std::ffi::OsStr::from_bytes(name));
         // klon's own state, including the log this pass writes.
         if name.starts_with(".klon") {
@@ -522,7 +548,7 @@ fn ignored_roots(klon: &Path) -> Result<Vec<PathBuf>> {
         }
         roots.push(klon.join(name));
     }
-    Ok(roots)
+    roots
 }
 
 /// Append the log lines to `<klon>/.klon/fixup.log`.
