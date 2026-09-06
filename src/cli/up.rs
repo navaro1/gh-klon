@@ -43,6 +43,9 @@ struct Report<'a> {
 
 pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    // A reboot takes a klon volume down and golden is then unreachable at its
+    // old path, so the image goes back up before the first `git` call (C15).
+    let cwd = crate::volume::ensure_attached(&cwd)?;
     let golden = git::main_worktree(&cwd)?;
     // One load: `base`, the `[warm] steps`, and the spare depth come from the
     // same file, and a second load would repeat its warning lines.

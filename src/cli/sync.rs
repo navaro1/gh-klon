@@ -113,6 +113,9 @@ struct Repo {
 
 pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    // A reboot takes a klon volume down and every klon is then unreachable at
+    // its old path, so the image goes back up before the first `git` call (C15).
+    let cwd = crate::volume::ensure_attached(&cwd)?;
     let worktrees = git::worktree_list(&cwd)?;
     let golden = paths::absolute(
         &worktrees
