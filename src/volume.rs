@@ -259,12 +259,20 @@ pub fn forget(common: &Path, golden_old: &Path) -> Result<()> {
 /// volume, and golden's symlink then points at nothing. `add` therefore looks
 /// here first, before its first `git` call.
 ///
-/// Two shapes match. An ancestor of `cwd` that is a converted golden answers at
-/// once. Else the registry is read, and a record whose golden sits below `cwd`
-/// answers: that is the user who could not `cd` into the dangling symlink and
-/// ran the command from the directory above it. An ambiguous second match
-/// gives None with one line on stderr, because klon must not guess a
-/// repository.
+/// Three shapes match, in this order:
+///
+/// | Shape | Who stands there |
+/// |---|---|
+/// | an ancestor of `cwd` is a converted golden | the usual caller, inside the repository at its old path |
+/// | `cwd` is on the volume, below a recorded golden | a caller who followed the symlink, or a shell left there |
+/// | a recorded golden sits **below** `cwd` | a caller who could not enter the dangling symlink and ran the command from the directory above it |
+///
+/// The first shape costs one failed `stat` per ancestor and reads no
+/// directory. The other two read the registry, which holds one small file per
+/// converted repository.
+///
+/// An ambiguous third match gives None with one line on stderr, because klon
+/// must not guess which repository the user meant.
 pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
     let here = paths::absolute(cwd)?;
     for ancestor in here.ancestors() {
@@ -288,10 +296,17 @@ pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        if let Some(record) = read_file(&path)? {
-            if record.golden_old.starts_with(&here) {
-                below.push(record);
-            }
+        let Some(record) = read_file(&path)? else {
+            continue;
+        };
+        if here.starts_with(&record.golden_new) {
+            return Ok(Some(Match {
+                record,
+                below: false,
+            }));
+        }
+        if record.golden_old.starts_with(&here) {
+            below.push(record);
         }
     }
     match below.len() {
