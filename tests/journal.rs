@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{assert_clean, git_ok, klon, stderr, stdout, Fixture, BIN};
+use common::{assert_clean, git_ok, klon, klon_env, stderr, stdout, Fixture, BIN};
 use serde_json::Value;
 
 const SEED: u64 = 42;
@@ -271,12 +271,18 @@ fn an_unknown_journal_version_fails_closed() {
 }
 
 /// The AC: `doctor` run twice gives byte-equal JSON except the timestamp.
+///
+/// The C17 jobserver row reports a store that every klon of the user shares,
+/// and its token count moves while a klon builds. The two runs below therefore
+/// get a private, idle store through `XDG_RUNTIME_DIR`, so the row reports one
+/// steady state instead of whatever a parallel test happens to hold.
 #[test]
 fn two_doctor_runs_agree_except_on_the_timestamp() {
     let fx = Fixture::generate(SEED, 30, 3, 3, 2);
-    let first = doctor_json(&fx);
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let first = doctor_json(&fx, runtime.path());
     std::thread::sleep(Duration::from_millis(1100));
-    let second = doctor_json(&fx);
+    let second = doctor_json(&fx, runtime.path());
     assert_ne!(first, second, "the timestamp must move");
     assert_eq!(
         blank_timestamp(&first),
@@ -285,8 +291,12 @@ fn two_doctor_runs_agree_except_on_the_timestamp() {
     );
 }
 
-fn doctor_json(fx: &Fixture) -> String {
-    let out = klon(&fx.golden, &["doctor", "--json"]);
+fn doctor_json(fx: &Fixture, runtime: &Path) -> String {
+    let out = klon_env(
+        &fx.golden,
+        &[("XDG_RUNTIME_DIR", runtime.as_os_str())],
+        &["doctor", "--json"],
+    );
     assert!(out.status.success(), "doctor failed: {}", stderr(&out));
     stdout(&out)
 }
