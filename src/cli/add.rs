@@ -1,5 +1,6 @@
-//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>]`: the `add`
-//! transaction from handoff §4, copy backend only.
+//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>] [--backend <b>]`:
+//! the `add` transaction from handoff §4. The probed backend fills the working
+//! directory (C5).
 
 use crate::backend::{self, Backend, Exclusions};
 use crate::branch;
