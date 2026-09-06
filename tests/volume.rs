@@ -177,6 +177,16 @@ fn udisks(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// True when `image` carries a loop device that is mounted. A path test would
+/// not do: two test volumes share the label `klon-golden`, so udisks gives the
+/// second one a suffixed mount point and each can stand where the other's
+/// record points.
+fn is_up(image: &Path) -> bool {
+    loop_device(image)
+        .and_then(|device| mount_point(&device))
+        .is_some()
+}
+
 /// Unmount `device`, with a few tries.
 ///
 /// A fresh mount under `/media` wakes the desktop file indexer, and udisks
@@ -630,7 +640,6 @@ fn add_reattaches_a_volume_that_went_down() {
     let fx = Fixture::generate(SEED, 60, 5, 10, 3);
     let record = convert(&fx, &sandbox, SIZE);
     let image = path_of(&record, "image");
-    let golden_new = path_of(&record, "golden_new");
     assert!(
         klon(&fx.golden, &sandbox, &["add", "feature"])
             .status
@@ -643,10 +652,7 @@ fn add_reattaches_a_volume_that_went_down() {
     if setup_by_caller(&device) {
         let _ = udisks(&["loop-delete", "-b", &device]);
     }
-    assert!(
-        !golden_new.exists(),
-        "the volume must be down, so golden's symlink dangles"
-    );
+    assert!(!is_up(&image), "the volume must be down");
 
     // The parent of golden is the only path a user can still stand in.
     let parent = fx.golden.parent().expect("a parent");
@@ -953,8 +959,8 @@ fn undo_restores_golden_on_the_old_filesystem() {
     );
     assert_eq!(git_ok(&fx.golden, &["status", "--porcelain"]), "");
     assert!(
-        !golden_new.exists() && loop_device(&image).is_none(),
-        "the undo must empty and detach the volume"
+        loop_device(&image).is_none(),
+        "the undo must detach the volume"
     );
 
     let report = doctor(&fx.golden, &sandbox);

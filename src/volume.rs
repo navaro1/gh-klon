@@ -356,7 +356,7 @@ pub fn ensure_attached(cwd: &Path) -> Result<PathBuf> {
     let Some(found) = find_for(cwd)? else {
         return Ok(here);
     };
-    if found.record.golden_new.is_dir() {
+    if is_up(&found.record)? {
         return Ok(here);
     }
     let live = attach(&found.record)?;
@@ -376,6 +376,19 @@ pub fn ensure_attached(cwd: &Path) -> Result<PathBuf> {
         live.golden_old.display()
     );
     Ok(live.golden_old)
+}
+
+/// True when this image is attached and mounted where the record says.
+///
+/// The question is asked of the image, never of the path. Two repositories
+/// with one name carry one label, and udisks gives the second volume a
+/// suffixed mount point. A path test would then find the wrong volume's golden
+/// at the recorded place and hand a command another repository's tree.
+fn is_up(record: &Volume) -> Result<bool> {
+    let Some(device) = loop_device(&record.image)? else {
+        return Ok(false);
+    };
+    Ok(mount_point(&device).as_deref() == Some(record.mount.as_path()))
 }
 
 /// Bring the volume up and answer with the record that names the live mount.
