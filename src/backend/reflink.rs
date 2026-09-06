@@ -85,10 +85,14 @@ pub fn copy_tree(src: &Path, dst: &Path, skip: &dyn Fn(&Path, bool) -> bool) -> 
         .map_err(|err| Error::klon(format!("cannot start the clone workers: {err}")))?;
     pool.install(|| plan.files.par_iter().try_for_each(clone_one))?;
     // Deepest first: a directory keeps its mtime only after its children are
-    // complete.
+    // complete. A source directory that vanished since phase 1 keeps the
+    // default mode and time on its empty copy; `vanished` explains why.
     for dir in plan.dirs.iter().rev() {
-        let meta = fs::symlink_metadata(&dir.from)
-            .map_err(Error::io(format!("stat {}", dir.from.display())))?;
+        let meta = match fs::symlink_metadata(&dir.from) {
+            Ok(meta) => meta,
+            Err(err) if vanished(&dir.from) => continue,
+            Err(err) => return Err(Error::io(format!("stat {}", dir.from.display()))(err)),
+        };
         set_times(&dir.to, &meta)?;
         fs::set_permissions(&dir.to, meta.permissions())
             .map_err(Error::io(format!("chmod {}", dir.to.display())))?;
@@ -124,20 +128,30 @@ fn collect(
     skip: &dyn Fn(&Path, bool) -> bool,
     plan: &mut Plan,
 ) -> Result<()> {
-    let entries = fs::read_dir(src).map_err(Error::io(format!("read {}", src.display())))?;
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(err) if vanished(src) => return Ok(()),
+        Err(err) => return Err(Error::io(format!("read {}", src.display()))(err)),
+    };
     for entry in entries {
         let entry = entry.map_err(Error::io(format!("read {}", src.display())))?;
         let from = entry.path();
-        let meta =
-            fs::symlink_metadata(&from).map_err(Error::io(format!("stat {}", from.display())))?;
+        let meta = match fs::symlink_metadata(&from) {
+            Ok(meta) => meta,
+            Err(err) if vanished(&from) => continue,
+            Err(err) => return Err(Error::io(format!("stat {}", from.display()))(err)),
+        };
         let kind = meta.file_type();
         if skip(&from, kind.is_dir()) {
             continue;
         }
         let to = dst.join(entry.file_name());
         if kind.is_symlink() {
-            let target =
-                fs::read_link(&from).map_err(Error::io(format!("readlink {}", from.display())))?;
+            let target = match fs::read_link(&from) {
+                Ok(target) => target,
+                Err(err) if vanished(&from) => continue,
+                Err(err) => return Err(Error::io(format!("readlink {}", from.display()))(err)),
+            };
             std::os::unix::fs::symlink(&target, &to)
                 .map_err(Error::io(format!("symlink {}", to.display())))?;
             set_symlink_times(&to, &meta)?;
@@ -160,12 +174,45 @@ fn collect(
     Ok(())
 }
 
+/// True when `path` is gone, so the error only says that the source tree moved
+/// on while the walk read it.
+///
+/// A live tree is normal: a build writes and deletes temporary files, and
+/// `git gc --auto` prunes the loose objects it has just packed, and then their
+/// empty fan-out directory. One vanished path costs a line on stderr instead of
+/// a failed clone. `init` proves afterwards, with `git fsck`, that the
+/// repository it copied is still whole.
+///
+/// The answer comes from a fresh stat, not from the error kind: `reflink-copy`
+/// checks the source itself and wraps a missing file in its own message, so the
+/// kind is not reliable. Only a confirmed `NotFound` counts; every other stat
+/// failure keeps the original error.
+fn vanished(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "klon: {} vanished during the clone; skipped",
+                path.display()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Phase 2: one `FICLONE` for one file, then its mode and its source mtime.
 fn clone_one(pair: &Pair) -> Result<()> {
-    reflink_copy::reflink(&pair.from, &pair.to)
-        .map_err(Error::io(format!("reflink {}", pair.from.display())))?;
-    let meta = fs::symlink_metadata(&pair.from)
-        .map_err(Error::io(format!("stat {}", pair.from.display())))?;
+    if let Err(err) = reflink_copy::reflink(&pair.from, &pair.to) {
+        if vanished(&pair.from) {
+            return Ok(());
+        }
+        return Err(Error::io(format!("reflink {}", pair.from.display()))(err));
+    }
+    let meta = match fs::symlink_metadata(&pair.from) {
+        Ok(meta) => meta,
+        Err(err) if vanished(&pair.from) => return Ok(()),
+        Err(err) => return Err(Error::io(format!("stat {}", pair.from.display()))(err)),
+    };
     // `reflink` gives the clone the source mode. Set it again, so a platform
     // that ignores the creation mode still produces an equal manifest.
     fs::set_permissions(&pair.to, meta.permissions())

@@ -420,6 +420,14 @@ struct VersionOnly {
 /// Write the cache atomically: a temporary file in the same directory, then one
 /// rename.
 fn write_cache(common: &Path, cache: &Cache) -> Result<()> {
+    // A common directory that vanished under the running command names no
+    // repository any more. `doctor --repair` reaches this state when it renames
+    // golden back after an interrupted `init`: its own path is then stale, and
+    // one `create_dir_all` below would rebuild the directory tree it just
+    // removed. An answer that nothing will read is not worth that.
+    if !common.is_dir() {
+        return Ok(());
+    }
     let path = cache_path(common);
     let dir = path.parent().unwrap_or(common);
     fs::create_dir_all(dir).map_err(Error::io(format!("create {}", dir.display())))?;
@@ -660,6 +668,7 @@ mod tests {
     fn the_cache_round_trips_and_forget_removes_it() {
         let tmp = tempfile::tempdir().unwrap();
         let common = tmp.path().join("common");
+        fs::create_dir(&common).unwrap();
         let cache = Cache {
             version: PROBE_VERSION,
             backend: "copy".to_string(),
@@ -675,5 +684,26 @@ mod tests {
         assert!(read_cache(&common).unwrap().is_none());
         // A second forget stays quiet.
         forget_probe(&common).unwrap();
+    }
+
+    /// `doctor --repair` renames golden back after an interrupted `init`, which
+    /// leaves its own common path stale. The cache write must not rebuild that
+    /// directory tree (C7).
+    #[test]
+    fn a_common_directory_that_vanished_gets_no_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("gone").join(".git");
+        let cache = Cache {
+            version: PROBE_VERSION,
+            backend: "copy".to_string(),
+            reason: "x".to_string(),
+            filesystem: "ext4".to_string(),
+            created: time::now_rfc3339(),
+        };
+        write_cache(&common, &cache).unwrap();
+        assert!(
+            !tmp.path().join("gone").exists(),
+            "the write must create nothing"
+        );
     }
 }

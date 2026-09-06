@@ -98,7 +98,20 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
             _ => actions.push("rm changed nothing; the klon stays".to_string()),
         },
         // C15 adds the `--volume` tail on top of this one.
-        Op::Init => init(&entry.path, entry.state, &mut actions)?,
+        Op::Init => {
+            init(&entry.path, entry.state, &mut actions)?;
+            // `init` keeps its journal inside golden, and the repair may have
+            // just renamed golden back under the caller's feet. The entry is
+            // therefore removed from the common directory the caller resolved
+            // and from the one golden holds now. A missing file is not an
+            // error, so the removal that finds nothing stays quiet.
+            journal::remove(common, &entry.name)?;
+            if let Ok(moved) = git::common_dir_of_main(&entry.path) {
+                journal::remove(&moved, &entry.name)?;
+            }
+            actions.push("deleted the journal entry".to_string());
+            return Ok(Outcome::closed(actions));
+        }
     }
     journal::remove(common, &entry.name)?;
     actions.push("deleted the journal entry".to_string());
@@ -127,12 +140,7 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
 /// Every delete is the detached background delete, so a repair returns at once
 /// and a second run finds nothing left to do.
 fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
-    let siblings = [
-        cli_init::sibling(golden, cli_init::OLD_SUFFIX)?,
-        cli_init::sibling(golden, cli_init::STAGING_SUFFIX)?,
-        cli_init::sibling(golden, cli_init::PLAIN_SUFFIX)?,
-    ];
-    let old = &siblings[0];
+    let old = cli_init::sibling(golden, cli_init::OLD_SUFFIX)?;
     if !golden.exists() {
         if state != State::Swapped || !old.exists() {
             return Err(Error::klon(format!(
@@ -141,7 +149,7 @@ fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
                 old.display()
             )));
         }
-        fs::rename(old, golden).map_err(Error::io(format!(
+        fs::rename(&old, golden).map_err(Error::io(format!(
             "rename {} back to {}",
             old.display(),
             golden.display()
@@ -153,15 +161,45 @@ fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
         ));
     }
     // Golden is at its path now. Every remaining sibling is a copy that no
-    // command reads: the staging copy of a conversion that stopped, or the
-    // replaced golden of one that finished.
-    for path in &siblings {
-        if path.exists() {
-            process::spawn_background_delete(path)?;
-            actions.push(format!("started the delete of {}", path.display()));
-        }
+    // command reads: the staging copy of a conversion that stopped, or a
+    // replaced golden whose background delete never started.
+    for path in init_leftovers(golden)? {
+        process::spawn_background_delete(&path)?;
+        actions.push(format!("started the delete of {}", path.display()));
     }
     Ok(())
+}
+
+/// Every `init` leftover beside golden that still exists.
+///
+/// The staging copies carry an exact name. The replaced golden carries
+/// `<golden>.klon-old`, or `<golden>.klon-old.<pid>.<n>` once `init` renamed it
+/// out of the way for the background delete, so that family matches by prefix.
+fn init_leftovers(golden: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for suffix in [cli_init::STAGING_SUFFIX, cli_init::PLAIN_SUFFIX] {
+        let path = cli_init::sibling(golden, suffix)?;
+        if path.exists() {
+            found.push(path);
+        }
+    }
+    let (Some(parent), Some(name)) = (golden.parent(), golden.file_name()) else {
+        return Ok(found);
+    };
+    let prefix = format!("{}{}", name.to_string_lossy(), cli_init::OLD_SUFFIX);
+    let read = match fs::read_dir(parent) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(err) => return Err(Error::io(format!("read {}", parent.display()))(err)),
+    };
+    for item in read {
+        let item = item.map_err(Error::io(format!("read {}", parent.display())))?;
+        if item.file_name().to_string_lossy().starts_with(&prefix) {
+            found.push(item.path());
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Unlock and remove a registered worktree, then prune. `git worktree remove`

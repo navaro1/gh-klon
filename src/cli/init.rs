@@ -152,6 +152,7 @@ fn convert(
     let skip = skip_rule(golden);
     reflink::copy_tree(golden, staging, &skip)?;
     copy_root_metadata(golden, staging)?;
+    verify(staging)?;
     record.reach(State::Copied)?;
 
     // Step 5: the swap is about to start. `doctor --repair` reads this state
@@ -175,14 +176,70 @@ fn convert(
     Ok(())
 }
 
-/// Remove the replaced golden. After `--undo` it is a subvolume, so the btrfs
-/// backend can drop it in one ioctl where the mount allows that.
+/// Remove the replaced golden.
+///
+/// The delete runs in the background, and it can take minutes on a big
+/// repository. One rename first frees the `<golden>.klon-old` name, so a second
+/// `init` on the same repository never waits for it and never refuses. The
+/// rename stays inside one directory, so it costs one metadata operation.
+/// `doctor --repair` removes every `<golden>.klon-old*` sibling, which closes
+/// the window between the rename and the start of the delete.
+///
+/// After `--undo` the replaced golden is a subvolume, so the btrfs backend can
+/// drop it in one ioctl where the mount allows that.
 fn delete_old(old: &Path, undo: bool) -> Result<()> {
+    let victim = free_name(old)?;
+    rename(old, &victim)?;
     if undo {
         use crate::backend::Backend;
-        return btrfs::BtrfsSnapshot.delete(old);
+        return btrfs::BtrfsSnapshot.delete(&victim);
     }
-    process::spawn_background_delete(old)
+    process::spawn_background_delete(&victim)
+}
+
+/// The first free `<old>.<pid>.<n>` path.
+fn free_name(old: &Path) -> Result<PathBuf> {
+    let pid = std::process::id();
+    for n in 0..64u32 {
+        let mut name = old.as_os_str().to_os_string();
+        name.push(format!(".{pid}.{n}"));
+        let candidate = PathBuf::from(name);
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::klon(format!(
+        "cannot find a free name beside {}",
+        old.display()
+    )))
+}
+
+/// Prove that the staged copy is a whole repository before the swap.
+///
+/// A copy of a live `.git` can miss an object: `git gc --auto` writes a pack
+/// and then prunes the loose objects it packed, and the walk can pass a
+/// directory before that pack lands. `fsck --connectivity-only` reads every
+/// reachable object without hashing its content, so it names a gap in seconds
+/// and `init` stops while golden is still untouched.
+fn verify(staging: &Path) -> Result<()> {
+    git::run(
+        staging,
+        &[
+            "fsck",
+            "--connectivity-only",
+            "--no-progress",
+            "--no-dangling",
+        ],
+    )
+    .map_err(|err| {
+        Error::klon(format!(
+            "the copy at {} is not a whole repository, so golden stays as it is. \
+             Let every build and every git command in golden finish, then run \
+             gh klon doctor --repair and try again.\n{err}",
+            staging.display()
+        ))
+    })?;
+    Ok(())
 }
 
 /// The paths that the copy leaves out: `<golden>/.git/klon`, which holds the

@@ -9,8 +9,10 @@
 # and through `workflow_dispatch` only, so pull requests stay fast.
 #
 # The `loop-fs` job builds an xfs and a btrfs loop filesystem and runs the
-# backend tests on each. It is the only proof for the copy-on-write acceptance
-# lines, because the development laptop runs ext4.
+# backend tests on each, then the C7 snapshot and `init` tests on btrfs. It is
+# the only proof for the copy-on-write acceptance lines and for the O(1)
+# subvolume delete, because the development laptop runs ext4 and its udisks
+# refuses `user_subvol_rm_allowed` (S1 §8).
 #
 # Later chunks extend this file: C32 adds a release workflow beside it.
 
@@ -104,12 +106,20 @@ jobs:
           KLON_TEST_REFLINK_DIR: /mnt/klon-xfs/work
         run: cargo test --locked --test backend -- --nocapture
       # btrfs answers FICLONE on a plain directory, so the same tests run again.
-      # KLON_TEST_BTRFS_DIR is for C7, which adds the subvolume backend.
       - name: Backend tests on btrfs
         env:
           KLON_TEST_REFLINK_DIR: /mnt/klon-btrfs/work
           KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
         run: cargo test --locked --test backend -- --nocapture
+      # C7: the `btrfs-snapshot` backend and `gh klon init`. The mount carries
+      # `user_subvol_rm_allowed`, so this job is the only proof for the O(1)
+      # subvolume delete. `SUDO_ASKPASS=/bin/false` keeps the zero-password rule
+      # even though this runner needs no udisks.
+      - name: The btrfs snapshot backend and init
+        env:
+          KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
+          SUDO_ASKPASS: /bin/false
+        run: cargo test --locked --test btrfs -- --nocapture
       # The 100k reflink budget of 10 s. It needs a big fixture, so it runs on
       # the schedule and on demand only, like the other 100k cell.
       - name: The 100k reflink walk on xfs
@@ -118,6 +128,14 @@ jobs:
           KLON_FIXTURE: 100k
           KLON_TEST_REFLINK_DIR: /mnt/klon-xfs/work
         run: cargo test --locked --release --test backend -- --nocapture reflink_walk_of_the_100k
+      # The 100k snapshot cell. It shares the schedule with the reflink one.
+      - name: The 100k btrfs snapshot
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          KLON_FIXTURE: 100k
+          KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
+          SUDO_ASKPASS: /bin/false
+        run: cargo test --locked --release --test btrfs -- --nocapture add_of_the_100k
 
   nightly:
     name: nightly, 100k fixture (ubuntu-22.04)
