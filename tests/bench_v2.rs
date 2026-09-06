@@ -97,21 +97,26 @@ impl Drop for Run {
     }
 }
 
-/// One cargo build at a time inside this binary.
+/// One M12 measurement at a time inside this binary.
 ///
-/// Three cells here drive real `cargo build` runs, and the harness would start
-/// all three at once. That much process churn beside the rest of the suite
-/// makes the C17 sampler in `tests/jobserver.rs` count a compile process that
-/// has already released its token, and the run fails on a machine that is
-/// merely busy. One at a time keeps this binary's share of the suite near the
-/// C11 zero-compile tests, which build one project each.
-static BUILDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// The two M12 tests are the heavy ones: each drives several `gh klon run`
+/// wrappers and a concurrent build phase. The harness would start both at once,
+/// and that much process churn beside the rest of the suite makes the C17
+/// sampler in `tests/jobserver.rs` count a compile process that has already
+/// released its token. The run then fails on a machine that is merely busy.
+///
+/// The two M3 tests stay parallel. Each builds one small project once, which is
+/// what the C11 zero-compile tests already do, and waiting for a turn would put
+/// them over the 60 s that a test in this suite may take.
+static MEASUREMENTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Hold `BUILDS` for the rest of the caller's scope. A test that panicked
+/// Hold `MEASUREMENTS` for the rest of the caller's scope. A test that panicked
 /// while holding it poisons the lock; the next test takes it anyway, because a
 /// poisoned lock guards no data here, only a turn.
-fn one_build_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    BUILDS.lock().unwrap_or_else(|poison| poison.into_inner())
+fn one_measurement_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    MEASUREMENTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// A directory name that no other test and no parallel run shares.
@@ -231,7 +236,6 @@ fn the_warm_cell_reports_the_time_to_a_warm_tree() {
 /// metric.
 #[test]
 fn the_rust_build_cell_compiles_nothing_in_a_klon() {
-    let _turn = one_build_at_a_time();
     let run = Run::new();
     let report = run.bench(&[], "m3-zero-compile-rust");
     if let Some(why) = skip_reason(&report, "m3-zero-compile-rust") {
@@ -273,7 +277,6 @@ fn the_rust_build_cell_compiles_nothing_in_a_klon() {
 /// it. The cell is skipped with a reason when pnpm, node, or tar is absent.
 #[test]
 fn the_pnpm_build_cell_installs_nothing_in_a_klon() {
-    let _turn = one_build_at_a_time();
     let run = Run::new();
     let report = run.bench(&[], "m3-zero-compile-pnpm");
     if let Some(why) = skip_reason(&report, "m3-zero-compile-pnpm") {
@@ -364,7 +367,7 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
 /// that the committed manifest still asks for six.
 #[test]
 fn the_throughput_cell_reports_the_ratio_and_every_build_time() {
-    let _turn = one_build_at_a_time();
+    let _turn = one_measurement_at_a_time();
     let run = Run::new();
     let report = run.bench(&[("KLON_BENCH_N", OsStr::new("2"))], "m12-throughput-n6");
     if let Some(why) = skip_reason(&report, "m12-throughput-n6") {
@@ -431,7 +434,7 @@ fn the_throughput_cell_reports_the_ratio_and_every_build_time() {
 /// must not stand, however good the ratio looks.
 #[test]
 fn a_throughput_run_without_build_slots_is_void() {
-    let _turn = one_build_at_a_time();
+    let _turn = one_measurement_at_a_time();
     let run = Run::new();
     // One builder is enough here: the question is whether the record says what
     // the envelope really gave it, not what six builders cost. One builder also
