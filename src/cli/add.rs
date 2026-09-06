@@ -128,7 +128,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // so the image goes back up before the first `git` call (C15, S1 §9.4). A
     // repository without a volume pays one failed stat per ancestor of the
     // working directory and starts no process.
-    crate::volume::ensure_attached(&cwd)?;
+    let cwd = crate::volume::ensure_attached(&cwd)?;
     let common = git::common_dir(&cwd)?;
     check_git_path(&common)?;
     let worktrees = git::worktree_list(&cwd)?;

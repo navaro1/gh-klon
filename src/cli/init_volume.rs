@@ -48,7 +48,7 @@ pub fn run(size: &str, args: &super::init::Args, yes: bool, json: bool) -> Resul
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     // A volume that a reboot took down leaves golden's symlink dangling, so
     // the repository is unreachable until klon mounts the image again.
-    volume::ensure_attached(&cwd)?;
+    let cwd = volume::ensure_attached(&cwd)?;
     if args.undo {
         return undo(&cwd, args.force, yes, json);
     }
@@ -231,12 +231,16 @@ fn undo(cwd: &Path, force: bool, yes: bool, json: bool) -> Result<()> {
     let common = git::common_dir(cwd)?;
     let record = match volume::read(&common)? {
         Some(record) => record,
-        None => volume::find_for(cwd)?.ok_or_else(|| {
-            Error::klon(format!(
-                "{} sits on no klon volume; gh klon init --volume never ran here",
-                golden.display()
-            ))
-        })?,
+        None => {
+            volume::find_for(cwd)?
+                .ok_or_else(|| {
+                    Error::klon(format!(
+                        "{} sits on no klon volume; gh klon init --volume never ran here",
+                        golden.display()
+                    ))
+                })?
+                .record
+        }
     };
     if paths::absolute(&record.golden_new)? != golden {
         return Err(Error::klon(format!(
@@ -514,12 +518,18 @@ fn confirmed(plan: &str, yes: bool) -> Result<bool> {
 
 fn print_plan(golden: &Path, plan: &Volume, size: &str) -> String {
     let mount = expected_mount(&plan.label);
+    let name = plan
+        .golden_new
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
     format!(
         "klon: move golden onto a btrfs loop volume:\n\
          \x20 image   {} ({size}, sparse)\n\
          \x20 label   {}, so udisks mounts it at {}\n\
          \x20 golden  {}\n\
-         \x20 becomes a symlink to {}/{}\n\
+         \x20 moves to {} and its old path becomes a symlink to that\n\
          \x20 klon reads the real mount point from findmnt, and udisks adds a \
          suffix when that path is taken.\n\
          golden keeps its path. The content does not change. No password is needed \
@@ -528,11 +538,7 @@ fn print_plan(golden: &Path, plan: &Volume, size: &str) -> String {
         plan.label,
         mount.display(),
         golden.display(),
-        mount.display(),
-        plan.golden_new
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy(),
+        volume::work_dir(&mount).join(name).display(),
     )
 }
 

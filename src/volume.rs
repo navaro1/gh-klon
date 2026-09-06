@@ -265,11 +265,14 @@ pub fn forget(common: &Path, golden_old: &Path) -> Result<()> {
 /// ran the command from the directory above it. An ambiguous second match
 /// gives None with one line on stderr, because klon must not guess a
 /// repository.
-pub fn find_for(cwd: &Path) -> Result<Option<Volume>> {
+pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
     let here = paths::absolute(cwd)?;
     for ancestor in here.ancestors() {
         if let Some(record) = read_file(&registry_path(ancestor)?)? {
-            return Ok(Some(record));
+            return Ok(Some(Match {
+                record,
+                below: false,
+            }));
         }
     }
     let dir = data_dir()?.join("volumes");
@@ -293,9 +296,11 @@ pub fn find_for(cwd: &Path) -> Result<Option<Volume>> {
     }
     match below.len() {
         0 => Ok(None),
-        1 => Ok(below.pop()),
+        1 => Ok(below.pop().map(|record| Match {
+            record,
+            below: true,
+        })),
         _ => {
-            below.sort_by(|a, b| a.golden_old.cmp(&b.golden_old));
             eprintln!(
                 "klon: {} holds {} klon volumes; run the command inside one of them",
                 here.display(),
@@ -306,6 +311,15 @@ pub fn find_for(cwd: &Path) -> Result<Option<Volume>> {
     }
 }
 
+/// One record and how the working directory reached it.
+pub struct Match {
+    pub record: Volume,
+    /// True when golden sits **below** the working directory. The caller then
+    /// stands outside the repository, which is what a dangling symlink leaves
+    /// after a reboot: no shell can enter a path that points at nothing.
+    pub below: bool,
+}
+
 // --- Attach --------------------------------------------------------------------
 
 /// Attach and mount the volume of the repository at or below `cwd` when it is
@@ -313,22 +327,48 @@ pub fn find_for(cwd: &Path) -> Result<Option<Volume>> {
 /// `git` call (S1 §9.4: the first `add` after a reboot re-runs `loop-setup`
 /// and `mount`).
 ///
+/// The answer is the working directory to use. It differs from `cwd` in one
+/// case: the volume was down and golden sits below `cwd`. No shell can stand
+/// in a repository whose symlink points at nothing, so the user runs the
+/// command from the directory above it, and klon steps in once the volume is
+/// back. klon prints that step, and it takes it only for the one repository
+/// that the registry names below `cwd`.
+///
 /// A repository without a volume costs one failed `stat` per ancestor of `cwd`
 /// and no subprocess.
-pub fn ensure_attached(cwd: &Path) -> Result<()> {
-    let Some(record) = find_for(cwd)? else {
-        return Ok(());
+pub fn ensure_attached(cwd: &Path) -> Result<PathBuf> {
+    let here = cwd.to_path_buf();
+    let Some(found) = find_for(cwd)? else {
+        return Ok(here);
     };
-    if record.golden_new.is_dir() {
-        return Ok(());
+    if found.record.golden_new.is_dir() {
+        return Ok(here);
     }
-    attach(&record).map(|_| ())
+    let live = attach(&found.record)?;
+    if live != found.record {
+        // udisks mounted the volume somewhere else, so golden's symlink now
+        // points at nothing. Both it and the record are rewritten before the
+        // first git command runs.
+        repoint(&live)?;
+    }
+    if !found.below {
+        return Ok(here);
+    }
+    std::env::set_current_dir(&live.golden_old)
+        .map_err(Error::io(format!("enter {}", live.golden_old.display())))?;
+    eprintln!(
+        "klon: the volume was down, so klon ran the command in {}",
+        live.golden_old.display()
+    );
+    Ok(live.golden_old)
 }
 
 /// Bring the volume up and answer with the record that names the live mount.
 ///
 /// The device number is resolved from the image every time, never stored. A
-/// mount that the automounter already made counts as success.
+/// mount that the automounter already made counts as success. The call writes
+/// nothing: `ensure_attached` owns the symlink and the record, and
+/// `init --volume` has neither of them yet when it calls this.
 pub fn attach(record: &Volume) -> Result<Volume> {
     if !record.image.is_file() {
         return Err(Error::klon(format!(
@@ -356,19 +396,17 @@ pub fn attach(record: &Volume) -> Result<Volume> {
         record.image.display(),
         mount.display()
     );
-    let live = record.at_mount(&mount);
-    if live != *record {
-        // udisks mounted the volume somewhere else, so golden's symlink points
-        // at nothing. Both are rewritten before any git command runs.
-        repoint(&live)?;
-    }
-    Ok(live)
+    Ok(record.at_mount(&mount))
 }
 
 /// Point golden's symlink at the live path and store the new record.
+///
+/// udisks appends a suffix to a mount point whose label is already taken, so a
+/// volume can come back at another path. The symlink then points at nothing
+/// and every git command would fail; this rewrites it and both record copies.
 fn repoint(live: &Volume) -> Result<()> {
     eprintln!(
-        "klon: the volume moved to {}; klon updates {}",
+        "klon: the volume came back at {}; klon repoints {}",
         live.mount.display(),
         live.golden_old.display()
     );
@@ -378,8 +416,10 @@ fn repoint(live: &Volume) -> Result<()> {
     }
     std::os::unix::fs::symlink(&live.golden_new, link)
         .map_err(Error::io(format!("link {}", link.display())))?;
-    write_file(&registry_path(&live.golden_old)?, live)?;
-    write_file(&record_path(&live.golden_new.join(".git")), live)
+    // The repository copy sits behind the symlink that this call just fixed,
+    // so its path is resolved now and not from the stale record.
+    let common = crate::git::common_dir_of_main(link)?;
+    write(&common, live)
 }
 
 // --- The host tools ------------------------------------------------------------
