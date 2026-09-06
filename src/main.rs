@@ -99,8 +99,8 @@ struct Cli {
 enum Command {
     /// Create a linked worktree with a warm copy of golden's ignored files.
     Add(cli::add::Args),
-    /// Run the approved `[warm] steps` in golden.
-    Up,
+    /// Fetch, fast-forward golden, run the approved `[warm] steps`, and start a spare.
+    Up(cli::up::Args),
     /// Remove a klon: rename it to .trash and delete it in the background.
     Rm(cli::rm::Args),
     /// Drop stale worktree admin entries and drain the .trash directory.
@@ -112,7 +112,7 @@ enum Command {
     Doctor(cli::doctor::Args),
     /// Convert golden into a btrfs subvolume, or move it onto a btrfs loop volume.
     Init(cli::init::Args),
-    /// Bring a klon up to date. C24 ships the `--check` dry run only.
+    /// Bring a klon up to date: fetch, then fast-forward, rebase, or merge.
     Sync(cli::sync::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
     Pr(cli::pr::Args),
@@ -136,7 +136,7 @@ enum Command {
 
 fn main() -> ExitCode {
     let Cli { yes, json, command } = Cli::parse();
-    // `--json` is global, like `--yes`. `up`, `prune`, and `pr` print no klon
+    // `--json` is global, like `--yes`. `prune` and `pr` print no klon
     // document, so the flag would promise one that never arrives. A later
     // chunk that gives a command a document deletes its name from this list.
     // `run` and `shell` hand stdout to the wrapped command, so klon must not
@@ -144,8 +144,7 @@ fn main() -> ExitCode {
     if json
         && matches!(
             command,
-            Command::Up
-                | Command::Prune
+            Command::Prune
                 | Command::Pr(_)
                 | Command::Run(_)
                 | Command::Shell(_)
@@ -155,21 +154,19 @@ fn main() -> ExitCode {
     {
         eprintln!(
             "{}",
-            Error::klon(
-                "--json is not available for up, prune, pr, run, shell, spare-build, and warm",
-            )
+            Error::klon("--json is not available for prune, pr, run, shell, spare-build, and warm",)
         );
         return ExitCode::from(1);
     }
     let result = match command {
         Command::Add(args) => cli::add::run(args, yes, json),
-        Command::Up => cli::up::run(yes),
+        Command::Up(args) => cli::up::run(args, yes, json),
         Command::Rm(args) => cli::rm::run(args, json),
         Command::Prune => cli::prune::run(),
         Command::List(args) => cli::list::run(args, json),
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Init(args) => cli::init::run(args, yes, json),
-        Command::Sync(args) => cli::sync::run(args),
+        Command::Sync(args) => cli::sync::run(args, yes, json),
         Command::Pr(args) => cli::pr::run(args),
         Command::Run(args) => cli::run::run(args),
         Command::Shell(args) => cli::shell::run(args),

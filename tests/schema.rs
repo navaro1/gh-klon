@@ -71,6 +71,27 @@ const LIST_ROW: Fields = &[
     ("behind", Ty::NumOrNull),
 ];
 
+/// C14. `head_before` and `head_after` are null in a repository with no commit.
+const UP: Fields = &[
+    ("schema", Ty::Str),
+    ("base", Ty::Str),
+    ("head_before", Ty::StrOrNull),
+    ("head_after", Ty::StrOrNull),
+    ("steps_run", Ty::Num),
+    ("spare_started", Ty::Bool),
+];
+
+/// C14. `sync --json` prints one of these per klon, one per line.
+const SYNC: Fields = &[
+    ("schema", Ty::Str),
+    ("branch", Ty::Str),
+    ("path", Ty::Str),
+    ("action", Ty::Str),
+    ("head_before", Ty::StrOrNull),
+    ("head_after", Ty::StrOrNull),
+    ("message", Ty::Str),
+];
+
 const RM: Fields = &[
     ("schema", Ty::Str),
     ("path", Ty::Str),
@@ -293,6 +314,34 @@ fn every_command_matches_its_documented_schema() {
     }
     check_rows(&doctor, "journal", DOCTOR_JOURNAL_ROW);
     check_rows(&doctor, "repaired", DOCTOR_REPAIR_ROW);
+
+    // C14. The fixture has no origin, so `up` skips the fetch and the merge
+    // and `sync` falls back to `base`; the document shape is the same.
+    let out = klon(&fx.golden, &["up", "--json"]);
+    assert!(out.status.success(), "up failed: {}", stderr(&out));
+    let up = parse(&stdout(&out));
+    check_ok(&up, UP);
+    assert_eq!(up["schema"], "klon.up/1");
+    assert_eq!(up["base"], "main");
+
+    let out = klon(&fx.golden, &["sync", "--json", "feature", "--check"]);
+    assert!(
+        out.status.success(),
+        "sync --check failed: {}",
+        stderr(&out)
+    );
+    let sync = parse(&stdout(&out));
+    check_ok(&sync, SYNC);
+    assert_eq!(sync["schema"], "klon.sync/1");
+    assert_eq!(sync["action"], "check");
+
+    let out = klon(&fx.golden, &["sync", "--json", "--all"]);
+    assert!(out.status.success(), "sync --all failed: {}", stderr(&out));
+    for line in stdout(&out).lines() {
+        let row = parse(line);
+        check_ok(&row, SYNC);
+        assert_eq!(row["schema"], "klon.sync/1");
+    }
 
     let out = klon(&fx.golden, &["stop", "--json", "feature"]);
     assert!(out.status.success(), "stop failed: {}", stderr(&out));

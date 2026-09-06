@@ -62,7 +62,13 @@ pub fn resolve_issue(golden: &Path, n: u64) -> Result<String> {
 /// The golden branch: the `base` key of `.klon.toml`, else the branch golden
 /// has checked out, else `main`.
 pub fn base(golden: &Path) -> Result<String> {
-    if let Some(base) = config::load(golden)?.base {
+    base_of(&config::load(golden)?, golden)
+}
+
+/// `base` for a caller that already loaded `.klon.toml`. `up` loads the file
+/// once: a second load repeats every warning line the loader prints.
+pub fn base_of(config: &config::Config, golden: &Path) -> Result<String> {
+    if let Some(base) = config.base.clone() {
         return Ok(base);
     }
     // A detached golden has no symbolic ref; fall back to the usual name.

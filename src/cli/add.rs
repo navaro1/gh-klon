@@ -116,7 +116,21 @@ struct SparePolicy<'a> {
 /// Directories inside golden where a klon may live.
 const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
 
-pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
+/// What the transaction made, for a caller that prints its own report.
+/// `sync --fresh` (C14) uses it: there `sync` owns stdout.
+pub struct Spawned {
+    pub path: PathBuf,
+    pub branch: String,
+    /// The backend that filled the tree, as the report names it.
+    pub backend: String,
+    /// True when the hot spare served this `add`.
+    pub spare: bool,
+    pub duration_ms: u64,
+    /// The ignored directories that the background warm pass still fills (C12).
+    pub warming: Vec<String>,
+}
+
+pub fn run(mut args: Args, yes: bool, json: bool) -> Result<()> {
     // The wrapped command owns stdout, so its output and the report would share
     // one stream and no reader could parse the result as one document. The
     // refusal comes before every repository change.
@@ -125,6 +139,41 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
             "--json is not available for add with a command after --; the command owns stdout",
         ));
     }
+    let command = std::mem::take(&mut args.command);
+    let spawned = spawn(args, yes, json)?;
+    if json {
+        let report = Report {
+            schema: SCHEMA,
+            path: &spawned.path,
+            branch: &spawned.branch,
+            head: git::run(&spawned.path, &["rev-parse", "HEAD"])?
+                .trim()
+                .to_string(),
+            backend: &spawned.backend,
+            spare: spawned.spare,
+            duration_ms: spawned.duration_ms,
+            warming: spawned.warming,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&report)
+                .map_err(|err| Error::klon(format!("serialize the report: {err}")))?
+        );
+    } else {
+        println!("{}", spawned.path.display());
+    }
+    // Step 12: `add <branch> -- <cmd>` is `add` and then `run`. The exit code
+    // of the command becomes the exit code of `add`.
+    if !command.is_empty() {
+        return super::run::exec(&spawned.path, &command);
+    }
+    Ok(())
+}
+
+/// The whole `add` transaction, with no report and no wrapped command. `json`
+/// says that the caller owns stdout for a document, which silences the copy
+/// progress line.
+pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
     let started = Instant::now();
     let mut steps = Steps::new();
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
@@ -311,31 +360,17 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     hint_volume(&common, choice.backend.name());
     steps.mark("warm-start");
 
-    if json {
-        let report = Report {
-            schema: SCHEMA,
-            path: &path,
-            branch: &branch,
-            head: git::run(&path, &["rev-parse", "HEAD"])?.trim().to_string(),
-            backend: spare_backend.as_deref().unwrap_or(choice.backend.name()),
-            spare: spare_backend.is_some(),
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            warming,
-        };
-        println!(
-            "{}",
-            serde_json::to_string(&report)
-                .map_err(|err| Error::klon(format!("serialize the report: {err}")))?
-        );
-    } else {
-        println!("{}", path.display());
-    }
-    // Step 12: `add <branch> -- <cmd>` is `add` and then `run`. The exit code
-    // of the command becomes the exit code of `add`.
-    if !args.command.is_empty() {
-        return super::run::exec(&path, &args.command);
-    }
-    Ok(())
+    Ok(Spawned {
+        backend: spare_backend
+            .as_deref()
+            .unwrap_or(choice.backend.name())
+            .to_string(),
+        spare: spare_backend.is_some(),
+        duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        path,
+        branch,
+        warming,
+    })
 }
 
 /// Close an open journal entry for this destination (R6, handoff §7). The

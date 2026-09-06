@@ -93,14 +93,14 @@ The table is the product shape from the handoff. The status column says what wor
 | `gh klon rm (<branch> \| --path <p>) [--merged] [--delete-branch] [--force]` | Same as `git worktree remove`. Deletes the branch only with `--merged` or `--delete-branch`. Async delete. Refuses a dirty tree or a tree with live processes without `--force`. | done |
 | `gh klon prune` | Same as `git worktree prune`, plus journal cleanup. | done |
 | `gh klon pr <branch>` | `gh pr create` from that tree. | done |
-| `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | partial: only `sync <branch> --check` works; the other forms land with C14 |
+| `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check] [--force] [--json]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | done. `--json` prints one document per klon, one per line. |
 | `gh klon merge <branch>` | Fetch, `pre_merge` hook, structured merge, fast-forward base, remove. Never pushes. | planned for v0.2 |
 | `gh klon check <branch>` | v0.2. Run `[proof] steps` at a clean HEAD and record a receipt. | planned for v0.2 |
 | `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
 | `gh klon shell <branch>` | An interactive shell inside the envelope. | done on Linux; macOS gets its fence and scope in v0.4 |
 | `gh klon stop <branch>` | Kill the whole process tree of that klon. | done |
-| `gh klon up` | In golden: fetch, `merge --ff-only`, approved `[warm] steps`, then a new spare. | partial: the fetch and the `[warm] steps` work; the spare lands with C9 |
+| `gh klon up [--no-spare] [--json]` | In golden: fetch, `merge --ff-only`, approved `[warm] steps`, then a new spare. | done. It refuses a dirty golden, a golden off `base`, and a golden that diverged from the remote. |
 | `gh klon hibernate <branch>` / `wake <branch>` | Stash the diff to `refs/klon/<name>` and delete the folder. `wake` is `add` plus apply. | planned |
 | `gh klon init [--volume <size>] [--undo]` | One time. Make golden a btrfs subvolume, or create a sudo-free btrfs loop volume. Prints the plan and waits for `y`. `--undo` reverses it. | done |
 | `gh klon doctor [--json] [--repair]` | Backend, git version, fence ABI, cgroup delegation, inotify limits, make and ninja versions, pasta, journal repair. | done. The row list grows as chunks land. |
