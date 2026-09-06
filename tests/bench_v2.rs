@@ -287,7 +287,6 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
     let klon = klon_record(&report);
     assert_eq!(klon["metric"], "M5");
     let bytes = klon["unique_bytes"].as_u64().expect("unique_bytes");
-    assert!(bytes > 0, "an idle klon holds bytes of its own");
     let method = klon["method"].as_str().expect("a method");
     assert!(
         ["btrfs-fi-du", "upper-bound"].contains(&method),
@@ -307,9 +306,14 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
             "btrfs must give the exact figure; check that btrfs-progs is on PATH \
              and that btrfs filesystem du runs without privileges here"
         );
-        // On btrfs a klon shares its extents with golden, so its exclusive
-        // figure may sit far below the baseline's. Which way the two fall is
-        // the answer of the cell, not a rule the test may impose.
+        // The M5 claim itself: a klon shares its extents with golden and a
+        // plain worktree writes its own. A klon that shares everything holds
+        // zero exclusive bytes, which is the answer, not a missing reading.
+        assert!(
+            bytes <= base_bytes,
+            "a klon must not hold more exclusive bytes than a fresh worktree: \
+             {bytes} against {base_bytes}"
+        );
     } else {
         assert_eq!(
             method, "upper-bound",
@@ -317,6 +321,7 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
         );
         // A plain copy shares nothing: the klon carries golden's ignored state
         // and the baseline worktree carries none of it.
+        assert!(bytes > 0, "an idle klon holds bytes of its own");
         assert!(
             bytes > base_bytes,
             "the klon holds the warm state: {bytes} against {base_bytes}"
