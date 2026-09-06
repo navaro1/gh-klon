@@ -132,7 +132,9 @@ fn part(ip: &str, ports: &[u16], fenced: Option<FencedExec>) -> Part {
         }
         if let Some((stub, upstreams)) = fenced.dns {
             wrapper.push("--dns-rescue".to_string());
-            wrapper.push(stub.to_string());
+            // The stub rides with its port: `--dns-rescue` takes a socket
+            // address, and a resolv.conf nameserver is a bare address.
+            wrapper.push(format!("{stub}:53"));
             wrapper.push("--dns-upstream".to_string());
             // One argv word with a comma list: the same compactness keeps the
             // wrapper short, and clap splits it on the commas.
@@ -327,7 +329,7 @@ mod tests {
             &words[start..start + 4],
             &[
                 "--dns-rescue".to_string(),
-                "127.0.0.53".to_string(),
+                "127.0.0.53:53".to_string(),
                 "--dns-upstream".to_string(),
                 "10.206.0.2,10.206.0.3".to_string(),
             ]

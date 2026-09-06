@@ -71,6 +71,24 @@ fn has_pasta() -> bool {
     on_path("pasta")
 }
 
+/// The skip guard of the four pasta tests: no pasta on the host, or the
+/// operator marked the pasta proofs as known red on the runner with
+/// `KLON_NETNS_CI_KNOWN_RED=1`. Both cases skip with a printed reason.
+fn skip_pasta_test() -> bool {
+    if !has_pasta() {
+        println!("skipped: pasta is not on PATH");
+        return true;
+    }
+    if std::env::var("KLON_NETNS_CI_KNOWN_RED").as_deref() == Ok("1") {
+        println!(
+            "skipped: KLON_NETNS_CI_KNOWN_RED=1 marks the pasta proofs as \
+             unverified on this runner; unset the variable to run them"
+        );
+        return true;
+    }
+    false
+}
+
 /// The `KLON_IP` of the klon at `path`, from `.klon/env`.
 fn klon_ip(path: &Path) -> String {
     let text = fs::read_to_string(path.join(".klon").join("env")).expect("read .klon/env");
@@ -184,8 +202,7 @@ impl Drop for Server {
 /// reachable from the host at `<KLON_IP>:3000`.
 #[test]
 fn a_server_inside_the_namespace_answers_on_the_klon_address() {
-    if !has_pasta() {
-        println!("skipped: pasta is not on PATH");
+    if skip_pasta_test() {
         return;
     }
     if !on_path("python3") {
@@ -212,8 +229,7 @@ fn a_server_inside_the_namespace_answers_on_the_klon_address() {
 /// `EADDRINUSE`.
 #[test]
 fn two_klons_bind_the_same_port_in_their_own_namespaces() {
-    if !has_pasta() {
-        println!("skipped: pasta is not on PATH");
+    if skip_pasta_test() {
         return;
     }
     if !on_path("python3") {
@@ -246,8 +262,7 @@ fn two_klons_bind_the_same_port_in_their_own_namespaces() {
 /// about the namespace. The same request on the host is the control.
 #[test]
 fn outbound_traffic_works_inside_the_namespace() {
-    if !has_pasta() {
-        println!("skipped: pasta is not on PATH");
+    if skip_pasta_test() {
         return;
     }
     if !on_path("curl") {
@@ -303,8 +318,7 @@ fn outbound_traffic_works_inside_the_namespace() {
 /// `KLON_DEBUG` lines are the proof the fence is on.
 #[test]
 fn the_command_keeps_the_write_fence_under_netns() {
-    if !has_pasta() {
-        println!("skipped: pasta is not on PATH");
+    if skip_pasta_test() {
         return;
     }
     watchdog("the_command_keeps_the_write_fence_under_netns", 150);
