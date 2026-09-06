@@ -1,0 +1,107 @@
+# The gh klon benchmark manifest, version 1 (spec R14, handoff section 8).
+#
+# The manifest fixes everything about a run before the run starts: the fixture
+# seed and shape, the cells, the run counts, the timer points, and the pass
+# rule. `gh klon bench` embeds this file at build time, so a binary always
+# carries the manifest it was built with. `fixture_hash` in the report is a
+# hash of `seed` and of every profile below. Two results are comparable only
+# when their `fixture_hash` values match.
+#
+# Edit this file to change the benchmark. Do not edit it to make a number look
+# better: a changed seed or shape gives a new hash, and the report says so.
+
+version = 1
+
+# The seed of every fixture. It fixes the file bytes and the commit dates, so
+# two hosts that build one profile get the same repository.
+seed = 20260905
+
+[runs]
+# A development run. Enough samples for a p50 and a rough p95.
+warm = 10
+cold = 5
+# A release claim. `--release` selects these two counts.
+release_warm = 30
+release_cold = 10
+# The `git status` calls after the first one, per M4 sample. They feed the
+# `steady_samples_ms` series.
+steady_calls = 3
+
+# --- Fixture profiles ---------------------------------------------------------
+#
+# A profile is one generated repository: `tracked_files` files spread over
+# `dirs` directories, `ignored_files` files of `ignored_file_bytes` bytes each
+# in the ignored `build/` directory, and a `feature` branch that changes
+# `changed_files` tracked files and adds `added_files` new ones.
+
+# 10k tracked files and 250 MB of ignored build state.
+[profiles.p10k]
+tracked_files = 10000
+dirs = 100
+ignored_files = 2500
+ignored_file_bytes = 100000
+changed_files = 20
+added_files = 2
+
+# 100k tracked files and 2 GB of ignored build state. Only a run with
+# `KLON_FIXTURE=100k` builds this profile.
+[profiles.p100k]
+tracked_files = 100000
+dirs = 1000
+ignored_files = 20000
+ignored_file_bytes = 100000
+changed_files = 20
+added_files = 2
+
+# --- Cells --------------------------------------------------------------------
+#
+# Every cell runs twice: once for the backend that klon probes on this host and
+# once for the `git worktree add` baseline. The two records carry one cell name
+# and differ in `backend`.
+#
+# `timer` names the timer points. `process` means that the sample starts just
+# before klon spawns the child and stops when the child has exited, so the
+# number is the latency that a user waits for. The rest of a sample is outside
+# the timer: the fixture build, the tree that a sample needs before the
+# measured command, the teardown, and the correctness check.
+
+[[cells]]
+name = "m1-add-10k"
+metric = "M1"
+profile = "p10k"
+action = "add"
+timer = "process: gh klon add, or git worktree add, from spawn to exit"
+# M1: spawn to an editable tree, p50 of 1 s or less in v0.
+pass_p50_ms = 1000
+
+[[cells]]
+name = "m1-add-100k"
+metric = "M1"
+profile = "p100k"
+action = "add"
+timer = "process: gh klon add, or git worktree add, from spawn to exit"
+pass_p50_ms = 1000
+requires_fixture = "100k"
+
+[[cells]]
+name = "m4-status-100k"
+metric = "M4"
+profile = "p100k"
+action = "status"
+timer = "process: git status --porcelain in the new tree, from spawn to exit"
+# M4: the first call in a fresh klon takes 500 ms or less; a later call 150 ms
+# or less.
+pass_p50_ms = 500
+pass_steady_p50_ms = 150
+requires_fixture = "100k"
+
+[[cells]]
+name = "m6-rm-100k"
+metric = "M6"
+profile = "p100k"
+action = "rm"
+timer = "process: gh klon rm --path, or git worktree remove --force, from spawn to exit"
+# M6: the command returns in 100 ms or less. The delete finishes in the
+# background.
+pass_p50_ms = 100
+requires_fixture = "100k"

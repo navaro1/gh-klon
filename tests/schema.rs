@@ -4,8 +4,9 @@
 
 mod common;
 
-use common::{klon, stderr, stdout, Fixture};
+use common::{klon, klon_env, stderr, stdout, Fixture};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 
 const SEED: u64 = 42;
 
@@ -23,6 +24,8 @@ enum Ty {
     StrOrNull,
     /// A number that is null when the value does not apply.
     NumOrNull,
+    /// A boolean that is null when the value does not apply.
+    BoolOrNull,
 }
 
 type Fields = &'static [(&'static str, Ty)];
@@ -92,6 +95,87 @@ const DOCTOR_JOURNAL_ROW: Fields = &[
     ("started", Ty::Str),
 ];
 
+const BENCH: Fields = &[
+    ("schema", Ty::Str),
+    ("timestamp", Ty::Str),
+    ("release", Ty::Bool),
+    ("smoke", Ty::Bool),
+    ("manifest", Ty::Obj),
+    ("environment", Ty::Obj),
+    ("records", Ty::Arr),
+    ("skipped", Ty::Arr),
+];
+
+const BENCH_MANIFEST: Fields = &[
+    ("version", Ty::Num),
+    ("path", Ty::Str),
+    ("seed", Ty::Num),
+    ("warm_runs", Ty::Num),
+    ("cold_runs", Ty::Num),
+];
+
+const BENCH_ENVIRONMENT: Fields = &[
+    ("hostname", Ty::Str),
+    ("cpu_model", Ty::Str),
+    ("cpu_cores", Ty::Num),
+    ("memory_total_kb", Ty::Num),
+    ("os", Ty::Str),
+    ("kernel", Ty::Str),
+    ("arch", Ty::Str),
+    ("bench_dir", Ty::Str),
+    ("filesystem", Ty::Str),
+    ("mount_options", Ty::Str),
+    ("git_version", Ty::Str),
+    ("klon_version", Ty::Str),
+    ("klon_commit", Ty::Str),
+    ("fixture_hash", Ty::Str),
+    ("order_seed", Ty::Num),
+    ("drop_caches", Ty::Str),
+];
+
+const BENCH_RECORD: Fields = &[
+    ("cell", Ty::Str),
+    ("metric", Ty::Str),
+    ("profile", Ty::Str),
+    ("profile_shape", Ty::Obj),
+    ("backend", Ty::Str),
+    // C9 sets `spare` when a hot spare served the add.
+    ("spare", Ty::Bool),
+    ("cold", Ty::Bool),
+    ("cache_drop", Ty::Str),
+    ("timer", Ty::Str),
+    ("runs", Ty::Num),
+    ("order", Ty::Arr),
+    ("samples_ms", Ty::Arr),
+    ("p50_ms", Ty::Num),
+    ("p95_ms", Ty::Num),
+    // The M4 cell alone reports the first and the steady series.
+    ("first_p50_ms", Ty::NumOrNull),
+    ("steady_p50_ms", Ty::NumOrNull),
+    ("steady_samples_ms", Ty::Arr),
+    ("correctness", Ty::Obj),
+    ("timing_valid", Ty::Bool),
+    ("pass_p50_ms", Ty::Num),
+    ("pass_steady_p50_ms", Ty::NumOrNull),
+    // Null for the baseline, which the klon budget does not bind.
+    ("pass", Ty::BoolOrNull),
+];
+
+const BENCH_PROFILE_SHAPE: Fields = &[
+    ("tracked_files", Ty::Num),
+    ("dirs", Ty::Num),
+    ("ignored_files", Ty::Num),
+    ("ignored_file_bytes", Ty::Num),
+    ("changed_files", Ty::Num),
+    ("added_files", Ty::Num),
+];
+
+const BENCH_CORRECTNESS: Fields = &[
+    ("matched", Ty::Bool),
+    ("ignored_manifest", Ty::Str),
+    ("status", Ty::Str),
+];
+
 const DOCTOR_REPAIR_ROW: Fields = &[
     ("name", Ty::Str),
     ("state", Ty::Str),
@@ -110,6 +194,7 @@ fn matches(value: &Value, ty: Ty) -> bool {
         Ty::Arr => value.is_array(),
         Ty::StrOrNull => value.is_string() || value.is_null(),
         Ty::NumOrNull => value.is_number() || value.is_null(),
+        Ty::BoolOrNull => value.is_boolean() || value.is_null(),
     }
 }
 
@@ -242,6 +327,39 @@ fn a_repair_row_matches_the_documented_schema() {
         doctor["journal"].as_array().unwrap().is_empty(),
         "the repair must close the entry"
     );
+}
+
+/// `bench --json` (C8). The run uses the smoke profiles and three samples, so
+/// it takes seconds; the document shape is the same as a full run's.
+#[test]
+fn the_bench_report_matches_its_documented_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("cwd");
+    let fixtures = tmp.path().join("fixtures");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let out = klon_env(
+        &cwd,
+        &[
+            ("KLON_BENCH_SMOKE", OsStr::new("1")),
+            ("KLON_BENCH_RUNS", OsStr::new("3")),
+            ("KLON_BENCH_DIR", fixtures.as_os_str()),
+        ],
+        &["bench", "--cell", "m1-add-10k", "--json"],
+    );
+    assert!(out.status.success(), "bench failed: {}", stderr(&out));
+    let bench = parse(&stdout(&out));
+    check_ok(&bench, BENCH);
+    assert_eq!(bench["schema"], "klon.bench/1");
+    check_ok(&bench["manifest"], BENCH_MANIFEST);
+    check_ok(&bench["environment"], BENCH_ENVIRONMENT);
+    check_rows(&bench, "records", BENCH_RECORD);
+    let records = bench["records"].as_array().expect("an array");
+    assert_eq!(records.len(), 2, "the klon record and the baseline record");
+    for record in records {
+        check_ok(&record["profile_shape"], BENCH_PROFILE_SHAPE);
+        check_ok(&record["correctness"], BENCH_CORRECTNESS);
+    }
 }
 
 // --- The checker itself ------------------------------------------------------

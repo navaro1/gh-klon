@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+build = "build.rs"
 description = "A git worktree replacement that spawns a warm copy of a project for each coding agent"
 repository = "https://github.com/navaro1/gh-klon"
 
