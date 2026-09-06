@@ -197,9 +197,12 @@ requires_fixture = "100k"
 # together cost exactly six times one builder alone; 0.80 allows a quarter of
 # the time to contention.
 #
-# `crates` is above the token count on purpose. A solo build must already fill
-# the pool, or the six-way run would beat it for free and the ratio would say
-# nothing about contention.
+# `crates` is well above the token count on purpose. A solo build must already
+# fill the pool, or the six-way run would beat it for free and the ratio would
+# say nothing about contention. A count near the pool size is not enough: 24
+# crates over 18 tokens take two rounds where the ideal is 1.33, and that
+# rounding alone lifts the ratio by half. Many small crates keep the rounding
+# below a tenth of a round.
 #
 # The golden of this cell is cold: every builder compiles the whole workspace.
 # Each klon build runs under `gh klon run`, so the jobserver, the resource
@@ -210,8 +213,8 @@ metric = "M12"
 profile = "p10k"
 action = "throughput"
 fixture = "rust"
-crates = 24
-functions = 200
+crates = 48
+functions = 150
 builders = 6
 timer = "wall: from the first build start to the last build finish of the concurrent builders"
 pass_p50_ms = 300000

@@ -744,6 +744,10 @@ fn warm_sample(fixture: &Fixture, tool: Tool, path: &Path) -> Result<Sample> {
     let kind = fixture.kind();
     let started = Instant::now();
     let mut child = create_command(tool, golden, path, fixture::BRANCH)
+        // The poll, not the report, ends this timer. The `add --json` document
+        // would otherwise land on the stdout of `bench --json`, which promises
+        // one document. Its stderr still reaches the terminal.
+        .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(Error::io("start the measured add"))?;
     let mut warm: Option<f64> = None;

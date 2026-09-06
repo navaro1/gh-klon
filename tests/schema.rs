@@ -26,6 +26,8 @@ enum Ty {
     NumOrNull,
     /// A boolean that is null when the value does not apply.
     BoolOrNull,
+    /// An object that is null when the value does not apply.
+    ObjOrNull,
 }
 
 type Fields = &'static [(&'static str, Ty)];
@@ -190,6 +192,10 @@ const BENCH_RECORD: Fields = &[
     ("metric", Ty::Str),
     ("profile", Ty::Str),
     ("profile_shape", Ty::Obj),
+    // C31: which repository the record measured, and the ecosystem shape
+    // behind a `rust` record.
+    ("fixture", Ty::Str),
+    ("fixture_shape", Ty::ObjOrNull),
     ("backend", Ty::Str),
     // C9 sets `spare` when a hot spare served the add.
     ("spare", Ty::Bool),
@@ -205,10 +211,27 @@ const BENCH_RECORD: Fields = &[
     ("first_p50_ms", Ty::NumOrNull),
     ("steady_p50_ms", Ty::NumOrNull),
     ("steady_samples_ms", Ty::Arr),
+    // C31: the M2 cell alone says whether the tree reached the warm state.
+    ("warm_reached", Ty::BoolOrNull),
+    // C31: the M3 cell alone counts the units a first build compiled.
+    ("units_compiled", Ty::NumOrNull),
+    // C31: the M5 cell alone reports the bytes and how it measured them.
+    ("unique_bytes", Ty::NumOrNull),
+    ("method", Ty::StrOrNull),
+    // C31: the M12 cell alone reports the throughput ratio and its parts.
+    ("ratio", Ty::NumOrNull),
+    ("t_solo_ms", Ty::NumOrNull),
+    ("t_wall6_ms", Ty::NumOrNull),
+    ("per_klon_ms", Ty::Arr),
+    ("builders", Ty::NumOrNull),
+    ("tokens", Ty::NumOrNull),
     ("correctness", Ty::Obj),
     ("timing_valid", Ty::Bool),
     ("pass_p50_ms", Ty::Num),
     ("pass_steady_p50_ms", Ty::NumOrNull),
+    // C31: the M3 and the M12 budgets.
+    ("pass_units_compiled", Ty::NumOrNull),
+    ("pass_ratio", Ty::NumOrNull),
     // Null for the baseline, which the klon budget does not bind.
     ("pass", Ty::BoolOrNull),
 ];
@@ -228,7 +251,12 @@ const BENCH_CORRECTNESS: Fields = &[
     ("tracked", Ty::Str),
     ("status", Ty::Str),
     ("removal", Ty::Str),
+    // C31: whether every measured build exited 0.
+    ("build", Ty::Str),
 ];
+
+/// The ecosystem shape of a `rust` record (C31).
+const BENCH_FIXTURE_SHAPE: Fields = &[("crates", Ty::Num), ("functions", Ty::Num)];
 
 const DOCTOR_REPAIR_ROW: Fields = &[
     ("name", Ty::Str),
@@ -249,6 +277,7 @@ fn matches(value: &Value, ty: Ty) -> bool {
         Ty::StrOrNull => value.is_string() || value.is_null(),
         Ty::NumOrNull => value.is_number() || value.is_null(),
         Ty::BoolOrNull => value.is_boolean() || value.is_null(),
+        Ty::ObjOrNull => value.is_object() || value.is_null(),
     }
 }
 
@@ -468,6 +497,51 @@ fn the_bench_report_matches_its_documented_schema() {
     for record in records {
         check_ok(&record["profile_shape"], BENCH_PROFILE_SHAPE);
         check_ok(&record["correctness"], BENCH_CORRECTNESS);
+        assert_eq!(record["fixture"], "synthetic");
+        assert_eq!(
+            record["fixture_shape"],
+            Value::Null,
+            "a synthetic record has no ecosystem shape"
+        );
+    }
+}
+
+/// A v2 cell keeps the same document shape and fills the ecosystem fields
+/// (C31). The rust cell is the one that carries `fixture_shape`; it is skipped
+/// with a reason on a host without cargo.
+#[test]
+fn a_bench_v2_record_matches_its_documented_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("cwd");
+    let fixtures = tmp.path().join("fixtures");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let out = klon_env(
+        &cwd,
+        &[
+            ("KLON_BENCH_SMOKE", OsStr::new("1")),
+            ("KLON_BENCH_RUNS", OsStr::new("1")),
+            ("KLON_BENCH_DIR", fixtures.as_os_str()),
+        ],
+        &["bench", "--cell", "m3-zero-compile-rust", "--json"],
+    );
+    assert!(out.status.success(), "bench failed: {}", stderr(&out));
+    let bench = parse(&stdout(&out));
+    check_ok(&bench, BENCH);
+    let skipped = bench["skipped"].as_array().expect("an array");
+    if !skipped.is_empty() {
+        println!("skipped: {}", skipped[0]["reason"]);
+        return;
+    }
+    check_rows(&bench, "records", BENCH_RECORD);
+    let records = bench["records"].as_array().expect("an array");
+    assert_eq!(records.len(), 2, "the klon record and the baseline record");
+    for record in records {
+        check_ok(&record["profile_shape"], BENCH_PROFILE_SHAPE);
+        check_ok(&record["fixture_shape"], BENCH_FIXTURE_SHAPE);
+        check_ok(&record["correctness"], BENCH_CORRECTNESS);
+        assert_eq!(record["fixture"], "rust");
+        assert!(record["units_compiled"].is_number(), "a build cell counts");
     }
 }
 
