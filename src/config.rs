@@ -75,6 +75,10 @@ pub struct Fence {
 pub struct CopySection {
     /// Directory name to command: the command runs inside the klon instead of a copy.
     pub reinstall: Option<BTreeMap<String, String>>,
+    /// The size above which a top-level ignored directory moves to the
+    /// background warm process, as a byte count or a suffixed size such as
+    /// `"1M"`. The default is `DEFAULT_INLINE_LIMIT`.
+    pub inline_limit: Option<String>,
 }
 
 /// The `[fixup]` table: gitignore-syntax globs that the path fixup pass leaves
@@ -145,7 +149,7 @@ const KNOWN_TABLES: &[(&str, &[&str])] = &[
     ("warm", &["steps"]),
     ("proof", &["steps"]),
     ("fence", &["allow"]),
-    ("copy", &["reinstall"]),
+    ("copy", &["reinstall", "inline_limit"]),
     ("fixup", &["skip"]),
     ("hardlink", &["paths"]),
 ];
@@ -398,6 +402,57 @@ fn write_approvals(approvals: &Approvals) -> Result<()> {
         text.push_str(&format!("[[approval]]\nhash = \"{}\"\n", approval.hash));
     }
     fs::write(&file, text).map_err(Error::io(format!("write {}", file.display())))
+}
+
+/// The default `[copy] inline_limit`: 64 MiB. A top-level ignored directory
+/// above it goes to the background warm process, so `add` returns before the
+/// big copy finishes (R36).
+pub const DEFAULT_INLINE_LIMIT: u64 = 64 * 1024 * 1024;
+
+impl CopySection {
+    /// The `inline_limit` in bytes. An unreadable value draws one warning line
+    /// and takes the default, because a size is a preference, not a rule.
+    pub fn inline_limit(&self) -> u64 {
+        let Some(text) = self.inline_limit.as_deref() else {
+            return DEFAULT_INLINE_LIMIT;
+        };
+        match parse_size(text) {
+            Some(bytes) => bytes,
+            None => {
+                eprintln!(
+                    "klon: .klon.toml: [copy] inline_limit {text} is not a size; using {DEFAULT_INLINE_LIMIT} bytes"
+                );
+                DEFAULT_INLINE_LIMIT
+            }
+        }
+    }
+}
+
+/// Read `12`, `64K`, `1M`, or `2G` as a byte count. The suffix is binary, as
+/// every other size in klon is, and the case does not matter. A trailing `B`
+/// is accepted, so `1MB` and `1M` agree.
+pub fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let body = lower.strip_suffix('b').unwrap_or(&lower);
+    let (digits, scale) = match body.strip_suffix(['k', 'm', 'g', 't']) {
+        Some(digits) => {
+            let unit = body.as_bytes()[body.len() - 1];
+            let power = match unit {
+                b'k' => 1,
+                b'm' => 2,
+                b'g' => 3,
+                _ => 4,
+            };
+            (digits, 1024u64.checked_pow(power)?)
+        }
+        None => (body, 1),
+    };
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 /// Lower-case hexadecimal. The config hash and the radar cache key share it.

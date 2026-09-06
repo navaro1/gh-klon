@@ -109,6 +109,27 @@ pub fn spawn_background_delete(target: &Path) -> Result<()> {
 /// Start a detached `gh-klon <args>` at the lowest disk and cpu priority. The
 /// binary is this process, so the child runs the same klon.
 pub fn spawn_detached_klon(args: &[&OsStr], job: &str) -> Result<()> {
+    spawn_detached_klon_with(args, job, Detached::default())
+}
+
+/// How a detached klon process differs from the plain one. The background warm
+/// needs all three fields (C12, R36): the klon as its working directory, so
+/// the live-process scan of `rm` finds it; a log file, because a detached
+/// process has no terminal to report to; and the klon's `stop` tags, so `stop`
+/// can end it (R22).
+#[derive(Default)]
+pub struct Detached<'a> {
+    /// The working directory of the child. None keeps this process's own.
+    pub cwd: Option<&'a Path>,
+    /// The file that takes the child's stderr. None sends it to `/dev/null`.
+    pub log: Option<std::fs::File>,
+    /// Variables the child carries on top of this process's environment.
+    pub env: Vec<(String, String)>,
+}
+
+/// `spawn_detached_klon` with a working directory, a log file, and extra
+/// variables.
+pub fn spawn_detached_klon_with(args: &[&OsStr], job: &str, setup: Detached) -> Result<()> {
     let exe = std::env::current_exe().map_err(Error::io("find the klon binary"))?;
     let mut words: Vec<&OsStr> = low_priority_prefix(job)
         .into_iter()
@@ -116,7 +137,26 @@ pub fn spawn_detached_klon(args: &[&OsStr], job: &str) -> Result<()> {
         .collect();
     words.push(exe.as_os_str());
     words.extend_from_slice(args);
-    spawn_detached(&words).map_err(Error::io(format!("start the {job}")))
+    let (program, rest) = words.split_first().expect("a program word");
+    let mut command = Command::new(program);
+    command
+        .args(rest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(match setup.log {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        });
+    if let Some(cwd) = setup.cwd {
+        command.current_dir(cwd);
+    }
+    for (key, value) in setup.env {
+        command.env(key, value);
+    }
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(Error::io(format!("start the {job}")))
 }
 
 /// True when an executable `name` sits in a PATH directory.

@@ -15,3 +15,4 @@ pub mod spare_build;
 pub mod stop;
 pub mod sync;
 pub mod up;
+pub mod warm;

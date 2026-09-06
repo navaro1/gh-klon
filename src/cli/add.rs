@@ -2,11 +2,11 @@
 //! the `add` transaction from handoff §4. The probed backend fills the working
 //! directory (C5).
 
-use crate::backend::{self, Backend, Exclusions};
+use crate::backend::{self, copy, Backend, Exclusions};
 use crate::branch;
 use crate::envelope::{env, slots};
 use crate::journal::{self, State};
-use crate::{config, fixup, git, paths, repair, spare, Error, Result};
+use crate::{config, fixup, git, paths, repair, space, spare, warm, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -99,6 +99,10 @@ struct Report<'a> {
     /// True when the hot spare served this `add` (C9).
     spare: bool,
     duration_ms: u64,
+    /// The ignored directories that a detached warm process still owes the
+    /// klon (C12). It is empty for every backend but `copy`, for a klon whose
+    /// ignored directories all fitted inline, and for a klon the spare served.
+    warming: Vec<String>,
 }
 
 /// What `fill` may take from the hot spare (C9).
@@ -112,7 +116,7 @@ struct SparePolicy<'a> {
 /// Directories inside golden where a klon may live.
 const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
 
-pub fn run(args: Args, json: bool) -> Result<()> {
+pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     // The wrapped command owns stdout, so its output and the report would share
     // one stream and no reader could parse the result as one document. The
     // refusal comes before every repository change.
@@ -194,6 +198,53 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let choice = backend::select(&golden, &common, Some(&path), args.backend.as_deref())?;
     steps.mark("resolve-and-probe");
 
+    // The clone leaves out `.git`, the destination, and every other registered
+    // worktree. The set is built here, before the first change, because the
+    // free-space estimate and the copy plan both read it (R36, R41).
+    let others = worktrees
+        .iter()
+        .map(|w| paths::absolute(&w.path))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|p| p != &golden);
+    let mut exclude = Exclusions::new(&golden, others.chain(std::iter::once(path.clone())));
+
+    // R41: one walk of golden answers how many bytes the backend will write.
+    // A backend that shares blocks answers 0 without a walk, so only a byte
+    // copy pays for this. klon refuses here, before git registers anything, so
+    // a full filesystem leaves no half-made klon behind.
+    let estimate = choice.backend.estimate_bytes(&golden, &exclude);
+    space::check(&path, estimate)?;
+
+    // R36: the big ignored directories go to a detached warm process, and a
+    // `[copy] reinstall` command replaces the copy of its directory. The plan
+    // is empty for every backend but `copy`. The approval gate runs before the
+    // first change, like every other refusal.
+    let plan = warm::plan(&golden, &exclude, &config, choice.backend.name())?;
+    if plan
+        .iter()
+        .any(|step| matches!(step.action, warm::Action::Reinstall { .. }))
+    {
+        config.ensure_approved(yes, &["copy.reinstall"])?;
+    }
+    if choice.backend.name() == "copy" {
+        // R41: the progress line counts the inline part only, so it ends at
+        // the total it announced. The survey is the memoized one the estimate
+        // above already walked, so golden is walked once.
+        let survey = copy::survey(&golden, &exclude);
+        let inline = plan.iter().fold(survey.total, |left, step| {
+            match survey.dirs.get(&step.dir) {
+                Some(sizes) => left.without(*sizes),
+                None => left,
+            }
+        });
+        copy::arm_progress(inline, json);
+    }
+    for step in &plan {
+        exclude.add_exact(golden.join(&step.dir));
+    }
+    steps.mark("plan");
+
     // Step 0: the journal entry precedes the first repository change.
     let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&branch))?;
 
@@ -221,7 +272,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let result = fill(
         &golden,
         &common,
-        &worktrees,
+        &exclude,
         &path,
         &branch,
         choice.backend.as_ref(),
@@ -234,6 +285,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         &mut record,
         &mut steps,
     );
+    copy::finish_progress();
     if result.is_err() && cleanup(&golden, &path) {
         // The rollback finished, so the entry has no work left either.
         record.close()?;
@@ -249,6 +301,16 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         steps.mark("spare-start");
     }
 
+    // Step 8b: the klon is ready and unlocked, so the big ignored directories
+    // can fill behind it. `list` reports `warming` until the last one lands.
+    // A spare already holds every one of them, so it leaves nothing to warm.
+    let warming = match spare_backend.is_some() {
+        true => Vec::new(),
+        false => warm::start(&golden, &path, plan, args.no_fixup),
+    };
+    hint_volume(&common, choice.backend.name());
+    steps.mark("warm-start");
+
     if json {
         let report = Report {
             schema: SCHEMA,
@@ -258,6 +320,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             backend: spare_backend.as_deref().unwrap_or(choice.backend.name()),
             spare: spare_backend.is_some(),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            warming,
         };
         println!(
             "{}",
@@ -400,7 +463,7 @@ fn refuse_checked_out(worktrees: &[git::Worktree], branch: &str) -> Result<()> {
 fn fill(
     golden: &Path,
     common: &Path,
-    worktrees: &[git::Worktree],
+    exclude: &Exclusions,
     path: &Path,
     branch: &str,
     backend: &dyn Backend,
@@ -424,14 +487,9 @@ fn fill(
     };
     let used_spare = spare_backend.is_some();
     if !used_spare {
-        let others = worktrees
-            .iter()
-            .map(|w| paths::absolute(&w.path))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|p| p != golden);
-        let exclude = Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
-        backend.clone(golden, path, &exclude)?;
+        // The set leaves out `.git`, the destination, every registered
+        // worktree, and the directories the warm process will bring (R36).
+        backend.clone(golden, path, exclude)?;
     }
     steps.mark(if used_spare { "claim" } else { "clone" });
 
@@ -558,24 +616,61 @@ fn read_admin_dir(path: &Path) -> Result<PathBuf> {
         .ok_or_else(|| Error::klon(format!("unexpected .git file in {}", path.display())))
 }
 
-/// Step 3: append `/.klon/` to `<common>/info/exclude` once.
+/// Step 3: append klon's own two paths to `<common>/info/exclude` once.
+///
+/// `/.klon/` hides the envelope. `/*.klon-warming/` hides the staging
+/// directory of the warm process (C12): without it a klon would read dirty
+/// while a big ignored directory fills, and `git clean` would delete the
+/// half-finished copy.
 fn exclude_klon_dir(common: &Path) -> Result<()> {
+    const LINES: &[&str] = &["/.klon/", "/*.klon-warming/"];
     let file = common.join("info").join("exclude");
     let mut current = match fs::read(&file) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(err) => return Err(Error::io("read info/exclude")(err)),
     };
-    if current
-        .split(|b| *b == b'\n')
-        .any(|line| line == b"/.klon/" || line == b"/.klon/\r")
-    {
+    let missing: Vec<&str> = LINES
+        .iter()
+        .copied()
+        .filter(|line| {
+            !current
+                .split(|b| *b == b'\n')
+                .any(|have| have == line.as_bytes() || have == format!("{line}\r").as_bytes())
+        })
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(common.join("info")).map_err(Error::io("create info/"))?;
     if !current.is_empty() && !current.ends_with(b"\n") {
         current.push(b'\n');
     }
-    current.extend_from_slice(b"/.klon/\n");
+    for line in missing {
+        current.extend_from_slice(line.as_bytes());
+        current.push(b'\n');
+    }
     fs::write(&file, current).map_err(Error::io("write info/exclude"))
+}
+
+/// Print the volume hint once per repository (R13).
+///
+/// On ext4 without a volume the `copy` backend takes 40 to 100 seconds for a
+/// big tree, and `gh klon init --volume` turns that into milliseconds. The
+/// line is worth saying once and tiresome after that, so a marker file under
+/// the common directory records the print. macOS has no btrfs volume, so the
+/// line never appears there.
+fn hint_volume(common: &Path, backend: &str) {
+    if !cfg!(target_os = "linux") || backend != "copy" {
+        return;
+    }
+    let dir = common.join("klon");
+    let marker = dir.join("hint-volume");
+    if marker.exists() {
+        return;
+    }
+    // A failed write only costs the repeat of one line, so the hint still
+    // reaches the person who needs it.
+    let _ = fs::create_dir_all(&dir).and_then(|()| fs::write(&marker, b"printed\n"));
+    eprintln!("klon: run gh klon init --volume for instant spawns");
 }

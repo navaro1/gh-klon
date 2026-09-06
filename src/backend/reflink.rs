@@ -58,6 +58,12 @@ impl Backend for Reflink {
         }
     }
 
+    /// `FICLONE` shares the blocks of every file it clones, so the copy writes
+    /// metadata only and the free-space guard has nothing to weigh (R41).
+    fn estimate_bytes(&self, _golden: &Path, _excludes: &Exclusions) -> u64 {
+        0
+    }
+
     /// `FICLONE` shares blocks, so both files must live on one filesystem.
     fn same_filesystem_only(&self) -> bool {
         true

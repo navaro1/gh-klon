@@ -16,9 +16,11 @@ mod probe;
 mod process;
 mod radar;
 mod repair;
+mod space;
 mod spare;
 mod time;
 mod volume;
+mod warm;
 
 use clap::{Parser, Subcommand};
 use std::fmt;
@@ -126,6 +128,10 @@ enum Command {
     /// detached; a user never needs it.
     #[command(hide = true)]
     SpareBuild(cli::spare_build::Args),
+    /// Finish a klon's big ignored directories. `add` starts it detached
+    /// (C12); a person never types it.
+    #[command(hide = true)]
+    Warm(cli::warm::Args),
 }
 
 fn main() -> ExitCode {
@@ -144,16 +150,19 @@ fn main() -> ExitCode {
                 | Command::Run(_)
                 | Command::Shell(_)
                 | Command::SpareBuild(_)
+                | Command::Warm(_)
         )
     {
         eprintln!(
             "{}",
-            Error::klon("--json is not available for up, prune, pr, run, shell, and spare-build")
+            Error::klon(
+                "--json is not available for up, prune, pr, run, shell, spare-build, and warm",
+            )
         );
         return ExitCode::from(1);
     }
     let result = match command {
-        Command::Add(args) => cli::add::run(args, json),
+        Command::Add(args) => cli::add::run(args, yes, json),
         Command::Up => cli::up::run(yes),
         Command::Rm(args) => cli::rm::run(args, json),
         Command::Prune => cli::prune::run(),
@@ -167,6 +176,7 @@ fn main() -> ExitCode {
         Command::Stop(args) => cli::stop::run(args, json),
         Command::Bench(args) => cli::bench::run(args, json),
         Command::SpareBuild(args) => cli::spare_build::run(args),
+        Command::Warm(args) => cli::warm::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

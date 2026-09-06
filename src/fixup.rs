@@ -31,6 +31,7 @@ use crate::{git, Error, Result};
 use grep_matcher::{Match, Matcher, NoCaptures, NoError};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -76,14 +77,45 @@ pub struct Summary {
 /// `add` calls this after `git clean`, so every remaining untracked entry is an
 /// ignored one. A destination that equals golden is a no-op.
 pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
+    let roots = ignored_roots(klon)?;
+    run_roots(golden, klon, config, &roots, None)
+}
+
+/// Rewrite golden's path inside one staged directory that the warm process is
+/// about to rename into place (C12).
+///
+/// `staging` is the directory as it sits now, `landed` the path it carries
+/// after the rename. The rewrite writes the landed path, and the log lines and
+/// the `[fixup] skip` globs use the landed name, so the staging suffix reaches
+/// neither.
+pub fn run_dir(
+    golden: &Path,
+    klon: &Path,
+    config: &Config,
+    staging: &Path,
+    landed: &Path,
+) -> Result<Summary> {
+    let roots = vec![staging.to_path_buf()];
+    let alias = Some((staging.to_path_buf(), landed.to_path_buf()));
+    run_roots(golden, klon, config, &roots, alias)
+}
+
+/// One pass over the given roots. `alias` maps a staging prefix to the name a
+/// directory will carry, for the log and the skip globs.
+fn run_roots(
+    golden: &Path,
+    klon: &Path,
+    config: &Config,
+    roots: &[PathBuf],
+    alias: Option<(PathBuf, PathBuf)>,
+) -> Result<Summary> {
     if golden == klon {
         return Ok(Summary::default());
     }
-    let roots = ignored_roots(klon)?;
     let Some((first, rest)) = roots.split_first() else {
         return Ok(Summary::default());
     };
-    let pass = Pass::new(golden, klon, config)?;
+    let pass = Pass::new(golden, klon, config, alias)?;
     let found = Shared::default();
     pass.walk(first, rest, &found);
 
@@ -203,10 +235,19 @@ struct Pass {
     klon: PathBuf,
     /// The `[fixup] skip` globs, compiled against the klon root.
     skip: ignore::gitignore::Gitignore,
+    /// A staging prefix and the name it becomes after the warm rename (C12).
+    /// `relative` maps the first to the second, so a `.klon-warming` suffix
+    /// never reaches a log line or a skip glob.
+    alias: Option<(PathBuf, PathBuf)>,
 }
 
 impl Pass {
-    fn new(golden: &Path, klon: &Path, config: &Config) -> Result<Pass> {
+    fn new(
+        golden: &Path,
+        klon: &Path,
+        config: &Config,
+        alias: Option<(PathBuf, PathBuf)>,
+    ) -> Result<Pass> {
         let needle = utf8(golden)?.to_string();
         let replacement = utf8(klon)?.to_string();
         let mut builder = ignore::gitignore::GitignoreBuilder::new(klon);
@@ -225,6 +266,7 @@ impl Pass {
             replacement,
             klon: klon.to_path_buf(),
             skip,
+            alias,
         })
     }
 
@@ -411,9 +453,19 @@ impl Pass {
     }
 
     /// The path of `entry` relative to the klon, for the log and the messages.
+    /// A staged warm directory reports the name it will carry after its
+    /// rename, not the staging name it holds now.
     fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.klon)
-            .unwrap_or(path)
+        let landed = match &self.alias {
+            Some((staging, landed)) => match path.strip_prefix(staging) {
+                Ok(rest) => Cow::Owned(landed.join(rest)),
+                Err(_) => Cow::Borrowed(path),
+            },
+            None => Cow::Borrowed(path),
+        };
+        landed
+            .strip_prefix(&self.klon)
+            .unwrap_or(&landed)
             .to_string_lossy()
             .into_owned()
     }
@@ -457,6 +509,15 @@ fn ignored_roots(klon: &Path) -> Result<Vec<PathBuf>> {
         let name = Path::new(std::ffi::OsStr::from_bytes(name));
         // klon's own state, including the log this pass writes.
         if name.starts_with(".klon") {
+            continue;
+        }
+        // A staging directory of the warm process (C12). Its own pass runs
+        // inside that process, before the rename that gives it its real name.
+        if name
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(crate::warm::STAGING_SUFFIX.as_bytes())
+        {
             continue;
         }
         roots.push(klon.join(name));

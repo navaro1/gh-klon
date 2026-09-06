@@ -39,6 +39,9 @@ const ADD: Fields = &[
     // C9: true when the hot spare served the add.
     ("spare", Ty::Bool),
     ("duration_ms", Ty::Num),
+    // The C12 warm list. It is empty for every backend but `copy` and for a
+    // klon whose ignored directories all fitted inline.
+    ("warming", Ty::Arr),
 ];
 
 const LIST: Fields = &[("schema", Ty::Str), ("klons", Ty::Arr)];
@@ -60,6 +63,8 @@ const LIST_ROW: Fields = &[
     ("rss_bytes", Ty::Num),
     ("pr", Ty::NumOrNull),
     ("checks", Ty::StrOrNull),
+    // The C12 warm list: the directories a detached warm process still owes.
+    ("warming", Ty::Arr),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -422,6 +427,7 @@ fn an_added_field_passes() {
         "backend": "copy",
         "spare": false,
         "duration_ms": 12,
+        "warming": [],
         "extra": true,
     });
     check_ok(&doc, ADD);
@@ -442,6 +448,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "rss_bytes": 0,
         "pr": 7,
         "checks": "pass",
+        "warming": [],
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
@@ -463,6 +470,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "rss_bytes": 0,
         "pr": Value::Null,
         "checks": Value::Null,
+        "warming": [],
         "vs_base": "-",
         "vs_siblings": "-",
         "behind": Value::Null,
@@ -482,6 +490,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "rss_bytes": 0,
         "pr": 7,
         "checks": "pass",
+        "warming": [],
         "vs_base": Value::Null,
         "vs_siblings": "clean",
         "behind": 0,
@@ -523,6 +532,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "rss_bytes": 0,
         "pr": 7,
         "checks": "pass",
+        "warming": [],
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
