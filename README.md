@@ -58,6 +58,7 @@ git                         2.34.1
 filesystem                  ext4
 backend                     copy: reflink unsupported
 btrfs-progs                 absent: btrfs is not on PATH
+cgroup.controllers          present: memory pids
 inotify.max_user_instances  present: 128
 inotify.max_user_watches    present: 65536
 loopback                    present: 127.0.0.2 accepts a bind
@@ -66,7 +67,9 @@ ninja                       absent: ninja is not on PATH
 pasta                       absent: pasta is not on PATH
 radar                       present: legacy merge-tree
 reflink                     absent: reflink unsupported: EOPNOTSUPP
+scope                       present: systemd 249 scope: MemoryHigh=63966M TasksMax=4096
 slots                       present: no address in use
+systemd-run                 present: systemd 249 (249.11-0ubuntu3.22)
 journal: no open entry
 ```
 
@@ -207,8 +210,8 @@ gh klon doctor              # the host report and the open entries
 gh klon doctor --repair     # close every open entry, one printed line per action
 ```
 
-`doctor` reports the git version, the filesystem of golden, `btrfs-progs`, the two
-inotify limits, `make`, `ninja`, and `pasta`. Each host feature reports `present`,
+`doctor` reports the git version, the filesystem of golden, the selected backend,
+and one row per host feature. Each host feature reports `present`,
 `absent`, or `broken` with a reason. A feature that this host does not have never
 stops a command.
 
