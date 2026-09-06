@@ -8,7 +8,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+// Only the `stop` tests wait for a process tree, and those need `/proc`.
+#[cfg(target_os = "linux")]
+use std::process::Child;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use common::{git_ok, klon, stderr, stdout, Fixture, BIN};
@@ -60,6 +64,7 @@ fn env_of(klon_path: &Path) -> BTreeMap<String, String> {
 }
 
 /// Poll `cond` until it holds or the timeout passes.
+#[cfg(target_os = "linux")]
 fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -115,8 +120,10 @@ fn processes_tagged(tag: &str) -> Vec<u32> {
 }
 
 /// Kill a spawned `run` when the test ends, whatever the outcome.
+#[cfg(target_os = "linux")]
 struct Reaper(Child);
 
+#[cfg(target_os = "linux")]
 impl Drop for Reaper {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -133,6 +140,7 @@ fn on_path(program: &str) -> bool {
 /// A branch name that no other test and no other build on this host shares.
 /// The branch name becomes `KLON_ID`, and the `stop` tests scan the whole
 /// process table, so a shared name would let two parallel runs see each other.
+#[cfg(target_os = "linux")]
 fn unique(tag: &str) -> String {
     format!("{tag}-{}", std::process::id())
 }
