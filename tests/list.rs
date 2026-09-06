@@ -57,10 +57,12 @@ fn list_shows_every_klon_with_a_dirty_flag() {
             .to_string()
     };
     // C30 puts the five extras columns between the head and the radar columns:
-    // disk, RSS, live processes, PR, checks. The klons idle, so the disk column
-    // bounds the ignored-directory size and every other extra shows `-`. Neither
-    // klon touches a file the other touches, so the radar reads `clean`.
-    let extras = |path: &Path| format!("| ≤ {} B | - | 0 | - | -", ignored_bytes(path));
+    // disk, RSS, live processes, PR, checks. C12 adds the warm column after
+    // them. The klons idle, so the disk column bounds the ignored-directory
+    // size and every other extra shows `-`; the ignored directory is small, so
+    // the clone copied it inline and nothing is warming. Neither klon touches a
+    // file the other touches, so the radar reads `clean`.
+    let extras = |path: &Path| format!("| ≤ {} B | - | 0 | - | - | -", ignored_bytes(path));
     const RADAR: &str = "| clean | clean | behind 0";
     assert_eq!(
         stdout(&out).trim(),
