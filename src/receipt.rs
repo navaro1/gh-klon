@@ -261,6 +261,11 @@ fn branch_was_checked(common: &Path, branch: &str) -> bool {
 /// receipt is written once and never changed, so its mtime is the time it was
 /// made. `prune` calls this; a failure costs one stderr line, never the
 /// command, because a stale receipt harms nobody.
+///
+/// The sweep takes an aged `.tmp` file too. `write` leaves one behind when a
+/// signal ends `check` between the write and the rename, and nothing else ever
+/// removes it. A `.tmp` file of a run that is still going is minutes old, not
+/// a month, so the same age limit keeps the sweep off a live write.
 pub fn prune(common: &Path, max_age: Duration) -> usize {
     let dir = dir(common);
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -270,7 +275,10 @@ pub fn prune(common: &Path, max_age: Duration) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "json") {
+        let ours = path
+            .extension()
+            .is_some_and(|ext| ext == "json" || ext == "tmp");
+        if !ours {
             continue;
         }
         let old = entry

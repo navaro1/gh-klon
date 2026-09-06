@@ -5,7 +5,8 @@
 //! commit and nothing ever replaces an old one. Each file is a few hundred
 //! bytes, so klon keeps a month of them (`receipt::MAX_AGE`) and drops the
 //! rest here. The age comes from the file's own timestamp: a receipt is
-//! written once and never changed, so its mtime is the time it was made.
+//! written once and never changed, so its mtime is the time it was made. The
+//! sweep also takes a temporary file that a killed `check` left behind.
 
 use crate::git;
 use crate::paths;

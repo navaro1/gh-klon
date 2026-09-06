@@ -455,9 +455,15 @@ fn prune_removes_a_receipt_older_than_thirty_days() {
     filetime::set_file_mtime(&old, long_ago).expect("age the old receipt");
     assert_eq!(receipt_files(&fx).len(), 2);
 
+    // A temporary file that a killed `check` left behind, aged the same way.
+    let orphan = receipts(&fx).join(".deadbeef.999.tmp");
+    fs::write(&orphan, "{}").expect("write the orphan");
+    filetime::set_file_mtime(&orphan, long_ago).expect("age the orphan");
+
     let out = klon(&fx.golden, &["prune"]);
     assert!(out.status.success(), "prune failed: {}", stderr(&out));
     let left = receipt_files(&fx);
     assert_eq!(left.len(), 1, "prune keeps the fresh receipt only");
     assert!(!old.exists(), "prune removes the aged receipt");
+    assert!(!orphan.exists(), "prune removes the aged temporary file");
 }
