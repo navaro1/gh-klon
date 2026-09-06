@@ -257,6 +257,11 @@ fn allow_set(
     for device in ["/dev/null", "/dev/shm", "/dev/tty", "/dev/ptmx", "/dev/pts"] {
         push(PathBuf::from(device), device.to_string(), false);
     }
+    // pasta (C23) opens `/dev/net/tun` read-write to build the tap device of
+    // the namespace. Without write access the open dies with EACCES and pasta
+    // exits, so the rule rides with the `/proc` one: no repository path lives
+    // under `/dev`, and the device keeps its own file permissions.
+    push(PathBuf::from("/dev/net/tun"), "/dev/net/tun".into(), false);
     // pasta (C23) runs inside the fence and writes `/proc/self/uid_map` to
     // set up its user namespace. The rule must cover all of `/proc`, because
     // Landlock pins directory inodes when klon adds the rule: `/proc/self`

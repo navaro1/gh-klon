@@ -47,6 +47,18 @@ fn tail(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
+/// End the whole test binary after `secs`. A pasta that dies before it hands
+/// the command its start signal can leave `run` waiting forever, and one hang
+/// would burn the whole job timeout. The watchdog turns a hang into a fast
+/// failure with the pasta error already in the log.
+fn watchdog(test: &'static str, secs: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(secs));
+        eprintln!("watchdog: {test} made no progress for {secs}s; ending the run");
+        std::process::exit(101);
+    });
+}
+
 /// True when `program` sits in a PATH directory.
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
@@ -180,6 +192,10 @@ fn a_server_inside_the_namespace_answers_on_the_klon_address() {
         println!("skipped: python3 is not on PATH");
         return;
     }
+    watchdog(
+        "a_server_inside_the_namespace_answers_on_the_klon_address",
+        150,
+    );
     let fx = fixture();
     add(&fx, "feature");
     let ip = klon_ip(&fx.klon_path("feature"));
@@ -204,6 +220,7 @@ fn two_klons_bind_the_same_port_in_their_own_namespaces() {
         println!("skipped: python3 is not on PATH");
         return;
     }
+    watchdog("two_klons_bind_the_same_port_in_their_own_namespaces", 150);
     let fx = fixture();
     git_ok(&fx.golden, &["branch", "feature2", "main"]);
     add(&fx, "feature");
@@ -252,6 +269,7 @@ fn outbound_traffic_works_inside_the_namespace() {
         println!("skipped: the host has no outbound network to example.com");
         return;
     }
+    watchdog("outbound_traffic_works_inside_the_namespace", 150);
     let fx = fixture();
     add(&fx, "feature");
     let _ports = hold_ports();
@@ -287,6 +305,7 @@ fn pasta_starts_under_the_write_fence() {
         println!("skipped: pasta is not on PATH");
         return;
     }
+    watchdog("pasta_starts_under_the_write_fence", 150);
     let fx = fixture();
     add(&fx, "feature");
     let _ports = hold_ports();
