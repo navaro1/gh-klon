@@ -356,28 +356,44 @@ fn restore(
     // volume content survives this line and the next one clears it.
     fs::remove_file(old).map_err(Error::io(format!("delete {}", old.display())))?;
     empty_the_volume(record);
+    // Every klon that lived on the volume is gone now, and git still lists it.
+    git::run_quiet(&record.golden_old, &["worktree", "prune"]);
     detach(record);
     Ok(())
 }
 
-/// Remove golden's copy from the volume.
+/// Clear the volume: golden's copy, every klon beside it, and the trash.
+///
+/// One image carries one repository, so everything below `<mount>/klon`
+/// belongs to the golden that just moved off. The seeded `klon/` directory
+/// itself stays: the mount root belongs to `root`, and that one directory is
+/// what makes the volume writable at all (S1 §6).
 ///
 /// The delete runs in the foreground, unlike every other klon delete: the
-/// unmount below must wait for it, and a detached process would race it.
+/// unmount below has to wait for it, and a detached process would race it.
 /// `remove_dir_all` removes a subvolume too, because the kernel lets an
 /// unprivileged user `rmdir` an empty one (S1 §8), and `btrfs subvolume
-/// delete` needs root that klon never takes.
+/// delete` needs the root that klon never takes.
 fn empty_the_volume(record: &Volume) {
-    if !record.golden_new.exists() {
+    let work = volume::work_dir(&record.mount);
+    let Ok(entries) = fs::read_dir(&work) else {
         return;
-    }
-    let removed = backend::make_removable(&record.golden_new).and_then(|()| {
-        fs::remove_dir_all(&record.golden_new)
-            .map_err(Error::io(format!("delete {}", record.golden_new.display())))
-    });
-    if let Err(err) = removed {
-        eprintln!("klon: {err}");
-        eprintln!("klon: the volume keeps golden's old copy; the image holds it");
+    };
+    for item in entries.flatten() {
+        let path = item.path();
+        if let Err(err) = backend::make_removable(&path) {
+            eprintln!("klon: {err}");
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            // A background delete that an earlier `rm` started can be clearing
+            // the same trash copy. A path that is already gone is a success.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!("klon: cannot delete {}: {err}", path.display());
+                eprintln!("klon: the volume keeps that copy; the image holds it");
+            }
+        }
     }
 }
 
@@ -396,7 +412,21 @@ fn detach(record: &Volume) {
             return;
         }
     };
-    if let Err(err) = volume::unmount(&device) {
+    // A background delete that an earlier `rm` started can still hold the
+    // mount. It is a `rm -rf` of a snapshot, which S1 §10 measured at under a
+    // second for 10,000 files, so a short wait covers it.
+    let mut failure = None;
+    for _ in 0..10 {
+        match volume::unmount(&device) {
+            Ok(()) => {
+                failure = None;
+                break;
+            }
+            Err(err) => failure = Some(err),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    if let Some(err) = failure {
         eprintln!("klon: {err}");
         eprintln!(
             "klon: the volume stays mounted; run udisksctl unmount -b {device} when it is idle"
@@ -467,12 +497,17 @@ fn refuse_a_host_that_cannot(golden: &Path, common: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The path of every linked worktree, golden left out. `git worktree repair`
-/// takes the list, and `--undo` names it in its refusal.
+/// The path of every linked worktree that still stands, golden left out.
+/// `git worktree repair` takes the list, and `--undo` names it in its refusal.
+///
+/// A worktree whose directory is gone is dropped: git keeps its admin entry
+/// until the next `prune`, and a stale entry must not block `--undo` and must
+/// not reach `repair`.
 fn linked_worktrees(golden: &Path) -> Result<Vec<String>> {
     Ok(git::worktree_list(golden)?
         .into_iter()
         .skip(1)
+        .filter(|w| w.path.exists())
         .map(|w| w.path.to_string_lossy().into_owned())
         .collect())
 }

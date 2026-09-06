@@ -102,15 +102,7 @@ impl Drop for Sandbox {
             };
             // A background delete inside the volume can hold the mount for a
             // moment, so the unmount gets a few tries before the guard gives up.
-            let mut unmounted = false;
-            for _ in 0..20 {
-                if udisks(&["unmount", "-b", &device]).is_ok() || mount_point(&device).is_none() {
-                    unmounted = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            if !unmounted {
+            if !unmount(&device) {
                 eprintln!("teardown: {device} stays mounted; unmount it by hand");
             }
             if setup_by_caller(&device) {
@@ -183,6 +175,20 @@ fn udisks(args: &[&str]) -> Result<String, String> {
     } else {
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
+}
+
+/// Unmount `device`, with a few tries.
+///
+/// A fresh mount under `/media` wakes the desktop file indexer, and udisks
+/// answers `DeviceBusy` while it reads. klon retries the same way.
+fn unmount(device: &str) -> bool {
+    for _ in 0..20 {
+        if mount_point(device).is_none() || udisks(&["unmount", "-b", device]).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
 }
 
 /// True when `udisksctl info` reports this user in `SetupByUID`. Every other
@@ -591,7 +597,7 @@ fn add_reattaches_a_volume_that_went_down() {
     );
 
     let device = loop_device(&image).expect("the image must carry a loop device");
-    udisks(&["unmount", "-b", &device]).expect("unmount");
+    assert!(unmount(&device), "the volume must go down");
     if setup_by_caller(&device) {
         let _ = udisks(&["loop-delete", "-b", &device]);
     }
@@ -619,7 +625,15 @@ fn add_reattaches_a_volume_that_went_down() {
         loop_device(&image).is_some(),
         "the image must carry a loop device again"
     );
-    assert!(golden_new.is_dir(), "golden must be reachable again");
+    // The mount point can differ from the one the conversion recorded: another
+    // volume with the same label may hold the old path, and udisks then adds a
+    // suffix. klon repoints golden's symlink, so the stable path is the test.
+    let target = fs::read_link(&fx.golden).expect("golden must still be a symlink");
+    assert!(
+        target.is_dir(),
+        "golden's symlink must resolve again: {}",
+        target.display()
+    );
     assert_eq!(git_ok(&fx.golden, &["status", "--porcelain"]), "");
     common::assert_clean(&path_of(&report, "path"));
 }
