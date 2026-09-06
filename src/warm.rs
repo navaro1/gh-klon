@@ -346,7 +346,7 @@ fn rewarm_untracked_cache(klon: &Path) {
     let _ = git::run_env(
         klon,
         &["status", "--porcelain"],
-        &[("GIT_FORCE_UNTRACKED_CACHE", "1")],
+        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
     );
 }
 

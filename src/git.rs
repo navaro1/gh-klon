@@ -16,28 +16,10 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
 /// stdout. The pairs are added to the inherited environment, not a replacement
 /// for it, so the caller keeps `PATH` and the git identity.
 ///
-/// One caller needs this: `add` warms the untracked cache and git 2.34 reads
-/// `GIT_FORCE_UNTRACKED_CACHE` from the environment only (see `src/cli/add.rs`).
-pub fn run_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args);
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let output = command.output().map_err(Error::io("run git"))?;
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
-    } else {
-        Err(Error::Git {
-            code: output.status.code().unwrap_or(1),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-}
-
-/// Run `git -C <cwd> <args>` with extra environment variables and return its
-/// stdout. `hibernate` (C29) needs `GIT_INDEX_FILE`, which git reads from the
-/// environment only: no command line option names a second index.
+/// Two callers need it. `hibernate` (C29) needs `GIT_INDEX_FILE`, which git
+/// reads from the environment only: no command line option names a second
+/// index. `add` (G2) needs `GIT_FORCE_UNTRACKED_CACHE`, which is the only way
+/// to make git 2.34 keep the untracked scan it just made.
 pub fn run_env(cwd: &Path, args: &[&str], envs: &[(&str, &OsStr)]) -> Result<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);

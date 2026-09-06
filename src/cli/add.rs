@@ -8,6 +8,7 @@ use crate::envelope::{env, slots};
 use crate::journal::{self, State};
 use crate::{budget, config, fixup, git, hooks, paths, repair, space, spare, warm, Error, Result};
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -714,7 +715,7 @@ fn fill(
     git::run_env(
         path,
         &["status", "--porcelain"],
-        &[("GIT_FORCE_UNTRACKED_CACHE", "1")],
+        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
     )?;
     steps.mark("status-warm");
     git::run(
