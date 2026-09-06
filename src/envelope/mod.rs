@@ -14,8 +14,18 @@
 //! | `netns` | C23 | a `pasta --config-net` wrapper |
 
 pub mod env;
+#[cfg(target_os = "linux")]
+pub mod fence_linux;
 pub mod scope;
 pub mod slots;
+
+#[cfg(target_os = "linux")]
+pub use fence_linux::Fence;
+/// The macOS fence arrives with C19 as a `sandbox-exec` wrapper. Until then
+/// nothing builds one, and the type only keeps the field on every system.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub struct Fence;
 
 use crate::{Error, Result};
 use std::os::unix::process::CommandExt;
@@ -43,8 +53,10 @@ pub struct Envelope {
     pub vars: Vec<(String, String)>,
     /// C17 fills this.
     pub jobserver: Option<Part>,
-    /// C18 on Linux and C19 on macOS fill this.
-    pub fence: Option<Part>,
+    /// C18 fills this on Linux: a Landlock ruleset that the child applies in
+    /// process, right before the exec. C19 fills it on macOS.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fence: Option<Fence>,
     /// C20 fills this.
     pub scope: Option<Part>,
     /// C23 fills this when `--netns` is given.
@@ -104,10 +116,11 @@ impl Envelope {
     }
 
     /// The parts in the order they wrap the command: the scope holds the
-    /// namespace, the namespace holds the fence, and the fence holds the
-    /// command. The jobserver adds no wrapper on either system.
+    /// namespace, and the namespace holds the command. The Linux fence is not
+    /// a wrapper: the child applies it in process (see `command`). The
+    /// jobserver adds no wrapper on either system.
     fn parts(&self) -> impl Iterator<Item = &Part> {
-        [&self.scope, &self.netns, &self.fence, &self.jobserver]
+        [&self.scope, &self.netns, &self.jobserver]
             .into_iter()
             .flatten()
     }
@@ -142,6 +155,18 @@ impl Envelope {
                 }
                 Ok(())
             });
+        }
+        // The fence is the last step before the exec, so every wrapper and
+        // the command itself run inside it (C18).
+        #[cfg(target_os = "linux")]
+        if let Some(fence) = &self.fence {
+            let step = fence.child_step()?;
+            // SAFETY: the step makes two syscalls and allocates nothing (see
+            // `Fence::child_step`), so it is legal between the fork and the
+            // exec.
+            unsafe {
+                command.pre_exec(step);
+            }
         }
         Ok(command)
     }

@@ -4,7 +4,7 @@
 
 use crate::envelope::{scope, slots};
 use crate::journal::{self, Entry, Op, State};
-use crate::{backend, git, probe, radar, repair, time, Error, Result};
+use crate::{backend, branch, git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,14 +31,16 @@ pub struct Host<'a> {
 /// One probe: a name and the function that answers for it.
 type Probe = fn(&Host) -> probe::Status;
 
-/// The `doctor` rows. C18 adds the fence ABI, C20 the cgroup delegation, and
-/// C17 the jobserver. Each is one line. The selected backend is not a row: it
-/// has its own two fields, because it carries a name and a reason.
+/// The `doctor` rows. C20 adds the cgroup delegation and C17 the jobserver.
+/// Each is one line. The selected backend is not a row: it has its own two
+/// fields, because it carries a name and a reason.
 const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
     ("cgroup.controllers", cgroup_controllers),
+    ("fence.residual", fence_residual),
     ("inotify.max_user_instances", inotify_instances),
     ("inotify.max_user_watches", inotify_watches),
+    ("landlock", landlock_abi),
     ("loopback", loopback),
     ("make", make_version),
     ("ninja", ninja_version),
@@ -361,6 +363,36 @@ fn cgroup_controllers(_host: &Host) -> probe::Status {
 /// The row is `absent` when the host gives klon no memory cap at all.
 fn scope_mechanism(host: &Host) -> probe::Status {
     scope::scope_status(host.common)
+}
+
+/// The Landlock ABI of the kernel (C18). The fence needs ABI 1; ABI 2 adds
+/// the cross-directory rename right and ABI 3 the truncate right. macOS has
+/// no Landlock; C19 brings `sandbox-exec` there.
+fn landlock_abi(_host: &Host) -> probe::Status {
+    #[cfg(target_os = "linux")]
+    {
+        crate::envelope::fence_linux::probe()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        probe::Status::Absent(
+            "Landlock is a Linux feature; the macOS fence arrives with C19".into(),
+        )
+    }
+}
+
+/// What the fence cannot stop (handoff §5): git needs `<common>/refs`, so a
+/// command under `run` can move the base branch. The row names that branch.
+/// `hooks/` and `config` stay read-only, because `<common>` itself is never
+/// in the allow set.
+fn fence_residual(host: &Host) -> probe::Status {
+    match branch::base(host.golden) {
+        Ok(base) => probe::Status::Present(format!(
+            "refs/heads/{base} stays writable under the fence: git needs <common>/refs; \
+             hooks and config stay read-only"
+        )),
+        Err(err) => probe::Status::Broken(err.to_string()),
+    }
 }
 
 fn make_version(_host: &Host) -> probe::Status {

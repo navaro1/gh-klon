@@ -3,8 +3,10 @@
 //!
 //! The command starts in its own session with the klon's environment, its own
 //! `TMPDIR`, its own loopback address, and `gc.auto=0`. It carries `KLON_ID`
-//! and `KLON_DIR`, so `stop` finds the whole tree. The exit code passes back
-//! unchanged, and a signal to `run` passes on to the command.
+//! and `KLON_DIR`, so `stop` finds the whole tree. On Linux it runs inside
+//! the write fence (C18, R17) unless `--no-fence` or `KLON_NO_FENCE=1` says
+//! otherwise. The exit code passes back unchanged, and a signal to `run`
+//! passes on to the command.
 
 use crate::envelope::{scope, Envelope};
 use crate::{git, paths, Error, Result};
@@ -19,14 +21,32 @@ pub struct Args {
     /// The klon path. It must match a registered worktree.
     #[arg(long, conflicts_with = "branch")]
     pub path: Option<PathBuf>,
+    /// Run without the write fence. The command can then write wherever the
+    /// user can, golden included.
+    #[arg(long)]
+    pub no_fence: bool,
     /// The command and its arguments, after `--`.
     #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
     pub command: Vec<String>,
 }
 
+/// What a caller asks of the envelope beyond the parts every command gets.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options {
+    /// Skip the write fence. `KLON_NO_FENCE=1` in the environment does the
+    /// same, for a harness that already runs klon inside a sandbox.
+    pub no_fence: bool,
+}
+
 pub fn run(args: Args) -> Result<()> {
     let klon = resolve(args.branch.as_deref(), args.path.as_deref())?;
-    exec(&klon, &args.command)
+    exec_with(
+        &klon,
+        &args.command,
+        Options {
+            no_fence: args.no_fence,
+        },
+    )
 }
 
 /// The klon directory for a branch or a path. The main worktree is not a klon,
@@ -62,15 +82,28 @@ pub fn resolve(branch: Option<&str>, path: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
-/// Run `argv` inside `klon` under the envelope and pass the exit code back.
-/// A command that fails gives `Error::Exit`, which prints nothing: the command
-/// already reported its own failure on its own stderr.
+/// Run `argv` inside `klon` under the whole envelope and pass the exit code
+/// back. `add -- cmd` and `shell` come through here.
 pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
+    exec_with(klon, argv, Options::default())
+}
+
+/// `exec` with the caller's options. A command that fails gives
+/// `Error::Exit`, which prints nothing: the command already reported its own
+/// failure on its own stderr.
+pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
     let mut envelope = Envelope::load(klon)?;
     // C20: the resource scope is the outermost wrapper, so it holds the whole
     // command tree. The guard removes a cgroup that klon made once the command
     // has left it.
     let _scope = scope::apply(&mut envelope);
+    #[cfg(target_os = "linux")]
+    if fence_wanted(options) {
+        envelope.fence = crate::envelope::fence_linux::build(klon, envelope.var("TMPDIR"))?;
+    }
+    // C19 reads the options on macOS.
+    #[cfg(not(target_os = "linux"))]
+    let _ = options;
     // The child leads a new session, so the terminal never signals it: Ctrl-C
     // and a `kill` of `gh klon run` reach only this process. klon relays each
     // of them to the child's process group, so the whole tree ends with the
@@ -79,7 +112,7 @@ pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
     let mut child = envelope
         .command(argv)?
         .spawn()
-        .map_err(Error::io(format!("run {}", argv.join(" "))))?;
+        .map_err(|err| spawn_error(err, argv, envelope.fence.is_some()))?;
     CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
     let status = child
         .wait()
@@ -89,6 +122,32 @@ pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
         0 => Ok(()),
         code => Err(Error::Exit(code)),
     }
+}
+
+/// The fence is on unless the caller or the environment turns it off.
+#[cfg(target_os = "linux")]
+fn fence_wanted(options: Options) -> bool {
+    if options.no_fence {
+        return false;
+    }
+    !std::env::var_os("KLON_NO_FENCE").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// The error of a failed spawn. Only an errno crosses the fork boundary, so
+/// a failed fence step arrives as a bare code; `run` names the fence when the
+/// code is one that `execve` never gives, and says how to run without it.
+fn spawn_error(err: std::io::Error, argv: &[String], fenced: bool) -> Error {
+    let context = format!("run {}", argv.join(" "));
+    #[cfg(target_os = "linux")]
+    if fenced && crate::envelope::fence_linux::is_fence_errno(&err) {
+        return Error::klon(format!(
+            "{context}: the write fence did not apply ({err}); \
+             pass --no-fence or set KLON_NO_FENCE=1 to run without it"
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = fenced;
+    Error::io(context)(err)
 }
 
 /// The process group of the running child, or 0 when none runs. The child
