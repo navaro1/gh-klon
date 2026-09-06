@@ -217,7 +217,7 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
                 &common,
                 &config,
                 &worktrees,
-                &claimed_names(&args),
+                likely_branch(&args).as_deref(),
                 args.evict,
             )? {
                 true => git::worktree_list(&cwd)?,
@@ -435,28 +435,30 @@ pub fn add_at(branch: &str, path: &Path, yes: bool) -> Result<Spawned> {
     )
 }
 
-/// The branch names this `add` may claim, read from the arguments before the
-/// branch form resolves and possibly creates one.
+/// The branch this `add` will claim, read from the arguments alone, before the
+/// branch form resolves and possibly creates one. None when the form gives no
+/// certain answer: `--issue` names a branch klon builds from the issue title,
+/// and that is always a new one.
 ///
-/// The budget must not offer a klon of such a branch as its eviction candidate.
-/// `add --evict <branch>` would otherwise hibernate the very klon it is about
-/// to replace: the register list would then show the branch free and the path
-/// empty, `add` would build a fresh klon over it, and the saved work would be
-/// hidden behind a path that `wake` can no longer fill.
+/// The budget (C29) needs the name for two rules. It must not offer the klon of
+/// that branch as an eviction candidate, and it must not evict at all when that
+/// branch is already checked out, because the `add` then ends a few steps later
+/// and a klon hibernated in between would be a klon lost for nothing.
 ///
-/// The list is a superset. `worktree-<raw>` belongs to `--path-mode claude`
-/// only, and an extra name costs nothing but one klon that keeps its place in
-/// the pool for this call.
-fn claimed_names(args: &Args) -> Vec<String> {
-    let mut names = Vec::new();
-    if let Some(raw) = &args.branch {
-        names.push(raw.clone());
-        names.push(format!("worktree-{raw}"));
-    }
+/// The answer is exact, never a guess, because the budget refuses on it. Every
+/// form here resolves to this name: `branch::resolve` takes a local branch
+/// under its own name, and an `origin/<name>` argument under `<name>`. A form
+/// this function does not know gives None, and `refuse_checked_out` after the
+/// branch form still catches it.
+fn likely_branch(args: &Args) -> Option<String> {
     if let Some(n) = args.pr {
-        names.push(format!("pr/{n}"));
+        return Some(format!("pr/{n}"));
     }
-    names
+    let raw = args.branch.as_deref()?;
+    match args.path_mode {
+        Some(config::PathMode::Claude) => Some(format!("worktree-{raw}")),
+        _ => Some(raw.strip_prefix("origin/").unwrap_or(raw).to_string()),
+    }
 }
 
 /// Close an open journal entry for this destination (R6, handoff §7). The

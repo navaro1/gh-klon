@@ -25,6 +25,18 @@ fn worktree_list(golden: &Path) -> String {
     git_ok(golden, &["worktree", "list", "--porcelain"])
 }
 
+/// Poll `cond` until it holds or the timeout passes.
+fn wait_until(mut cond: impl FnMut() -> bool, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cond()
+}
+
 /// `<common>/klon/journal`: an entry here after a command means the command
 /// left a transaction open.
 fn journal_entries(golden: &Path) -> Vec<String> {
@@ -401,5 +413,253 @@ fn a_budget_that_is_not_a_size_fails_the_add() {
     assert!(
         !fx.default_klon_path().exists(),
         "a refused add must create nothing"
+    );
+}
+
+// --- Review regressions ------------------------------------------------------
+
+/// The stat cache must never decide what `hibernate` saves. `add` sets
+/// `core.checkStat=minimal`, which compares only the size and the whole seconds
+/// of the modification time, so an edit of the same length under the same stamp
+/// reads as clean. The bytes must still reach the work commit, because the
+/// removal that follows deletes the only other copy of them.
+#[test]
+fn an_edit_that_the_stat_cache_hides_still_survives() {
+    let fx = Fixture::generate(SEED, 40, 4, 4, 0);
+    let klon_path = add_feature(&fx);
+    let file = klon_path.join(fx.tracked_rel(2));
+    let before = fs::read(&file).unwrap();
+
+    // The same length, and the modification time that the index recorded.
+    let mut changed = before.clone();
+    changed[0] = b'X';
+    assert_eq!(changed.len(), before.len(), "the edit must keep the size");
+    assert_ne!(changed, before, "the edit must change the bytes");
+    let stamp = fs::metadata(&file).unwrap().modified().unwrap();
+    fs::write(&file, &changed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(stamp)
+        .unwrap();
+
+    // git itself now reports the klon clean, which is the whole point.
+    assert_eq!(
+        git_ok(&klon_path, &["status", "--porcelain"]),
+        "",
+        "the test needs an edit that the minimal stat check hides"
+    );
+
+    let out = klon(&fx.golden, &["hibernate", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+    let out = klon(&fx.golden, &["wake", "feature"]);
+    assert!(out.status.success(), "wake failed: {}", stderr(&out));
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        changed,
+        "the hidden edit must survive the round trip"
+    );
+}
+
+/// `add --evict <branch>` must never hibernate the klon of `<branch>` itself.
+/// The eviction would free the branch and the path, `add` would build a fresh
+/// klon over them, and the work the eviction just saved would sit behind a path
+/// that `wake` can no longer fill.
+#[test]
+fn evict_never_takes_the_klon_that_the_add_asks_for() {
+    let (fx, old, _recent) = budget_fixture(None);
+    let old_path = fx.klon_path(old.to_str().unwrap());
+    fs::write(old_path.join("keep-me.txt"), "work in progress\n").unwrap();
+
+    let out = klon_env(
+        &fx.golden,
+        &[("KLON_TEST_KLON_BYTES", OsStr::new(SIX_HUNDRED_MB))],
+        &["add", "--evict", "old"],
+    );
+    assert!(!out.status.success(), "add --evict old must fail");
+    assert!(
+        old_path.join("keep-me.txt").exists(),
+        "the klon of the requested branch must stay: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        metadata_bytes(&fx.golden),
+        0,
+        "nothing may be hibernated: {}",
+        stderr(&out)
+    );
+}
+
+/// A hibernated branch owns its path. A plain `add` of it would build a second
+/// klon there and hide the saved work, so it refuses and names `wake`.
+#[test]
+fn add_refuses_a_hibernated_branch() {
+    let fx = Fixture::generate(SEED, 40, 4, 4, 0);
+    let klon_path = add_feature(&fx);
+    fs::write(klon_path.join("keep-me.txt"), "work in progress\n").unwrap();
+    let out = klon(&fx.golden, &["hibernate", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(
+        !out.status.success(),
+        "add of a hibernated branch must fail"
+    );
+    assert!(
+        stderr(&out).contains("hibernated") && stderr(&out).contains("wake"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(!klon_path.exists(), "a refused add must create nothing");
+
+    // The work is still reachable through wake.
+    let out = klon(&fx.golden, &["wake", "feature"]);
+    assert!(out.status.success(), "wake failed: {}", stderr(&out));
+    assert_eq!(
+        fs::read_to_string(klon_path.join("keep-me.txt")).unwrap(),
+        "work in progress\n"
+    );
+}
+
+/// The saved tree is a whole tree, not a patch. A branch that advanced while
+/// the klon slept would lose those commits in the working directory, so `wake`
+/// refuses before it changes anything and names the way back.
+#[test]
+fn wake_refuses_a_branch_that_moved_while_it_slept() {
+    let fx = Fixture::generate(SEED, 40, 4, 4, 0);
+    let klon_path = add_feature(&fx);
+    fs::write(klon_path.join("keep-me.txt"), "work in progress\n").unwrap();
+    let out = klon(&fx.golden, &["hibernate", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+
+    // Another worktree moves the branch while the klon sleeps.
+    git_ok(&fx.golden, &["branch", "-f", "feature", "main"]);
+
+    let out = klon(&fx.golden, &["wake", "feature"]);
+    assert!(!out.status.success(), "wake of a moved branch must fail");
+    assert!(
+        stderr(&out).contains("moved") && stderr(&out).contains("branch -f"),
+        "stderr must name the way back: {}",
+        stderr(&out)
+    );
+    assert!(!klon_path.exists(), "a refused wake must create nothing");
+    assert!(
+        metadata_bytes(&fx.golden) > 0,
+        "a refused wake must keep the record and the ref"
+    );
+}
+
+/// The `wake` journal entry must not share a file with the entry of the `add`
+/// it runs, so `doctor --repair` can still name a `wake` that stopped.
+#[test]
+fn a_killed_wake_leaves_an_entry_that_the_repair_can_close() {
+    let fx = Fixture::generate(SEED, 40, 4, 4, 0);
+    let klon_path = add_feature(&fx);
+    fs::write(klon_path.join("keep-me.txt"), "work in progress\n").unwrap();
+    let out = klon(&fx.golden, &["hibernate", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+
+    // Stop the wake inside its own `add`, after the clone landed.
+    let mut child = Command::new(common::BIN)
+        .args(["wake", "feature"])
+        .current_dir(&fx.golden)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KLON_SPARE", "0")
+        .env("KLON_TEST_PAUSE_AT", "cloned")
+        .spawn()
+        .expect("spawn wake");
+    let paused = wait_until(
+        || {
+            journal_entries(&fx.golden)
+                .iter()
+                .any(|name| name.starts_with("wake-"))
+        },
+        std::time::Duration::from_secs(30),
+    );
+    child.kill().expect("kill wake");
+    child.wait().expect("reap wake");
+    assert!(paused, "the wake must write a journal entry of its own");
+
+    let out = klon(&fx.golden, &["doctor", "--repair"]);
+    assert!(
+        out.status.success(),
+        "doctor --repair failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        journal_entries(&fx.golden).is_empty(),
+        "the repair must close every entry: {:?}",
+        journal_entries(&fx.golden)
+    );
+    assert!(!klon_path.exists(), "the half-made klon must be gone");
+
+    // The klon stays hibernated, and a fresh wake still brings the work back.
+    let out = klon(&fx.golden, &["wake", "feature"]);
+    assert!(
+        out.status.success(),
+        "wake after the repair failed: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(klon_path.join("keep-me.txt")).unwrap(),
+        "work in progress\n"
+    );
+}
+
+/// A `hibernate` that stopped before the rename must roll back whole: the
+/// record and the ref go, and the klon stays where it is.
+#[test]
+fn a_hibernate_killed_before_the_rename_rolls_back() {
+    let fx = Fixture::generate(SEED, 40, 4, 4, 0);
+    let klon_path = add_feature(&fx);
+    fs::write(klon_path.join("keep-me.txt"), "work in progress\n").unwrap();
+
+    let mut child = Command::new(common::BIN)
+        .args(["hibernate", "feature"])
+        .current_dir(&fx.golden)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KLON_SPARE", "0")
+        .env("KLON_TEST_PAUSE_AT", "removing")
+        .spawn()
+        .expect("spawn hibernate");
+    let paused = wait_until(
+        || metadata_bytes(&fx.golden) > 0 && !journal_entries(&fx.golden).is_empty(),
+        std::time::Duration::from_secs(30),
+    );
+    child.kill().expect("kill hibernate");
+    child.wait().expect("reap hibernate");
+    assert!(paused, "the hibernate must reach the removing state");
+    assert!(klon_path.exists(), "the rename must not have run yet");
+
+    let out = klon(&fx.golden, &["doctor", "--repair"]);
+    assert!(
+        out.status.success(),
+        "doctor --repair failed: {}",
+        stderr(&out)
+    );
+    assert!(
+        journal_entries(&fx.golden).is_empty(),
+        "the repair must close every entry"
+    );
+    assert_eq!(
+        metadata_bytes(&fx.golden),
+        0,
+        "the repair must drop the record and the ref"
+    );
+    assert!(klon_path.exists(), "the klon must stay");
+    assert_eq!(
+        fs::read_to_string(klon_path.join("keep-me.txt")).unwrap(),
+        "work in progress\n"
+    );
+
+    // The klon is whole, so a fresh hibernate still works.
+    let out = klon(&fx.golden, &["hibernate", "feature"]);
+    assert!(
+        out.status.success(),
+        "hibernate after the repair failed: {}",
+        stderr(&out)
     );
 }

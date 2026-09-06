@@ -48,7 +48,7 @@ struct Candidate {
 /// Check the budget before `add` changes anything, and evict when asked.
 ///
 /// `worktrees` is the current register list; the first entry is golden. `keep`
-/// names the branches this `add` may claim, which can never be the candidate.
+/// is the branch this `add` will claim, which can never be the candidate.
 /// The answer is true when a klon was hibernated, so the caller reads the list
 /// again. A repository with no `disk_budget` pays one `Option` test.
 pub fn check(
@@ -56,7 +56,7 @@ pub fn check(
     common: &Path,
     config: &config::Config,
     worktrees: &[git::Worktree],
-    keep: &[String],
+    keep: Option<&str>,
     evict: bool,
 ) -> Result<bool> {
     let Some(text) = config.disk_budget.as_deref() else {
@@ -76,6 +76,23 @@ pub fn check(
     };
     if !(evict || hibernate::config_evicts(config)) {
         return Err(refusal(&over, budget, Some(candidate)));
+    }
+    // An `add` that is going to fail must evict nothing. A branch that another
+    // klon already has checked out ends the command a few steps later, and a
+    // klon hibernated in between would be a klon lost for nothing. The refusal
+    // repeats the one that `add` gives there, so the reader sees one message.
+    if let Some(name) = keep {
+        if let Some(held) = worktrees.iter().find(|w| {
+            w.branch
+                .as_deref()
+                .and_then(|b| b.strip_prefix("refs/heads/"))
+                == Some(name)
+        }) {
+            return Err(Error::klon(format!(
+                "branch {name} is already checked out at {}",
+                held.path.display()
+            )));
+        }
     }
     hibernate::refuse_live(&candidate.path)?;
     eprintln!(
@@ -124,7 +141,7 @@ fn refusal(over: &Over, budget: u64, candidate: Option<&Candidate>) -> Error {
 fn measure(
     golden: &Path,
     worktrees: &[git::Worktree],
-    keep: &[String],
+    keep: Option<&str>,
     budget: u64,
 ) -> Result<Option<Over>> {
     let klons: Vec<PathBuf> = worktrees
@@ -267,7 +284,7 @@ fn tree_bytes(path: &Path) -> u64 {
 /// A klon's last use is the newer of two times: its `.klon/env` file, which
 /// `add` writes once, and its index, which every `git` command in the klon
 /// touches. The oldest of those across the klons is the candidate.
-fn least_recently_used(worktrees: &[git::Worktree], keep: &[String]) -> Option<Candidate> {
+fn least_recently_used(worktrees: &[git::Worktree], keep: Option<&str>) -> Option<Candidate> {
     let mut best: Option<(SystemTime, Candidate)> = None;
     for worktree in worktrees.iter().skip(1) {
         let Ok(path) = paths::absolute(&worktree.path) else {
@@ -287,10 +304,7 @@ fn least_recently_used(worktrees: &[git::Worktree], keep: &[String]) -> Option<C
         // very `add` may claim is off the list too: hibernating it would let
         // the `add` build a fresh klon over the same path and hide the work
         // that the hibernation just saved.
-        if keep.iter().any(|name| name == branch)
-            || worktree.locked
-            || process::live_process(&path).is_some()
-        {
+        if keep == Some(branch) || worktree.locked || process::live_process(&path).is_some() {
             continue;
         }
         let used = last_use(&path);

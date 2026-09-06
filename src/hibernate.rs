@@ -301,12 +301,22 @@ fn save(golden: &Path, common: &Path, path: &Path, branch: &str, name: &str) -> 
 /// non-ignored file, and `git write-tree` turns that into one tree. The commit
 /// takes the parent that `git stash create` would take, which is HEAD.
 ///
-/// The temporary index lives in the klon's own admin directory, beside the real
-/// one. A split index names its shared file by base name only, so an index
-/// outside that directory could not resolve it.
+/// The temporary index starts **empty**, and that is the whole safety of this
+/// function. An empty index carries no stat cache, so `git add -A` hashes the
+/// content of every file it walks and cannot call one clean that is not.
 ///
-/// The index is copied first, so `git add -A` keeps the stat cache and rehashes
-/// only the files that changed. A fresh index would rehash the whole tree.
+/// A copy of the klon's index would be faster and wrong. `add` sets
+/// `core.checkStat=minimal`, which compares only the size and the whole seconds
+/// of the modification time, so an edit that keeps the size inside one second
+/// still reads as clean; `git add -A` would skip those bytes, and the removal
+/// that follows would delete the only copy of them. `git add --renormalize`
+/// forces the rehash but drops the untracked files and fails on a tracked file
+/// that the klon deleted, so it does not fit either. The empty index costs one
+/// hash of the source tree, which a command that then deletes that tree can
+/// afford (R28).
+///
+/// The temporary index still lives in the klon's own admin directory, beside
+/// the real one, so it lands on the same filesystem and no other klon shares it.
 ///
 /// The commit carries klon's own identity, not the user's. It is machinery: it
 /// never reaches a branch, a pull request, or a merge, and `wake` deletes it.
@@ -315,18 +325,15 @@ fn save(golden: &Path, common: &Path, path: &Path, branch: &str, name: &str) -> 
 fn work_commit(path: &Path, head: &str, branch: &str) -> Result<String> {
     let admin = admin_dir(path)?;
     let temp = admin.join(format!("klon-hibernate.{}.index", std::process::id()));
+    // A leftover from a killed run would bring its stat cache back.
+    if let Err(err) = fs::remove_file(&temp) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(Error::io(format!("delete {}", temp.display()))(err));
+        }
+    }
     let result = (|| -> Result<String> {
-        fs::copy(admin.join("index"), &temp).map_err(Error::io("copy the index"))?;
         let env: [(&str, &OsStr); 1] = [("GIT_INDEX_FILE", temp.as_os_str())];
-        // `--renormalize` makes git hash every tracked file instead of trusting
-        // the stat cache. `add` sets `core.checkStat=minimal`, which compares
-        // only the size and the whole seconds of the modification time, so an
-        // edit that keeps the size inside one second still looks clean. Without
-        // the rehash `git add -A` would skip those bytes, and the removal that
-        // follows would delete the only copy of them. The pass costs one hash
-        // of the source tree, which a command that then deletes that tree can
-        // afford (R28).
-        git::run_env(path, &["add", "-A", "--renormalize"], &env)?;
+        git::run_env(path, &["add", "-A"], &env)?;
         let tree = git::run_env(path, &["write-tree"], &env)?
             .trim()
             .to_string();
