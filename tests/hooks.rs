@@ -310,6 +310,23 @@ fn doctor_reports_absent_without_the_extension() {
 
 // --- The `[warm] steps` under the envelope ------------------------------------
 
+/// A klon whose env file is gone refuses the command instead of running it
+/// with no envelope. The C22 refactor made the caller name what the root is,
+/// and this is the state the old sniff would have misread as golden.
+#[test]
+fn run_refuses_a_klon_without_an_env_file() {
+    let fx = fixture();
+    let klon_path = add(&fx, "feature");
+    fs::remove_file(klon_path.join(".klon").join("env")).unwrap();
+    let out = klon(&fx.golden, &["run", "feature", "--", "sh", "-c", "exit 0"]);
+    assert!(!out.status.success(), "run accepted a broken klon");
+    assert!(
+        stderr(&out).contains("is missing; the klon predates the envelope"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// `up` runs the approved steps in golden, in order, and reports the count.
 #[test]
 fn up_runs_approved_steps_in_golden() {

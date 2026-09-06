@@ -227,13 +227,13 @@ impl Envelope {
     /// `run`, because `up` needs the same spawn for its warm steps, and C25
     /// (`merge`) will need it for its gate.
     ///
-    /// `root` is a klon when it holds `<root>/.klon/env` and golden
-    /// otherwise, so `up` hands it golden and gets no fence, no klon tags,
-    /// and no envelope variables on top of the jobserver and the scope.
-    pub fn spawn_and_wait(root: &Path, argv: &[String], options: Options) -> Result<ExitStatus> {
-        let mut envelope = match env::file(root).exists() {
-            true => Envelope::load(root)?,
-            false => Envelope::for_golden(root),
+    /// The caller names what `root` is. A klon without its env file refuses
+    /// the spawn: a command that runs there without the envelope would run
+    /// without the fence, and klon never guesses its way into that state.
+    pub fn spawn_and_wait(root: Root<'_>, argv: &[String], options: Options) -> Result<ExitStatus> {
+        let (path, mut envelope) = match root {
+            Root::Klon(klon) => (klon, Envelope::load(klon)?),
+            Root::Golden(golden) => (golden, Envelope::for_golden(golden)),
         };
         // C20: the resource scope is the outermost wrapper, so it holds the
         // whole command tree. The guard removes a cgroup that klon made once
@@ -251,12 +251,23 @@ impl Envelope {
         // before the exec, so the scope wrapper runs inside it too. A cgroup
         // the scope made is joined from inside the child, so the fence opens
         // its `cgroup.procs`.
-        envelope.fence = fence(root, &envelope, options.no_fence, guard.cgroup())?;
+        envelope.fence = fence(path, &envelope, options.no_fence, guard.cgroup())?;
         // The child leads a new session, so the terminal never signals it:
         // Ctrl-C and a `kill` of the wrapper reach only this process. klon
         // relays each of them to the child's process group, so the whole tree
-        // ends with the wrapper instead of outliving it.
-        relay_signals();
+        // ends with the wrapper instead of outliving it. The handlers go
+        // back after the wait: `up` runs one step after another in this
+        // process, and a signal between two steps must end `up`, not fall
+        // into a handler that holds no child.
+        let saved = relay_signals();
+        let outcome = Self::spawn_child(&envelope, argv, options);
+        restore_signals(&saved);
+        outcome
+    }
+
+    /// Build the command, spawn it, and wait. The body of the spawn above
+    /// without the signal setup, so the handlers come back on every path.
+    fn spawn_child(envelope: &Envelope, argv: &[String], options: Options) -> Result<ExitStatus> {
         let mut command = envelope.command(argv)?;
         if let Some(stdout) = options.stdout {
             command.stdout(stdout);
@@ -271,6 +282,20 @@ impl Envelope {
         CHILD.store(0, Ordering::SeqCst);
         Ok(status)
     }
+}
+
+/// What the command runs in. The caller knows, and a wrong guess in either
+/// direction costs a fence: a klon treated as golden runs without one, and
+/// golden treated as a klon would fail its env read anyway.
+pub enum Root<'a> {
+    /// A klon. The spawn needs `<klon>/.klon/env`; a klon without it is
+    /// damaged, and klon refuses instead of running the command without the
+    /// fence and the tags.
+    Klon(&'a Path),
+    /// The main worktree. Golden has no env file, so the command carries no
+    /// klon tags and no envelope variables, and the caller turns the fence
+    /// off through `Options` when golden is the write target.
+    Golden(&'a Path),
 }
 
 /// The fence of this run, or None when the caller or the environment turns
@@ -333,17 +358,32 @@ extern "C" fn relay(signal: libc::c_int) {
     }
 }
 
-/// Install the relay for every signal in `RELAYED`. A signal that arrives
-/// before the spawn finds no child and does nothing; the window is the few
-/// microseconds between the fork and the store above.
-fn relay_signals() {
-    for signal in RELAYED {
-        // The cast goes through a pointer: a direct cast of a function item to
-        // an integer is a clippy error. SAFETY: `relay` is a plain function
-        // with the C signature the call expects, and it touches only an atomic
-        // and `killpg`.
-        let handler = relay as *const () as libc::sighandler_t;
-        unsafe { libc::signal(*signal, handler) };
+/// Install the relay for every signal in `RELAYED` and give the previous
+/// handlers back, so the caller can restore them after the child ends. A
+/// signal that arrives before the spawn finds no child and does nothing; the
+/// window is the few microseconds between the fork and the store above.
+fn relay_signals() -> Vec<(libc::c_int, libc::sighandler_t)> {
+    RELAYED
+        .iter()
+        .map(|&signal| {
+            // The cast goes through a pointer: a direct cast of a function item to
+            // an integer is a clippy error. SAFETY: `relay` is a plain function
+            // with the C signature the call expects, and it touches only an atomic
+            // and `killpg`.
+            let handler = relay as *const () as libc::sighandler_t;
+            let previous = unsafe { libc::signal(signal, handler) };
+            (signal, previous)
+        })
+        .collect()
+}
+
+/// Put the handlers of the caller back. `signal` gave them to us, so they are
+/// valid handler values again.
+fn restore_signals(saved: &[(libc::c_int, libc::sighandler_t)]) {
+    for &(signal, handler) in saved {
+        // SAFETY: every value here came out of `libc::signal`, so it is a
+        // handler the process held before klon replaced it.
+        unsafe { libc::signal(signal, handler) };
     }
 }
 

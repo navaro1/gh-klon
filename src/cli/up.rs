@@ -17,7 +17,7 @@
 //! golden is the write target. Golden has no `.klon/env`, so the step also
 //! carries no klon tag.
 
-use crate::envelope::{Envelope, Options};
+use crate::envelope::{Envelope, Options, Root};
 use crate::{branch, config, git, process, spare, Error, Result};
 use serde::Serialize;
 use std::os::fd::AsFd;
@@ -106,7 +106,7 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
             no_fence: true,
             stdout: step_stdout(json)?,
         };
-        let status = Envelope::spawn_and_wait(&golden, &argv, options)?;
+        let status = Envelope::spawn_and_wait(Root::Golden(&golden), &argv, options)?;
         if !status.success() {
             return Err(Error::klon(format!(
                 "warm step failed ({}): {step}",

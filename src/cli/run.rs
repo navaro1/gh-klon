@@ -11,7 +11,7 @@
 //! C22 moved the composition of the envelope and the spawn into
 //! `Envelope::spawn_and_wait`, which `up` now shares.
 
-use crate::envelope::{exit_code, Envelope, Options};
+use crate::envelope::{exit_code, Envelope, Options, Root};
 use crate::{git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
 /// `Error::Exit`, which prints nothing: the command already reported its own
 /// failure on its own stderr.
 pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
-    let status = Envelope::spawn_and_wait(klon, argv, options)?;
+    let status = Envelope::spawn_and_wait(Root::Klon(klon), argv, options)?;
     match exit_code(&status) {
         0 => Ok(()),
         code => Err(Error::Exit(code)),
