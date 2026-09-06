@@ -6,7 +6,7 @@ use crate::backend::{self, Backend, Exclusions};
 use crate::branch;
 use crate::envelope::{env, slots};
 use crate::journal::{self, State};
-use crate::{config, git, paths, repair, Error, Result};
+use crate::{config, fixup, git, paths, repair, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,10 @@ pub struct Args {
         conflicts_with_all = ["path", "pr", "issue"]
     )]
     pub path_mode: Option<config::PathMode>,
+    /// Skip the path fixup pass over the ignored directories (R15). The klon
+    /// then keeps golden's absolute paths in its build artifacts.
+    #[arg(long)]
+    pub no_fixup: bool,
     /// A command to run in the new klon, after `--`. `add` runs it through
     /// `run` and exits with its exit code.
     #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
@@ -98,6 +102,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         }
         _ => resolve_branch(&golden, &args)?,
     };
+    // One load: the path template and the `[fixup] skip` globs come from the
+    // same file, and a second load would repeat its warning lines.
+    let config = config::load(&golden)?;
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
         None => match args.path_mode {
@@ -107,7 +114,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
                 &branch,
                 &klon_name(&args, &branch),
             )?,
-            None => config::load(&golden)?.resolve_path(&golden, &branch)?,
+            None => config.resolve_path(&golden, &branch)?,
         },
     };
     // Refuse unsupported paths before any repository mutation.
@@ -167,6 +174,8 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         &path,
         &branch,
         choice.backend.as_ref(),
+        &config,
+        args.no_fixup,
         &mut record,
     );
     if result.is_err() && cleanup(&golden, &path) {
@@ -315,6 +324,7 @@ fn refuse_checked_out(worktrees: &[git::Worktree], branch: &str) -> Result<()> {
 }
 
 /// Steps 3 to 10. Runs after git registered the worktree.
+#[allow(clippy::too_many_arguments)]
 fn fill(
     golden: &Path,
     common: &Path,
@@ -322,6 +332,8 @@ fn fill(
     path: &Path,
     branch: &str,
     backend: &dyn Backend,
+    config: &config::Config,
+    no_fixup: bool,
     record: &mut journal::Record,
 ) -> Result<()> {
     let admin_dir = read_admin_dir(path)?;
@@ -377,6 +389,12 @@ fn fill(
     // Steps 8 to 10.
     git::run(path, &["checkout", "-q", "--force", branch])?;
     git::run(path, &["clean", "-fdq"])?;
+    // Step 5b: the ignored directories still name golden. `git clean` ran
+    // first, so every entry that the pass walks is an ignored one (handoff §4).
+    // It runs before the envelope, so the pass never reads the new `.klon/`.
+    if !no_fixup {
+        fixup::run(golden, path, config)?;
+    }
 
     // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
     // `info/exclude`, so the new directory keeps the klon clean for git. It is

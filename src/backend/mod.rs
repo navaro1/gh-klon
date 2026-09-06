@@ -92,9 +92,24 @@ pub trait Backend: Send + Sync {
 const TOP_LEVEL_SKIP: &[&str] = &[".claude/worktrees", ".t3"];
 
 /// Paths that a clone leaves out. Every path is absolute and normalized.
+///
+/// The rules run in this order, and the first answer wins (R39):
+///
+/// | # | Rule | A `.worktreeinclude` line can override it |
+/// |---|---|---|
+/// | 1 | a `.git` entry at any depth | no |
+/// | 2 | the exact set: the destination, every other registered worktree, `.claude/worktrees`, `.t3` | no |
+/// | 3 | a submodule path from `.gitmodules` | no |
+/// | 4 | a `.klonignore` match | yes |
+///
+/// Rules 1 to 3 protect the clone itself: a nested `.git` would give the klon a
+/// second repository, the exact set would copy a worktree into itself, and a
+/// submodule directory without its admin entry is a broken checkout. Only
+/// rule 4 states a preference, so only rule 4 gives way.
 pub struct Exclusions {
     exact: HashSet<PathBuf>,
     klonignore: Option<Gitignore>,
+    include: Includes,
     golden: PathBuf,
 }
 
@@ -104,9 +119,13 @@ impl Exclusions {
         for name in TOP_LEVEL_SKIP {
             set.insert(golden.join(name));
         }
+        for path in submodule_paths(golden) {
+            set.insert(golden.join(path));
+        }
         Exclusions {
             exact: set,
             klonignore: load_klonignore(golden),
+            include: Includes::load(golden),
             golden: golden.to_path_buf(),
         }
     }
@@ -117,10 +136,14 @@ impl Exclusions {
         if path.file_name().is_some_and(|n| n == ".git") || self.exact.contains(path) {
             return true;
         }
-        match (&self.klonignore, path.strip_prefix(&self.golden)) {
-            (Some(ignore), Ok(rel)) => ignore.matched_path_or_any_parents(rel, is_dir).is_ignore(),
-            _ => false,
+        let (Some(ignore), Ok(rel)) = (&self.klonignore, path.strip_prefix(&self.golden)) else {
+            return false;
+        };
+        if !ignore.matched_path_or_any_parents(rel, is_dir).is_ignore() {
+            return false;
         }
+        // `.worktreeinclude` is additive: it takes a `.klonignore` match back.
+        !self.include.covers(rel, is_dir)
     }
 }
 
@@ -133,6 +156,102 @@ fn load_klonignore(golden: &Path) -> Option<Gitignore> {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(golden);
     builder.add(&file);
     builder.build().ok()
+}
+
+/// The submodule paths of `golden`, relative to golden, from `.gitmodules`.
+///
+/// klon asks git instead of parsing the file: `.gitmodules` is git config
+/// syntax, not INI. A repository without the file, or a file that git refuses,
+/// gives an empty list; the clone then falls back on the nested `.git` rule,
+/// which already skips a populated submodule.
+fn submodule_paths(golden: &Path) -> Vec<PathBuf> {
+    if !golden.join(".gitmodules").is_file() {
+        return Vec::new();
+    }
+    let out = crate::git::run(
+        golden,
+        &["config", "--file", ".gitmodules", "--get-regexp", "path"],
+    );
+    let Ok(text) = out else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(_, value)| PathBuf::from(value))
+        .filter(|p| p.is_relative() && !p.as_os_str().is_empty())
+        .collect()
+}
+
+/// `<golden>/.worktreeinclude`: the additive include (R39). It uses gitignore
+/// syntax, where a matching line means "clone this after all".
+#[derive(Default)]
+struct Includes {
+    /// The lines, compiled as a gitignore matcher.
+    patterns: Option<Gitignore>,
+    /// Every directory that an include line names or sits below, relative to
+    /// golden. The walk must descend into these, because a `.klonignore` line
+    /// that excludes a directory would otherwise hide its included children.
+    ancestors: HashSet<PathBuf>,
+}
+
+impl Includes {
+    fn load(golden: &Path) -> Includes {
+        let file = golden.join(".worktreeinclude");
+        let Ok(text) = fs::read_to_string(&file) else {
+            return Includes::default();
+        };
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(golden);
+        let mut ancestors = HashSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let _ = builder.add_line(Some(file.clone()), line);
+            for dir in ancestor_dirs(line) {
+                ancestors.insert(dir);
+            }
+        }
+        Includes {
+            patterns: builder.build().ok(),
+            ancestors,
+        }
+    }
+
+    /// True when `rel` is included, or is a directory on the way to one.
+    fn covers(&self, rel: &Path, is_dir: bool) -> bool {
+        if is_dir && self.ancestors.contains(rel) {
+            return true;
+        }
+        self.patterns
+            .as_ref()
+            .is_some_and(|p| p.matched_path_or_any_parents(rel, is_dir).is_ignore())
+    }
+}
+
+/// The directories that an include line sits below, up to the first glob.
+/// `build/keep/**` gives `build` and `build/keep`; `*.log` gives nothing.
+fn ancestor_dirs(line: &str) -> Vec<PathBuf> {
+    let line = line.strip_prefix('!').unwrap_or(line);
+    let literal = match line.find(['*', '?', '[']) {
+        Some(cut) => &line[..cut],
+        None => line,
+    };
+    let mut out = Vec::new();
+    let mut walk = PathBuf::new();
+    let parts: Vec<&str> = literal.split('/').filter(|p| !p.is_empty()).collect();
+    // The last part is the entry itself when the line ends in no separator, so
+    // it is a parent only when a separator follows it.
+    let last = if literal.ends_with('/') {
+        parts.len()
+    } else {
+        parts.len().saturating_sub(1)
+    };
+    for part in parts.iter().take(last) {
+        walk.push(part);
+        out.push(walk.clone());
+    }
+    out
 }
 
 // --- Shared filesystem helpers -------------------------------------------------
