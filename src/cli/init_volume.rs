@@ -201,7 +201,7 @@ fn build(
     // `--undo` finds a consistent register list.
     let new_common = git::common_dir_of_main(golden)?;
     record.relocate(&new_common);
-    repair_worktrees(&live.golden_new, &linked);
+    volume::repair_worktrees(&live.golden_new, &linked);
     volume::write(&new_common, &live)?;
     record.reach(State::Ready)?;
     // The conversion changed which backend is right while the cached answer
@@ -250,13 +250,24 @@ fn undo(cwd: &Path, force: bool, yes: bool, json: bool) -> Result<()> {
             golden.display()
         )));
     }
-    let live = linked_worktrees(&golden)?;
-    if !live.is_empty() && !force {
+    // Only a klon that sits on the volume goes away with it. One that stayed
+    // on the old filesystem, from before the conversion or from `--path`,
+    // survives the undo, so it must not block the command.
+    let linked = linked_worktrees(&golden)?;
+    let doomed: Vec<&String> = linked
+        .iter()
+        .filter(|path| Path::new(path).starts_with(&record.mount))
+        .collect();
+    if !doomed.is_empty() && !force {
         return Err(Error::klon(format!(
             "{} klons live on the volume and go away with it: {}. \
              Remove them with gh klon rm, or pass --force.",
-            live.len(),
-            live.join(", ")
+            doomed.len(),
+            doomed
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     let plain = sibling(&record.golden_old, PLAIN_SUFFIX)?;
@@ -280,7 +291,7 @@ fn undo(cwd: &Path, force: bool, yes: bool, json: bool) -> Result<()> {
         undo: true,
     };
     let mut entry = journal::Record::start_volume(&common, &record.golden_old, mark)?;
-    if let Err(err) = restore(&golden, &common, &record, &plain, &old, &live, &mut entry) {
+    if let Err(err) = restore(&golden, &common, &record, &plain, &old, &linked, &mut entry) {
         eprintln!("klon: run gh klon doctor --repair to finish or revert the conversion");
         return Err(err);
     }
@@ -345,7 +356,7 @@ fn restore(
 
     let new_common = git::common_dir_of_main(&record.golden_old)?;
     entry.relocate(&new_common);
-    repair_worktrees(&record.golden_old, linked);
+    volume::repair_worktrees(&record.golden_old, linked);
     // The record goes before the volume does, so a kill below never leaves a
     // command chasing an image that is no longer golden's home.
     volume::forget(&new_common, &record.golden_old)?;
@@ -449,7 +460,9 @@ fn detach(record: &Volume) {
         return;
     }
     match fs::remove_file(&record.image) {
-        Ok(()) => println!("deleted the volume image {}", record.image.display()),
+        // Every line of this command that is not the report goes to stderr:
+        // `--json` owns stdout, and a second document there is not JSON.
+        Ok(()) => eprintln!("klon: deleted the volume image {}", record.image.display()),
         Err(err) => eprintln!("klon: cannot delete {}: {err}", record.image.display()),
     }
 }
@@ -506,24 +519,6 @@ fn linked_worktrees(golden: &Path) -> Result<Vec<String>> {
         .filter(|w| w.path.exists())
         .map(|w| w.path.to_string_lossy().into_owned())
         .collect())
-}
-
-/// `git worktree repair <path>...` from golden's new home.
-///
-/// Every `.git` file and every admin `gitdir` file holds an absolute path.
-/// Golden's symlink already answers for all of them, and `repair` writes them
-/// out again so the register list stays right when the symlink goes.
-fn repair_worktrees(golden: &Path, linked: &[String]) {
-    let mut args = vec!["worktree", "repair"];
-    args.extend(linked.iter().map(String::as_str));
-    match git::run(golden, &args) {
-        Ok(text) => {
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                eprintln!("klon: git worktree repair: {line}");
-            }
-        }
-        Err(err) => eprintln!("klon: git worktree repair did not finish: {err}"),
-    }
 }
 
 /// Handoff §7: print the plan and wait for `y`. `--yes` skips the prompt, and a

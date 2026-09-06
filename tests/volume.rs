@@ -29,6 +29,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 const SEED: u64 = 915;
@@ -48,7 +49,20 @@ const BIG_SIZE: &str = "12G";
 /// `$XDG_DATA_HOME/klon`, so one variable isolates the whole feature.
 struct Sandbox {
     data: PathBuf,
+    /// One volume at a time in this binary. Every fixture is called `golden`,
+    /// so every test volume carries the label `klon-golden`, and udisks then
+    /// numbers the mount points. Two tests that mount and unmount at once race
+    /// for one numbered directory, and the loser fails with `File exists`.
+    /// The field is never read: the guard lives here so it is released after
+    /// the teardown below.
+    #[allow(dead_code)]
+    guard: MutexGuard<'static, ()>,
 }
+
+/// The lock that `Sandbox` holds. A poisoned lock is still a lock: a test that
+/// panicked already reported its own failure, and the next test must not fail
+/// with a message about a mutex.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 impl Sandbox {
     /// `$HOME/.local/share/klon-tests/<test>-<pid>-<n>`.
@@ -66,7 +80,10 @@ impl Sandbox {
             .join("klon-tests")
             .join(format!("{test}-{}-{n}", std::process::id()));
         fs::create_dir_all(&data).ok()?;
-        Some(Sandbox { data })
+        let guard = ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        Some(Sandbox { data, guard })
     }
 
     /// The environment that points klon at this sandbox.
@@ -448,6 +465,10 @@ fn init_volume_moves_golden_and_doctor_reports_the_snapshot_backend() {
     assert_eq!(record["version"], 1);
     assert_eq!(path_of(&record, "golden_old"), fx.golden);
     assert!(image.is_file(), "{} must exist", image.display());
+    // The image is the raw filesystem, so a reader of the file reads every
+    // path in the repository. Its mode must not follow the umask.
+    let mode = fs::metadata(&image).expect("stat the image").mode() & 0o777;
+    assert_eq!(mode, 0o600, "the image must be owner-only, found {mode:o}");
     assert!(
         record["label"]
             .as_str()
@@ -582,6 +603,28 @@ fn a_klon_made_before_the_move_still_works() {
     let out = klon(&fx.golden, &sandbox, &["add", "--json", "second"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
     assert_eq!(parse(&stdout(&out))["backend"], "btrfs-snapshot");
+    assert!(klon(&fx.golden, &sandbox, &["rm", "second"])
+        .status
+        .success());
+
+    // A klon that stayed on the old filesystem survives the undo, so it must
+    // not ask for `--force`. Only a klon on the volume goes away with it.
+    let out = klon(
+        &fx.golden,
+        &sandbox,
+        &["init", "--volume", "--undo", "--yes", "--json"],
+    );
+    assert!(
+        out.status.success(),
+        "an external klon must not block the undo: {}",
+        stderr(&out)
+    );
+    // Every other line went to stderr, so stdout holds one document.
+    assert_eq!(parse(&stdout(&out))["shape"], "directory");
+    assert!(old_klon.is_dir(), "the external klon must survive the undo");
+    assert_eq!(git_ok(&old_klon, &["status", "--porcelain"]), "");
+    assert!(git_ok(&old_klon, &["worktree", "list", "--porcelain"])
+        .contains(&fx.golden.display().to_string()));
 }
 
 /// The 100k timing line. It needs a big fixture and a big image, so it runs

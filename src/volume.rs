@@ -259,19 +259,24 @@ pub fn forget(common: &Path, golden_old: &Path) -> Result<()> {
 /// volume, and golden's symlink then points at nothing. `add` therefore looks
 /// here first, before its first `git` call.
 ///
-/// Three shapes match, in this order:
+/// Four shapes match, in this order:
 ///
 /// | Shape | Who stands there |
 /// |---|---|
 /// | an ancestor of `cwd` is a converted golden | the usual caller, inside the repository at its old path |
-/// | `cwd` is on the volume, below a recorded golden | a caller who followed the symlink, or a shell left there |
+/// | `cwd` is on the volume, below a recorded golden | a caller who followed the symlink |
+/// | `cwd` is a worktree whose git directory sits on the volume | a caller inside a klon that stayed on the old filesystem |
 /// | a recorded golden sits **below** `cwd` | a caller who could not enter the dangling symlink and ran the command from the directory above it |
 ///
 /// The first shape costs one failed `stat` per ancestor and reads no
-/// directory. The other two read the registry, which holds one small file per
+/// directory. The others read the registry, which holds one small file per
 /// converted repository.
 ///
-/// An ambiguous third match gives None with one line on stderr, because klon
+/// The last shape only answers for a caller who stands in no repository at
+/// all. A repository that holds a converted one below it must keep its own
+/// identity: a command in the parent belongs to the parent.
+///
+/// An ambiguous last match gives None with one line on stderr, because klon
 /// must not guess which repository the user meant.
 pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
     let here = paths::absolute(cwd)?;
@@ -289,6 +294,8 @@ pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(Error::io(format!("read {}", dir.display()))(err)),
     };
+    let git_dir = git_dir_of(&here);
+    let outside = git_dir.is_none();
     let mut below: Vec<Volume> = Vec::new();
     for item in read {
         let item = item.map_err(Error::io(format!("read {}", dir.display())))?;
@@ -299,13 +306,17 @@ pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
         let Some(record) = read_file(&path)? else {
             continue;
         };
-        if here.starts_with(&record.golden_new) {
+        let inside = here.starts_with(&record.golden_new)
+            || git_dir
+                .as_ref()
+                .is_some_and(|dir| dir.starts_with(&record.golden_new));
+        if inside {
             return Ok(Some(Match {
                 record,
                 below: false,
             }));
         }
-        if record.golden_old.starts_with(&here) {
+        if outside && record.golden_old.starts_with(&here) {
             below.push(record);
         }
     }
@@ -324,6 +335,45 @@ pub fn find_for(cwd: &Path) -> Result<Option<Match>> {
             Ok(None)
         }
     }
+}
+
+/// The git directory that `cwd` belongs to, without a `git` process.
+///
+/// A `.git` directory is the answer itself. A `.git` file names one, which is
+/// what a linked worktree carries: a klon that stayed on the old filesystem
+/// keeps a path into golden's git directory, and that path names the volume
+/// even while the volume is down. None means the caller stands in no
+/// repository, which is the one case where klon may look below the working
+/// directory for a repository to attach.
+fn git_dir_of(here: &Path) -> Option<PathBuf> {
+    for ancestor in here.ancestors() {
+        let dot_git = ancestor.join(".git");
+        let Ok(meta) = fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        if meta.is_dir() {
+            // A directory named `.git` is not yet a git directory: git looks
+            // for `HEAD` inside it. An empty one that somebody left behind
+            // must not turn its whole parent into a repository.
+            if dot_git.join("HEAD").exists() {
+                return Some(dot_git);
+            }
+            continue;
+        }
+        if meta.is_file() {
+            let text = fs::read_to_string(&dot_git).ok()?;
+            let target = text
+                .trim_end_matches(['\n', '\r'])
+                .strip_prefix("gitdir: ")?;
+            let path = Path::new(target);
+            return Some(if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                ancestor.join(path)
+            });
+        }
+    }
+    None
 }
 
 /// One record and how the working directory reached it.
@@ -362,9 +412,9 @@ pub fn ensure_attached(cwd: &Path) -> Result<PathBuf> {
     let live = attach(&found.record)?;
     if live != found.record {
         // udisks mounted the volume somewhere else, so golden's symlink now
-        // points at nothing. Both it and the record are rewritten before the
-        // first git command runs.
-        repoint(&live)?;
+        // points at nothing. It, the record, and every worktree path are
+        // rewritten before the first git command runs.
+        repoint(&live, &found.record.mount)?;
     }
     if !found.below {
         return Ok(here);
@@ -432,7 +482,7 @@ pub fn attach(record: &Volume) -> Result<Volume> {
 /// udisks appends a suffix to a mount point whose label is already taken, so a
 /// volume can come back at another path. The symlink then points at nothing
 /// and every git command would fail; this rewrites it and both record copies.
-fn repoint(live: &Volume) -> Result<()> {
+fn repoint(live: &Volume, was: &Path) -> Result<()> {
     eprintln!(
         "klon: the volume came back at {}; klon repoints {}",
         live.mount.display(),
@@ -447,7 +497,50 @@ fn repoint(live: &Volume) -> Result<()> {
     // The repository copy sits behind the symlink that this call just fixed,
     // so its path is resolved now and not from the stale record.
     let common = crate::git::common_dir_of_main(link)?;
-    write(&common, live)
+    write(&common, live)?;
+    repair_moved_worktrees(live, was);
+    Ok(())
+}
+
+/// Rewrite the worktree paths that moved with the mount point.
+///
+/// Every klon on the volume carries the old mount in its `.git` file, and the
+/// admin `gitdir` file beside golden carries the old klon path. Git rejects a
+/// worktree whose two ends disagree, and `git worktree list` then offers to
+/// prune a klon that is alive. `git worktree repair` writes both ends again
+/// for each path it is given, so klon hands it the translated ones.
+fn repair_moved_worktrees(live: &Volume, was: &Path) {
+    let Ok(list) = crate::git::worktree_list(&live.golden_new) else {
+        return;
+    };
+    let moved: Vec<String> = list
+        .iter()
+        .skip(1)
+        .map(|w| match w.path.strip_prefix(was) {
+            Ok(rest) => live.mount.join(rest),
+            Err(_) => w.path.clone(),
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    repair_worktrees(&live.golden_new, &moved);
+}
+
+/// `git worktree repair <path>...` from golden.
+///
+/// Every `.git` file and every admin `gitdir` file holds an absolute path.
+/// `repair` writes them out again, so the register list stays right from both
+/// ends after golden moves.
+pub fn repair_worktrees(golden: &Path, linked: &[String]) {
+    let mut args = vec!["worktree", "repair"];
+    args.extend(linked.iter().map(String::as_str));
+    match crate::git::run(golden, &args) {
+        Ok(text) => {
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                eprintln!("klon: git worktree repair: {line}");
+            }
+        }
+        Err(err) => eprintln!("klon: git worktree repair did not finish: {err}"),
+    }
 }
 
 // --- The host tools ------------------------------------------------------------
@@ -643,30 +736,51 @@ pub fn refuse_a_remote_session() -> Result<()> {
         eprintln!("klon: loginctl is not on PATH, so klon cannot check the session");
         return Ok(());
     };
-    for id in session_ids(&loginctl) {
+    // polkit reads the session of the calling process, so the caller's own
+    // session decides. An ssh login carries `XDG_SESSION_ID`, and that session
+    // is neither active nor local: klon must refuse it even while the same
+    // user sits at the desktop.
+    if let Some(id) = caller_session() {
+        return match active_and_local(&loginctl, &id) {
+            Some(true) => Ok(()),
+            _ => Err(remote_session()),
+        };
+    }
+    // The caller belongs to no session that logind knows, which is what a
+    // process started by a user service looks like. klon then asks whether
+    // this user holds an active local session at all.
+    for id in user_sessions(&loginctl) {
         if let Some(true) = active_and_local(&loginctl, &id) {
             return Ok(());
         }
     }
-    Err(Error::klon(
+    Err(remote_session())
+}
+
+fn remote_session() -> Error {
+    Error::klon(
         "gh klon init --volume needs an active local session: udisks asks for a \
          password in an ssh session and on a headless host. Run it from the \
          desktop session, or run gh klon init on a btrfs filesystem.",
-    ))
+    )
 }
 
-/// The session ids to test: the caller's own session first, then every session
-/// of this user. `XDG_SESSION_ID` is empty in a process that a service started,
-/// and `/proc/self/sessionid` holds the audit id, which is not always the
-/// logind id, so the list is the last word.
-fn session_ids(loginctl: &Path) -> Vec<String> {
+/// The caller's own session id, from `XDG_SESSION_ID`. Every login that
+/// `pam_systemd` handled carries it, an ssh login included.
+fn caller_session() -> Option<String> {
+    let id = std::env::var_os("XDG_SESSION_ID")?
+        .to_string_lossy()
+        .into_owned();
+    (!id.trim().is_empty()).then_some(id)
+}
+
+/// Every session of this user, from `loginctl list-sessions`.
+///
+/// `/proc/self/sessionid` holds the audit id, which is not always the logind
+/// id, so the list is the only reliable answer for a caller that carries no
+/// `XDG_SESSION_ID`.
+fn user_sessions(loginctl: &Path) -> Vec<String> {
     let mut ids = Vec::new();
-    if let Some(id) = std::env::var_os("XDG_SESSION_ID") {
-        let id = id.to_string_lossy().into_owned();
-        if !id.is_empty() {
-            ids.push(id);
-        }
-    }
     // SAFETY: `getuid` reads a process property and cannot fail.
     let me = unsafe { libc::getuid() };
     let Ok(out) = Command::new(loginctl)
@@ -735,7 +849,13 @@ pub fn parse_size(text: &str) -> Result<u64> {
 
 /// Create the sparse image. The file reports its full size and uses no disk
 /// space until klon writes into it (S1 §4.1).
+///
+/// The mode is `0600`, and the file carries it before the first repository
+/// byte lands. The image is the raw filesystem: a reader of the file reads
+/// every path inside it, mode `0600` files included. A default umask of 022
+/// would leave the whole repository world-readable.
 pub fn create_image(image: &Path, bytes: u64) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = image
         .parent()
         .ok_or_else(|| Error::klon(format!("{} has no parent directory", image.display())))?;
@@ -743,6 +863,7 @@ pub fn create_image(image: &Path, bytes: u64) -> Result<()> {
     let file = fs::File::options()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(image)
         .map_err(Error::io(format!("create {}", image.display())))?;
     file.set_len(bytes)
@@ -848,6 +969,37 @@ mod tests {
         assert_eq!(moved.golden_new, Path::new("/media/u/klon-repo1/klon/repo"));
         assert_eq!(moved.golden_old, record.golden_old);
         assert_eq!(record.at_mount(&record.mount), record);
+    }
+
+    /// The descendant search may only answer for a caller who stands in no
+    /// repository. A worktree names its git directory through a `.git` file,
+    /// and that path still names the volume while the volume is down.
+    #[test]
+    fn a_worktree_names_the_git_directory_it_belongs_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        assert!(
+            git_dir_of(&root).is_none_or(|found| !found.starts_with(&root)),
+            "a plain directory holds no git directory of its own"
+        );
+
+        let golden = root.join("golden");
+        let state = golden.join(".git");
+        fs::create_dir_all(state.join("worktrees").join("x")).unwrap();
+        fs::create_dir_all(golden.join("src")).unwrap();
+        assert!(
+            git_dir_of(&golden.join("src")).is_none_or(|found| found != state),
+            "a .git directory without HEAD is not a git directory"
+        );
+        fs::write(state.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        assert_eq!(git_dir_of(&golden.join("src")), Some(state.clone()));
+
+        // A klon carries a `.git` file that names the admin directory.
+        let klon = root.join("golden.wt").join("x");
+        fs::create_dir_all(klon.join("src")).unwrap();
+        let admin = state.join("worktrees").join("x");
+        fs::write(klon.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
+        assert_eq!(git_dir_of(&klon.join("src")), Some(admin));
     }
 
     /// An unknown version fails closed, so an old binary never rewrites a
