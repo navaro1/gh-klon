@@ -130,6 +130,14 @@ pub struct Hardlink {
     pub paths: Option<Vec<String>>,
 }
 
+/// The `[netns]` table. Read by the netns chunk.
+#[allow(dead_code)]
+#[derive(Debug, Default, Deserialize)]
+pub struct Netns {
+    /// TCP ports pasta maps from the klon's loopback address into the namespace.
+    pub ports: Option<Vec<u16>>,
+}
+
 /// The whole `.klon.toml`. Every key is optional (handoff §3).
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -161,6 +169,9 @@ pub struct Config {
     /// Paths to hardlink in v2. Read by the hardlink backend.
     #[allow(dead_code)]
     pub hardlink: Option<Hardlink>,
+    /// The TCP ports of `run --netns`. Read by the netns chunk.
+    #[allow(dead_code)]
+    pub netns: Option<Netns>,
     /// The SHA-256 of the raw file bytes. `None` when the file is absent.
     hash: Option<String>,
 }
@@ -179,6 +190,7 @@ const KNOWN_TOP: &[&str] = &[
     "fixup",
     "merge",
     "hardlink",
+    "netns",
 ];
 
 /// The keys klon knows inside each table, as `(table, keys)`.
@@ -190,6 +202,7 @@ const KNOWN_TABLES: &[(&str, &[&str])] = &[
     ("fixup", &["skip"]),
     ("merge", &["ff"]),
     ("hardlink", &["paths"]),
+    ("netns", &["ports"]),
 ];
 
 /// Read and parse `<golden>/.klon.toml`. A missing file is an empty config.

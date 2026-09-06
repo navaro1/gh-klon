@@ -17,6 +17,7 @@ pub mod env;
 #[cfg(target_os = "linux")]
 pub mod fence_linux;
 pub mod jobserver;
+pub mod netns;
 pub mod scope;
 pub mod slots;
 
@@ -58,6 +59,9 @@ pub struct Options {
     /// and `shell` want. `up` points a warm step at stderr under `--json`,
     /// because klon owns stdout for its document there.
     pub stdout: Option<Stdio>,
+    /// C23: wrap the command in a pasta network namespace. `Some` holds the
+    /// port list, and `None` keeps the command on the host network.
+    pub netns: Option<Vec<u16>>,
 }
 
 /// The envelope of one klon.
@@ -253,6 +257,12 @@ impl Envelope {
         // the scope made is joined from inside the child, so the fence opens
         // its `cgroup.procs`.
         envelope.fence = fence(path, &envelope, options.no_fence, guard.cgroup())?;
+        // C23: the pasta wrapper goes around the fence, so the child execs
+        // pasta inside it. `enable` prints one line and does nothing on a
+        // host without pasta.
+        if let Some(ports) = options.netns.as_deref() {
+            netns::enable(&mut envelope, ports)?;
+        }
         // The child leads a new session, so the terminal never signals it:
         // Ctrl-C and a `kill` of the wrapper reach only this process. klon
         // relays each of them to the child's process group, so the whole tree

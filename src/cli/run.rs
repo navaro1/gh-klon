@@ -5,14 +5,15 @@
 //! `TMPDIR`, its own loopback address, and `gc.auto=0`. It carries `KLON_ID`
 //! and `KLON_DIR`, so `stop` finds the whole tree. On Linux it runs inside
 //! the write fence (C18, R17) unless `--no-fence` or `KLON_NO_FENCE=1` says
-//! otherwise. The exit code passes back unchanged, and a signal to `run`
-//! passes on to the command.
+//! otherwise. With `--netns` it also runs inside a pasta network namespace
+//! (C23). The exit code passes back unchanged, and a signal to `run` passes
+//! on to the command.
 //!
 //! C22 moved the composition of the envelope and the spawn into
 //! `Envelope::spawn_and_wait`, which `up` now shares.
 
-use crate::envelope::{exit_code, Envelope, Options, Root};
-use crate::{git, paths, Error, Result};
+use crate::envelope::{exit_code, netns, Envelope, Options, Root};
+use crate::{config, git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 
 #[derive(clap::Args)]
@@ -26,6 +27,15 @@ pub struct Args {
     /// user can, golden included.
     #[arg(long)]
     pub no_fence: bool,
+    /// Wrap the command in a pasta network namespace. A host without pasta
+    /// gets one line and the command runs on the host network as before.
+    #[arg(long)]
+    pub netns: bool,
+    /// The TCP ports pasta maps from the klon's loopback address into the
+    /// namespace. Implies `--netns`. The default is `3000,5173,8000,8080`,
+    /// or `[netns] ports` in `.klon.toml`.
+    #[arg(long, value_name = "PORTS", value_delimiter = ',')]
+    pub netns_ports: Option<Vec<u16>>,
     /// The command and its arguments, after `--`.
     #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
     pub command: Vec<String>,
@@ -33,14 +43,28 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let klon = resolve(args.branch.as_deref(), args.path.as_deref())?;
+    let netns = netns_arg(args.netns, args.netns_ports.as_deref())?;
     exec_with(
         &klon,
         &args.command,
         Options {
             no_fence: args.no_fence,
             stdout: None,
+            netns,
         },
     )
+}
+
+/// The `netns` value of `Options`: `Some` holds the port list, and `None`
+/// keeps the command on the host network. `--netns-ports` implies `--netns`.
+pub fn netns_arg(netns: bool, flag_ports: Option<&[u16]>) -> Result<Option<Vec<u16>>> {
+    if !netns && flag_ports.is_none() {
+        return Ok(None);
+    }
+    let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
+    let golden = git::main_worktree(&cwd)?;
+    let from_config = config::load(&golden)?.netns.and_then(|table| table.ports);
+    Ok(Some(netns::ports(flag_ports, from_config.as_deref())))
 }
 
 /// The klon directory for a branch or a path. The main worktree is not a klon,
