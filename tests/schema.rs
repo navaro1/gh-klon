@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{git_ok, klon, klon_env, stderr, stdout, Fixture};
+use common::{identity, klon, klon_env, stderr, stdout, Fixture};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
 
@@ -382,8 +382,7 @@ fn every_command_matches_its_documented_schema() {
 #[test]
 fn the_merge_report_matches_its_documented_schema() {
     let fx = Fixture::generate(SEED, 30, 3, 3, 2);
-    git_ok(&fx.golden, &["config", "user.name", "klon"]);
-    git_ok(&fx.golden, &["config", "user.email", "klon@example.com"]);
+    identity(&fx.golden);
     let out = klon(&fx.golden, &["add", "feature"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
 

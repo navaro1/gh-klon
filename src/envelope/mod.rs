@@ -162,6 +162,22 @@ impl Envelope {
             .flatten()
     }
 
+    /// Run `argv` inside the klon at `dir` under the whole envelope and wait
+    /// for it. A command that fails gives `Error::Exit`, so the caller reads
+    /// the answer and carries on instead of handing over its own process.
+    ///
+    /// Every caller outside `run` itself uses this name: `up` for its warm
+    /// steps (C22) and `merge` for the `pre_merge` hook and the `[proof] steps`
+    /// (C25). The body stays in `cli::run`, which owns the signal relay, the
+    /// fence choice, and the child bookkeeping around one spawn.
+    pub fn spawn_and_wait(
+        dir: &Path,
+        argv: &[String],
+        options: crate::cli::run::Options,
+    ) -> Result<()> {
+        crate::cli::run::exec_with(dir, argv, options)
+    }
+
     /// The command `argv` under this envelope. The child starts a new session,
     /// so `stop` finds the whole tree and C20 can put one cgroup around it.
     pub fn command(&self, argv: &[String]) -> Result<Command> {

@@ -17,7 +17,7 @@
 
 use crate::cli::{rm, run};
 use crate::config::{self, Ff};
-use crate::envelope::env;
+use crate::envelope::{env, Envelope};
 use crate::journal;
 use crate::{branch, git, paths, process, Error, Result};
 use serde::Serialize;
@@ -118,7 +118,10 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         })?;
 
     // --- Step 1: the two trees and the branch golden stands on ---------------
-    let base = branch::base(&golden)?;
+    // `.klon.toml` is read once. A second read repeats every warning line the
+    // loader prints, and `merge` reads three keys out of the same file.
+    let cfg = config::load(&golden)?;
+    let base = branch::base_of(&cfg, &golden)?;
     if args.branch == base {
         return Err(Error::klon(format!(
             "{base} is the base branch; merge lands a klon's branch in it"
@@ -160,14 +163,14 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     }
 
     // --- Step 3: the merge gate ---------------------------------------------
-    let hook = gate(&klon, &golden, yes)?;
+    let hook = gate(&klon, &cfg, yes)?;
 
     // --- Step 4: the structured merge driver --------------------------------
     configure_mergiraf(&golden, &common)?;
 
     // --- Step 5: the merge ---------------------------------------------------
     configure_merge(&golden)?;
-    let mode = pick_mode(&args, &golden)?;
+    let mode = pick_mode(&args, &cfg);
     let head_before = head(&golden)?;
     // The entry marks the window in which golden's history moves. The removal
     // in step 6 writes its own `rm` entry over this one, so a kill there
@@ -235,13 +238,12 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
 /// Every command runs inside the klon under the envelope, so the write fence
 /// holds a test that writes where it should not. The first failure stops the
 /// merge and golden never moves.
-fn gate(klon: &Path, golden: &Path, yes: bool) -> Result<Option<&'static str>> {
+fn gate(klon: &Path, cfg: &config::Config, yes: bool) -> Result<Option<&'static str>> {
     if let Some(hook) = pre_merge_hook(klon) {
         let argv = vec![hook.to_string_lossy().into_owned()];
         exec_step(klon, &argv, &hook.display().to_string())?;
         return Ok(Some(GATE_HOOK));
     }
-    let cfg = config::load(golden)?;
     let steps = cfg
         .proof
         .as_ref()
@@ -259,10 +261,10 @@ fn gate(klon: &Path, golden: &Path, yes: bool) -> Result<Option<&'static str>> {
     Ok(Some(GATE_PROOF))
 }
 
-/// One gate command inside the klon. `run` spawns and waits, so `merge`
+/// One gate command inside the klon. The envelope spawns and waits, so `merge`
 /// continues with the answer instead of handing its process to the command.
 fn exec_step(klon: &Path, argv: &[String], what: &str) -> Result<()> {
-    match run::exec_with(klon, argv, run::Options::default()) {
+    match Envelope::spawn_and_wait(klon, argv, run::Options::default()) {
         Ok(()) => Ok(()),
         // The command already reported its own failure on its own stderr.
         Err(Error::Exit(_)) => Err(Error::klon(format!("pre_merge failed: {what}"))),
@@ -348,17 +350,17 @@ fn configure_merge(golden: &Path) -> Result<()> {
 }
 
 /// The merge mode: the flags first, then `[merge] ff`, then `no-ff`.
-fn pick_mode(args: &Args, golden: &Path) -> Result<Ff> {
+fn pick_mode(args: &Args, cfg: &config::Config) -> Ff {
     if args.ff_only {
-        return Ok(Ff::FfOnly);
+        return Ff::FfOnly;
     }
     if args.no_ff {
-        return Ok(Ff::NoFf);
+        return Ff::NoFf;
     }
-    Ok(config::load(golden)?
-        .merge
+    cfg.merge
+        .as_ref()
         .and_then(|merge| merge.ff)
-        .unwrap_or(Ff::NoFf))
+        .unwrap_or(Ff::NoFf)
 }
 
 /// Step 6: hand the klon to the `rm` logic. The branch is in base now, so a

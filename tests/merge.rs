@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{git, git_ok, klon, klon_env, stderr, stdout, Fixture};
+use common::{git, git_ok, identity, klon, klon_env, stderr, stdout, Fixture};
 
 const SEED: u64 = 25;
 
@@ -22,8 +22,7 @@ const SEED: u64 = 25;
 /// global config at `/dev/null`.
 fn repo(tracked_files: usize) -> Fixture {
     let fx = Fixture::generate(SEED, tracked_files, 4, 3, 2);
-    git_ok(&fx.golden, &["config", "user.name", "klon"]);
-    git_ok(&fx.golden, &["config", "user.email", "klon@example.com"]);
+    identity(&fx.golden);
     fx
 }
 
