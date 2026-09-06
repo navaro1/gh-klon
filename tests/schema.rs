@@ -70,7 +70,7 @@ const STOP: Fields = &[
     ("terminated", Ty::Num),
     ("killed", Ty::Num),
     ("survivors", Ty::Arr),
-    ("cgroup", Ty::StrOrNull),
+    ("cgroups", Ty::Arr),
 ];
 
 const DOCTOR: Fields = &[

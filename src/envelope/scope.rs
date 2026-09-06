@@ -26,8 +26,8 @@ mod imp {
         Scope
     }
 
-    pub fn klon_cgroup(_pids: &[u32], _name: &str) -> Option<PathBuf> {
-        None
+    pub fn klon_cgroups(_pids: &[u32], _name: &str) -> Vec<PathBuf> {
+        Vec::new()
     }
 
     pub fn kill(_dir: &Path) -> bool {

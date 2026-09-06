@@ -18,13 +18,15 @@
 //! ignores it (handoff §11), so klon adds `nice -n 10` inside the scope below
 //! systemd 252 and lets `CPUWeight` do the work above it.
 //!
-//! `stop` reads the cgroup back from a live process and ends the whole tree
+//! `stop` reads each cgroup back from a live process and ends the whole tree
 //! with one write to `cgroup.kill`. That catches a process which called
 //! `setsid` and cleared its own environment, which no other scan can see.
 
 use crate::envelope::{slots, Envelope, Part};
 use crate::{git, probe};
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -269,17 +271,31 @@ fn make_cgroup(unit: &str, limits: &Limits) -> Option<PathBuf> {
         .find_map(|dir| fill_cgroup(&dir.join(unit), limits))
 }
 
-/// The cgroups of this process, its own first, that would give a child the
-/// memory controller. A parent whose `cgroup.subtree_control` misses `memory`
-/// gives its children no `memory.high` file at all, so klon skips it.
+/// The cgroups of this process, its own first, that klon may put a capped
+/// child in. A parent whose `cgroup.subtree_control` misses `memory` gives its
+/// children no `memory.high` file at all, and a parent klon cannot write in
+/// takes no child, so klon skips both. `doctor` reads the same list, so the
+/// row it prints names the mechanism that `run` will really take.
 fn memory_parents() -> Vec<PathBuf> {
     match own_cgroup() {
         Some(dir) => ancestors(dir)
             .into_iter()
-            .filter(|dir| delegates_memory(dir))
+            .filter(|dir| delegates_memory(dir) && writable(dir))
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// True when this process may create a directory in `dir`. `access` answers
+/// for a read-only mount as well as for a permission the user does not hold,
+/// which is what a container and a locked-down host give. A parent that passes
+/// here and still refuses the `mkdir` costs nothing: `make_cgroup` walks on.
+fn writable(dir: &Path) -> bool {
+    let Ok(path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `path` is NUL-terminated and `access` touches no memory of ours.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK) == 0 }
 }
 
 /// `start` and every cgroup above it, the mount point excluded. klon never
@@ -390,12 +406,20 @@ fn sanitize(name: &str) -> String {
 
 // --- stop --------------------------------------------------------------------
 
-/// The cgroup that klon made for the klon `name`, read back from one of
-/// `pids`. The answer is None unless the directory carries klon's own name
-/// shape, `klon-<branch>-<digits>`, so `stop` can never write `cgroup.kill`
-/// into the cgroup of the caller's own login session.
-pub fn klon_cgroup(pids: &[u32], name: &str) -> Option<PathBuf> {
+/// Every cgroup that klon made for the klon `name`, read back from `pids`.
+/// Two `run` commands in one klon make two cgroups, so the answer is a list
+/// and `stop` empties each of them.
+///
+/// A directory joins the list only when it carries klon's own name shape,
+/// `klon-<branch>-<digits>`, so `stop` can never write `cgroup.kill` into the
+/// cgroup of the caller's own login session.
+///
+/// A command whose very first `exec` clears its own environment leaves no
+/// tagged process and so names no cgroup here. That gap is older than C20:
+/// `stop` finds nothing at all for such a tree, cgroup or no cgroup.
+pub fn klon_cgroups(pids: &[u32], name: &str) -> Vec<PathBuf> {
     let prefix = format!("klon-{}-", sanitize(name));
+    let mut found: Vec<PathBuf> = Vec::new();
     for pid in pids {
         let Ok(text) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
             continue;
@@ -405,14 +429,16 @@ pub fn klon_cgroup(pids: &[u32], name: &str) -> Option<PathBuf> {
         };
         // A command may make cgroups of its own below klon's, so the walk
         // rises until it finds klon's own directory or leaves the hierarchy.
-        if let Some(found) = ancestors(dir)
+        if let Some(dir) = ancestors(dir)
             .into_iter()
             .find(|dir| is_klon_cgroup(dir, &prefix))
         {
-            return Some(found);
+            if !found.contains(&dir) {
+                found.push(dir);
+            }
         }
     }
-    None
+    found
 }
 
 /// True when `dir` is named `<prefix><digits>`, with the `.scope` suffix that

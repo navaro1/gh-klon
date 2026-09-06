@@ -80,35 +80,45 @@ fn mem_total() -> u64 {
     kib * 1024
 }
 
-/// The `scope` row of `doctor --json`: the mechanism a `run` in this
-/// repository would take, and its detail. A row that is not `present` means
-/// the host gives klon no memory cap, and the cap tests then skip.
-fn scope_row(fx: &Fixture) -> (String, String) {
+/// One feature row of `doctor --json`: its status and its detail.
+fn feature_row(fx: &Fixture, name: &str) -> (String, String) {
     let out = klon(&fx.golden, &["--json", "doctor"]);
     assert!(out.status.success(), "doctor failed: {}", stderr(&out));
     let document: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("valid JSON");
-    let row = &document["features"]["scope"];
+    let row = &document["features"][name];
     (
-        row["status"].as_str().expect("a status").to_string(),
+        row["status"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no {name} row"))
+            .to_string(),
         row["detail"].as_str().expect("a detail").to_string(),
     )
 }
 
-/// The memory cap that a command under `run <branch>` really carries.
-fn memory_high_under_run(fx: &Fixture, branch: &str) -> u64 {
+/// The memory cap that a command under `run <branch>` really carries, or None
+/// when `run` itself said that this host gave it no memory cap. `run` is the
+/// only honest source: a host can hold a controller and still refuse the
+/// `mkdir`, and then the command runs under `nice` with no cap at all.
+fn memory_high_under_run(fx: &Fixture, branch: &str) -> Option<u64> {
     let out = klon(
         &fx.golden,
         &["run", branch, "--", "sh", "-c", READ_MEMORY_HIGH],
     );
-    assert!(
-        out.status.success(),
-        "run {branch} failed: {}",
-        stderr(&out)
-    );
+    let note = stderr(&out);
+    if note.contains("nice -n") || note.contains("no resource cap") {
+        println!(
+            "skipped: this host gives klon no memory cap: {}",
+            note.trim()
+        );
+        return None;
+    }
+    assert!(out.status.success(), "run {branch} failed: {note}");
     let text = stdout(&out);
-    text.trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("memory.high is not a number: {text:?}"))
+    Some(
+        text.trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("memory.high is not a number: {text:?}")),
+    )
 }
 
 /// Assert that `got` is `MemTotal / share` within 1 %. The kernel rounds
@@ -208,12 +218,10 @@ fn run_caps_memory_at_the_share_of_one_klon() {
     }
     let fx = fixture();
     add(&fx, "feature");
-    let (status, detail) = scope_row(&fx);
-    if status != "present" {
-        println!("skipped: this host gives klon no memory cap: {detail}");
+    let Some(got) = memory_high_under_run(&fx, "feature") else {
         return;
-    }
-    assert_share(memory_high_under_run(&fx, "feature"), 2);
+    };
+    assert_share(got, 2);
 }
 
 /// AC: with two live klons, a new `run` gets `MemTotal / 3`. A command runs in
@@ -240,16 +248,48 @@ fn two_live_klons_leave_a_third_of_the_memory_each() {
         "the sibling command never started"
     );
 
-    let (status, detail) = scope_row(&fx);
-    if status != "present" {
-        println!("skipped: this host gives klon no memory cap: {detail}");
-        return;
+    if let Some(got) = memory_high_under_run(&fx, "feature") {
+        assert_share(got, 3);
     }
-    assert_share(memory_high_under_run(&fx, "feature"), 3);
 
     let out = klon(&fx.golden, &["stop", &name]);
     assert!(out.status.success(), "stop failed: {}", stderr(&out));
     drop(reaper);
+}
+
+/// AC: `doctor` reports the delegated controllers. The two rows beside it name
+/// the systemd version and the mechanism the next `run` would take.
+#[test]
+fn doctor_reports_the_scope_the_controllers_and_the_systemd_version() {
+    let fx = fixture();
+    add(&fx, "feature");
+
+    let (status, detail) = feature_row(&fx, "cgroup.controllers");
+    if status == "present" {
+        assert!(
+            detail.split_whitespace().any(|word| word == "memory"),
+            "a delegated memory controller must show: {detail}"
+        );
+    } else {
+        println!("note: this host delegates no controller: {detail}");
+    }
+
+    // The scope row names the mechanism, and `run` must take the same one.
+    let (scope_status, scope_detail) = feature_row(&fx, "scope");
+    let capped = memory_high_under_run(&fx, "feature").is_some();
+    assert_eq!(
+        scope_status == "present",
+        capped,
+        "doctor says {scope_status} ({scope_detail}) and run says capped={capped}"
+    );
+
+    let (systemd_status, systemd_detail) = feature_row(&fx, "systemd-run");
+    if systemd_status == "present" {
+        assert!(
+            systemd_detail.starts_with("systemd "),
+            "the row must hold a version line: {systemd_detail}"
+        );
+    }
 }
 
 // --- stop --------------------------------------------------------------------
