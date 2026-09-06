@@ -1,5 +1,5 @@
-//! `gh klon merge <branch> [--no-ff | --ff-only] [--keep]`: land a klon's
-//! branch in golden and remove the klon (handoff §6, R24).
+//! `gh klon merge <branch> [--no-ff | --ff-only] [--keep] [--no-check]`: land
+//! a klon's branch in golden and remove the klon (handoff §6, R24).
 //!
 //! The command runs six steps in order. Each one refuses before the next one
 //! changes anything, so a merge that stops leaves golden where it stood.
