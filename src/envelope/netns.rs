@@ -28,18 +28,20 @@ pub fn ports(flag: Option<&[u16]>, config: Option<&[u16]>) -> Vec<u16> {
     flag.or(config).unwrap_or(DEFAULT_PORTS).to_vec()
 }
 
-/// The port mapping `-t` value for one address: `127.0.0.2/3000,5173`. An
-/// empty list maps nothing, which is the documented spec `none`.
-fn port_spec(ip: &str, ports: &[u16]) -> String {
+/// The value of the port mapping `-t` option for one address:
+/// `127.0.0.2/3000,5173`. An empty list maps nothing, which is the documented
+/// spec `none`. The value is its own argv element: getopt would read a space
+/// inside `-t <value>` as the first character of the value.
+fn port_value(ip: &str, ports: &[u16]) -> String {
     if ports.is_empty() {
-        return "-t none".to_string();
+        return "none".to_string();
     }
     let list = ports
         .iter()
         .map(u16::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    format!("-t {ip}/{list}")
+    format!("{ip}/{list}")
 }
 
 /// The envelope part: pasta with the host's network configuration, the port
@@ -50,7 +52,8 @@ fn part(ip: &str, ports: &[u16]) -> Part {
         wrapper: vec![
             "pasta".to_string(),
             "--config-net".to_string(),
-            port_spec(ip, ports),
+            "-t".to_string(),
+            port_value(ip, ports),
             "--".to_string(),
         ],
     }
@@ -98,7 +101,7 @@ mod tests {
     #[test]
     fn an_empty_flag_means_no_forwarded_ports() {
         assert_eq!(ports(Some(&[]), None), Vec::<u16>::new());
-        assert_eq!(port_spec("127.0.0.2", &[]), "-t none");
+        assert_eq!(port_value("127.0.0.2", &[]), "none");
     }
 
     #[test]
@@ -110,9 +113,13 @@ mod tests {
             vec![
                 "pasta".to_string(),
                 "--config-net".to_string(),
-                "-t 127.0.0.3/3000,5173".to_string(),
+                "-t".to_string(),
+                "127.0.0.3/3000,5173".to_string(),
                 "--".to_string(),
             ]
         );
+        // No argv element holds a space: getopt would read it as part of the
+        // option value.
+        assert!(part.wrapper.iter().all(|word| !word.contains(' ')));
     }
 }
