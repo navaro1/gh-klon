@@ -742,16 +742,28 @@ fn fill(
     // What the spare record says about the tree, and what the checkout is
     // about to change in it (G1). One `git diff-tree` between the commit the
     // spare was made from and the branch names every path the checkout will
-    // write or remove. Two things follow from that list:
+    // write or remove. The recorded lists are shortcuts around two walks of
+    // the whole tree, and each holds only while the tree the spare carries
+    // still matches the commit that diff starts from. Four conditions say
+    // when it does:
     //
-    // - The path fixup may run beside the checkout only when no such path
-    //   lies under a recorded ignored entry: a branch that tracks files
-    //   inside a directory golden ignores would have the checkout and the
-    //   fixup write the same files.
-    // - The recorded untracked list is exact only when no `.gitignore`
-    //   changes between the two commits: a branch that drops a rule turns
-    //   ignored paths into untracked ones, and only a status after the
-    //   checkout sees them.
+    // - `index_matches_head`: the spare carries the index golden had when
+    //   the builder ran. A staged change makes the spare's files differ from
+    //   `head` in a way a diff between two commits cannot name. A staged
+    //   `git rm --cached` of a file an ignore rule matches is the case that
+    //   bites: the diff says nothing, and the checkout restores the file as
+    //   tracked while the fixup treats it as ignored.
+    // - `shared_ignore_hash`: `info/exclude` and `core.excludesFile` decide
+    //   what is ignored, live in no commit, and so no diff can see them
+    //   change.
+    // - `rules_stable`: no `.gitignore` differs between the two commits. A
+    //   branch that drops a rule turns ignored paths into untracked ones,
+    //   and a branch that adds one turns an untracked directory into an
+    //   ignored one that the recorded entries do not name.
+    // - `entries_safe`: no path the checkout writes meets a recorded ignored
+    //   entry. `meets` is symmetric on purpose: a branch may track files
+    //   inside an ignored directory, and it may also replace the directory
+    //   itself with a tracked file or symlink of the same name.
     //
     // A spare from an older builder has neither list, and a direct clone has
     // no record at all; both take the git-asked paths below.
@@ -760,21 +772,26 @@ fn fill(
         let touched = tree_diff(path, &meta.head, branch)?;
         Some((entries, touched))
     });
-    let entries_safe = recorded.as_ref().is_some_and(|(entries, touched)| {
-        !touched.iter().any(|changed| {
-            entries.iter().any(|entry| match entry.strip_suffix('/') {
-                Some(dir) => {
-                    changed.starts_with(dir.as_bytes()) && changed.get(dir.len()) == Some(&b'/')
-                }
-                None => changed == entry.as_bytes(),
-            })
-        })
+    let spare_tree_is_its_commit = spare_meta.as_ref().is_some_and(|meta| {
+        meta.index_matches_head == Some(true)
+            && meta.shared_ignore_hash.as_deref()
+                == Some(spare::shared_ignore_hash(golden, common).as_str())
     });
-    let rules_stable = recorded.as_ref().is_some_and(|(_, touched)| {
-        !touched
-            .iter()
-            .any(|changed| crate::untracked::is_ignore_file(changed))
-    });
+    let rules_stable = spare_tree_is_its_commit
+        && recorded.as_ref().is_some_and(|(_, touched)| {
+            !touched
+                .iter()
+                .any(|changed| crate::untracked::is_ignore_file(changed))
+        });
+    // The recorded entries are safe to walk beside the checkout only while
+    // the rules that produced them still hold, so this builds on
+    // `rules_stable`.
+    let entries_safe = rules_stable
+        && recorded.as_ref().is_some_and(|(entries, touched)| {
+            !touched
+                .iter()
+                .any(|changed| entries.iter().any(|entry| meets(changed, entry)))
+        });
     let recorded_untracked = spare_meta
         .as_ref()
         .filter(|_| rules_stable)
@@ -929,6 +946,22 @@ struct Filled {
     /// True when `fill` ran the forced `git status` itself. Else the builder
     /// that `spawn` starts runs it in the background (G1).
     warmed_inline: bool,
+}
+
+/// True when a path the checkout writes and a recorded ignored entry can
+/// touch the same file. The two meet when they are equal, when the changed
+/// path lies inside the entry, or when the entry lies inside the changed
+/// path. The last case is the one a descendant-only test misses: a branch
+/// that replaces an ignored `build/` with a tracked symlink named `build`
+/// changes the path `build`, which no descendant test matches.
+fn meets(changed: &[u8], entry: &str) -> bool {
+    fn inside(inner: &[u8], outer: &[u8]) -> bool {
+        inner.len() > outer.len()
+            && inner.starts_with(outer)
+            && inner.get(outer.len()) == Some(&b'/')
+    }
+    let entry = entry.strip_suffix('/').unwrap_or(entry).as_bytes();
+    changed == entry || inside(changed, entry) || inside(entry, changed)
 }
 
 /// The paths that differ between the tree of `from` and the tree of

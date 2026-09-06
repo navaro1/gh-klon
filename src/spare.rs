@@ -128,6 +128,21 @@ pub struct Meta {
     /// then asks git.
     #[serde(default)]
     pub ignored_entries: Option<Vec<String>>,
+    /// True when golden's index held nothing that its HEAD commit does not,
+    /// at the moment the builder copied that index (G1). The spare carries
+    /// that index, so a staged change makes the spare's tree differ from
+    /// `head` in a way that a diff between two commits cannot name. `add`
+    /// takes neither the recorded entries nor the recorded untracked list
+    /// unless this is `Some(true)`. None in a record from an older builder.
+    #[serde(default)]
+    pub index_matches_head: Option<bool>,
+    /// The SHA-256 of the ignore rules that no commit holds:
+    /// `<common>/info/exclude` and the file `core.excludesFile` names (G1).
+    /// A diff between two commits cannot see a change to either, so `add`
+    /// compares this hash before it trusts the recorded lists. None in a
+    /// record from an older builder.
+    #[serde(default)]
+    pub shared_ignore_hash: Option<String>,
 }
 
 /// What the builder did.
@@ -155,8 +170,9 @@ pub enum Claim {
 
 /// What the judgement of a spare record says.
 enum Judgement {
-    /// The record is sound and the spare may serve this call.
-    Usable(Meta),
+    /// The record is sound and the spare may serve this call. Boxed, because
+    /// the record is far larger than the string of the other two variants.
+    Usable(Box<Meta>),
     /// The spare is wrong for every call and must go: torn, made under other
     /// exclusion rules, or unreadable. The string is the line for stderr.
     Discard(String),
@@ -196,7 +212,7 @@ fn judge(golden: &Path, layout: &Layout, wanted: Option<&str>) -> Judgement {
             meta.backend
         ));
     }
-    Judgement::Usable(meta)
+    Judgement::Usable(Box::new(meta))
 }
 
 /// True when a spare sits next to golden and its record passes every check
@@ -232,6 +248,38 @@ fn exclusions_hash(golden: &Path) -> String {
         hasher.update(bytes.len().to_le_bytes());
         hasher.update(&bytes);
     }
+    config::hex(&hasher.finalize())
+}
+
+/// The SHA-256 of the ignore rules that no commit holds: the shared
+/// `<common>/info/exclude` and whatever `core.excludesFile` points at. A
+/// `git diff-tree` between two commits cannot see a change to either, so the
+/// builder records this and `add` compares it before it trusts the recorded
+/// lists (G1). A file that cannot be read counts as empty, which is what git
+/// does with a missing one.
+pub fn shared_ignore_hash(golden: &Path, common: &Path) -> String {
+    let mut hasher = Sha256::new();
+    let mut feed = |bytes: &[u8]| {
+        hasher.update(bytes.len().to_le_bytes());
+        hasher.update(bytes);
+    };
+    feed(&fs::read(common.join("info").join("exclude")).unwrap_or_default());
+    // git expands a leading `~/` in `core.excludesFile` against $HOME. No
+    // other form of the value is a path that this code can read, so any
+    // other value hashes as empty and the comparison stays stable.
+    let named = git::run(golden, &["config", "--get", "core.excludesFile"])
+        .map(|out| out.trim().to_string())
+        .unwrap_or_default();
+    let global = match named.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest)),
+        None if named.is_empty() => None,
+        None => Some(PathBuf::from(&named)),
+    };
+    feed(
+        &global
+            .and_then(|file| fs::read(file).ok())
+            .unwrap_or_default(),
+    );
     config::hex(&hasher.finalize())
 }
 
@@ -421,6 +469,12 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
     );
 
     let head = git::run(golden, &["rev-parse", "HEAD"])?.trim().to_string();
+    // `diff-index --cached` names what the index holds that the commit does
+    // not. An empty answer means the copied index describes `head` exactly.
+    let index_matches_head = git::run(golden, &["diff-index", "--cached", "--name-only", &head])
+        .ok()
+        .map(|out| out.trim().is_empty());
+    let shared_ignore_hash = Some(shared_ignore_hash(golden, &common));
     let status = git::run(golden, &["status", "--porcelain"])?;
     let status_hash = config::hex(&Sha256::digest(status.as_bytes()));
     let (before, _) = ignored_listing(golden, &exclude)?;
@@ -441,6 +495,8 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
                 created: time::now_rfc3339(),
                 untracked,
                 ignored_entries: Some(entries),
+                index_matches_head,
+                shared_ignore_hash,
             };
             let text = serde_json::to_string_pretty(&meta)
                 .map_err(|err| Error::klon(format!("serialize spare.json: {err}")))?;
@@ -698,7 +754,7 @@ pub fn claim(golden: &Path, path: &Path, admin_dir: &Path, wanted: Option<&str>)
     if let Err(err) = fs::remove_dir_all(&stub) {
         eprintln!("klon: cannot remove {}: {err}", stub.display());
     }
-    Ok(Claim::Used(Box::new(meta)))
+    Ok(Claim::Used(meta))
 }
 
 /// Move the spare's index files into the admin entry: `.klon/index` and any
@@ -984,6 +1040,8 @@ mod tests {
             created: time::now_rfc3339(),
             untracked: Some(vec!["junk.txt".to_string()]),
             ignored_entries: Some(vec!["build/".to_string(), "CMakeCache.txt".to_string()]),
+            index_matches_head: Some(true),
+            shared_ignore_hash: Some("0".repeat(64)),
         };
         let text = serde_json::to_string(&meta).unwrap();
         let read: Meta = serde_json::from_str(&text).unwrap();
