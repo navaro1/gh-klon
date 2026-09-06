@@ -146,8 +146,9 @@ fn a_passing_pre_merge_hook_lets_the_merge_through() {
     assert_eq!(report["removed"], true);
 }
 
-/// Without a hook the approved `[proof] steps` are the gate. A step that fails
-/// stops the merge in the same way.
+/// Without a hook the approved `[proof] steps` are the gate. Since C26 they
+/// run under `gh klon check`, and `merge` reads the receipt they wrote, so a
+/// step that fails stops the merge through the receipt.
 #[test]
 fn a_failing_proof_step_stops_the_merge() {
     let fx = repo(20);
@@ -161,15 +162,39 @@ fn a_failing_proof_step_stops_the_merge() {
     );
     let klon_dir = add(&fx, "feature");
     let before = head(&fx.golden);
+    let approvals = fx.golden.parent().unwrap().as_os_str();
 
+    // A repository with `[proof] steps` and no receipt never reaches the merge.
     let out = klon_env(
         &fx.golden,
-        &[("KLON_CONFIG_HOME", fx.golden.parent().unwrap().as_os_str())],
+        &[("KLON_CONFIG_HOME", approvals)],
+        &["--yes", "merge", "feature"],
+    );
+    assert!(
+        !out.status.success(),
+        "a missing receipt must fail the merge"
+    );
+    assert!(
+        stderr(&out).contains("receipt missing"),
+        "stderr: {}",
+        stderr(&out)
+    );
+
+    // The check runs the step, the step fails, and the merge refuses again.
+    let out = klon_env(
+        &fx.golden,
+        &[("KLON_CONFIG_HOME", approvals)],
+        &["--yes", "check", "feature"],
+    );
+    assert!(!out.status.success(), "a failed step must fail the check");
+    let out = klon_env(
+        &fx.golden,
+        &[("KLON_CONFIG_HOME", approvals)],
         &["--yes", "merge", "feature"],
     );
     assert!(!out.status.success(), "a failed step must fail the merge");
     assert!(
-        stderr(&out).contains("pre_merge failed: exit 3"),
+        stderr(&out).contains("receipt failed"),
         "stderr: {}",
         stderr(&out)
     );

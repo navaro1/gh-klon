@@ -89,13 +89,13 @@ The table is the product shape from the handoff. The status column says what wor
 | `gh klon add --pr <n>` | A pull request, forks included, from `refs/pull/<n>/head`. | done |
 | `gh klon add --issue <n>` | A new branch named from the issue title. | done |
 | `gh klon add <branch> -- <cmd...>` | Spawn, then run a command inside the envelope. | done |
-| `gh klon list [--json]` | Path, branch, disk delta, RSS, live processes, PR number, checks, vs-base, vs-siblings, behind. | partial: path, branch, HEAD, dirty, locked, the loopback address, vs-base, vs-siblings, and behind print today; the disk, RSS, process, PR, and checks columns land with later chunks |
+| `gh klon list [--json]` | Path, branch, disk delta, RSS, live processes, PR number, checks, receipt, vs-base, vs-siblings, behind. | partial: path, branch, HEAD, dirty, locked, the loopback address, the receipt mark, vs-base, vs-siblings, and behind print today; the disk, RSS, process, PR, and checks columns land with later chunks |
 | `gh klon rm (<branch> \| --path <p>) [--merged] [--delete-branch] [--force]` | Same as `git worktree remove`. Deletes the branch only with `--merged` or `--delete-branch`. Async delete. Refuses a dirty tree or a tree with live processes without `--force`. | done |
-| `gh klon prune` | Same as `git worktree prune`, plus journal cleanup. | done |
+| `gh klon prune` | Same as `git worktree prune`, plus journal cleanup and a sweep of the receipts older than 30 days. | done |
 | `gh klon pr <branch>` | `gh pr create` from that tree. | done |
 | `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check] [--force] [--json]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | done. `--json` prints one document per klon, one per line. |
-| `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--json]` | Fetch, `pre_merge` hook, structured merge, advance base, remove. Never pushes. | done. The receipt gate of `check` arrives with v0.2. |
-| `gh klon check <branch>` | v0.2. Run `[proof] steps` at a clean HEAD and record a receipt. | planned for v0.2 |
+| `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--no-check] [--json]` | Fetch, `pre_merge` hook, the `check` receipt gate, structured merge, advance base, remove. Never pushes. | done. Where `.klon.toml` names `[proof] steps`, the branch tip needs a passing receipt; `--no-check` skips that gate. |
+| `gh klon check <branch> [--json]` | Run the approved `[proof] steps` at a clean HEAD and record a receipt under `<common>/klon/receipts/<commit>.json`. | done |
 | `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
 | `gh klon shell <branch>` | An interactive shell inside the envelope. | done on Linux; macOS gets its fence and scope in v0.4 |
@@ -261,11 +261,15 @@ next one changes anything:
 1. Refuse a locked klon, a golden that holds a merge that stopped, a dirty
    golden, a dirty klon, and a golden that is not on `base`.
 2. `git fetch origin`. A repository with no `origin` remote draws one line.
-3. Run the merge gate inside the klon under the envelope: the executable
-   `<klon>/.klon/hooks/pre_merge`, else the approved `[proof] steps`. The first
-   failure prints `pre_merge failed: <cmd>` and golden never moves. klon reads
-   the branch tip before and after the gate and refuses a tip that moved, so
-   the commit that lands is the commit the gate proved.
+3. Run the merge gate. It has two halves, and both can apply. The executable
+   `<klon>/.klon/hooks/pre_merge` runs inside the klon under the envelope, and
+   its failure prints `pre_merge failed: <cmd>`. Then, where `.klon.toml` names
+   `[proof] steps`, the branch tip that step 5 lands needs a passing `check`
+   receipt; see `check` below. `merge` does not run the steps itself. The gate
+   names that tip and never the klon's live HEAD, because a hook can detach the
+   klon between the check and the merge. klon reads the tip before and after
+   the gate and refuses a tip that moved, so the commit that lands is the
+   commit the gate proved.
 4. Configure the mergiraf merge driver when `mergiraf` is on PATH. klon writes
    `merge.mergiraf.driver` to the repository config and two generated lines to
    `<common>/info/attributes`. A host without mergiraf keeps git's line merge,
@@ -281,6 +285,72 @@ next one changes anything:
 `merge` sets `merge.conflictStyle` and `rerere.enabled=true` in the repository
 config. `zdiff3` needs git 2.35; an older git gets `diff3`, because it rejects
 the value it does not know and every merge in the repository would then fail.
+
+## `check` and the receipt
+
+`gh klon check <branch>` runs the approved `[proof] steps` inside the klon and
+records what happened. `merge` reads that record instead of running the steps
+again, so a long test suite runs once, when the agent asks for it.
+
+```toml
+[proof]
+steps = ["cargo fmt --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+```
+
+```sh
+gh klon check feature        # run the steps, write the receipt
+gh klon check --json feature # the same, as one klon.check/1 document
+gh klon merge feature        # reads the receipt; refuses without a passing one
+gh klon merge --no-check feature   # land it without a receipt
+```
+
+`check` refuses a dirty klon and writes nothing: a receipt names a commit, and
+work outside that commit would make the receipt a lie. It refuses a repository
+with no `[proof] steps`. Each step runs as `sh -c` inside the klon under the
+envelope, in file order, and the run stops at the first failure. The steps need
+one approval per `.klon.toml` content hash, the same as the `[warm] steps`.
+
+A test suite takes minutes, and the agent that owns the klon can commit inside
+that window. `check` reads HEAD before the first step and again after the last
+one, and it writes nothing when the two differ: the steps saw two trees and
+prove neither commit.
+
+The receipt lands at `<common>/klon/receipts/<commit>.json`:
+
+```json
+{
+  "version": 1,
+  "commit": "b1946ac92492d2347c6235b4d2611184",
+  "tree": "4b825dc642cb6eb9a060e54bf8d69288",
+  "branch": "feature",
+  "steps_hash": "9f86d081884c7d659a2feaa0c55ad015",
+  "results": [{ "cmd": "cargo test", "status": "pass", "duration_ms": 8421 }],
+  "status": "pass",
+  "duration_ms": 8433,
+  "created": "2026-09-06T10:00:00Z"
+}
+```
+
+**A receipt holds no environment values.** No variable, no working directory,
+and no host name reaches the file. Only the step text from `.klon.toml` is
+recorded, so the file is safe to read, to copy, and to show.
+
+`merge` refuses with one of three lines:
+
+| Line | What happened |
+|---|---|
+| `receipt missing` | Nothing has checked the branch. Run `gh klon check <branch>`. |
+| `receipt stale` | The klon committed after the check, or the `[proof] steps` changed. Run the check again. |
+| `receipt failed` | The steps ran and one of them failed. Fix the branch, then check again. |
+
+`list` shows the verdict in a receipt column before the radar columns: `✓` for
+a passing receipt of the klon's HEAD, `✗` for a failed one, `stale`, and `-`
+where the repository names no `[proof] steps` or nothing has checked the
+branch. `list --json` carries the same answer in the `receipt` field as
+`"pass"`, `"failed"`, `"stale"`, or null.
+
+Receipts are keyed by commit, so a repository collects one file per checked
+commit. `gh klon prune` removes every receipt older than 30 days.
 
 ## The journal and `doctor`
 

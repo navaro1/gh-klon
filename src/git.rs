@@ -254,3 +254,15 @@ pub fn local_branch_exists(cwd: &Path, branch: &str) -> bool {
     let rev = format!("refs/heads/{branch}");
     run(cwd, &["show-ref", "--verify", "--quiet", &rev]).is_ok()
 }
+
+/// The klon that has `branch` checked out. `merge` and `check` both start
+/// here, and both must skip the first entry: the main worktree is not a klon,
+/// so `merge <base>` and `check <base>` never name golden itself.
+pub fn klon_of_branch<'a>(worktrees: &'a [Worktree], branch: &str) -> Result<&'a Worktree> {
+    let full = format!("refs/heads/{branch}");
+    worktrees
+        .iter()
+        .skip(1)
+        .find(|w| w.branch.as_deref() == Some(full.as_str()))
+        .ok_or_else(|| Error::klon(format!("no klon has the branch {branch} checked out")))
+}

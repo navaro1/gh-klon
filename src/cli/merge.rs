@@ -1,13 +1,13 @@
-//! `gh klon merge <branch> [--no-ff | --ff-only] [--keep]`: land a klon's
-//! branch in golden and remove the klon (handoff §6, R24).
+//! `gh klon merge <branch> [--no-ff | --ff-only] [--keep] [--no-check]`: land
+//! a klon's branch in golden and remove the klon (handoff §6, R24).
 //!
 //! The command runs six steps in order. Each one refuses before the next one
 //! changes anything, so a merge that stops leaves golden where it stood.
 //!
 //! 1. Refuse a dirty golden, a dirty klon, and a golden that is not on `base`.
 //! 2. `git fetch` in golden.
-//! 3. Run the merge gate inside the klon: the `pre_merge` hook, else the
-//!    approved `[proof] steps`.
+//! 3. Run the merge gate inside the klon: the `pre_merge` hook, then the C26
+//!    receipt gate where the repository configures `[proof] steps`.
 //! 4. Configure the mergiraf merge driver when the host has mergiraf.
 //! 5. Merge the branch into golden. On a conflict, abort and name the paths.
 //! 6. Remove the klon.
@@ -19,6 +19,7 @@ use crate::cli::rm;
 use crate::config::{self, Ff};
 use crate::envelope::{env, step_stdout, Envelope, Options, Root};
 use crate::journal;
+use crate::receipt::{self, Verdict};
 use crate::{branch, git, paths, process, Error, Result};
 use serde::Serialize;
 use std::fs;
@@ -89,9 +90,17 @@ pub struct Args {
     /// Keep the klon after the merge instead of removing it.
     #[arg(long)]
     pub keep: bool,
+    /// Land the branch without a `check` receipt (C26). The `pre_merge` hook
+    /// still runs.
+    #[arg(long)]
+    pub no_check: bool,
 }
 
-pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
+// `merge` takes no `--yes`: since C26 it runs no repository command of its
+// own. The `pre_merge` hook is a file of the repository, not a `.klon.toml`
+// key, and the `[proof] steps` run under `gh klon check`, which takes the
+// approval there.
+pub fn run(args: Args, json: bool) -> Result<()> {
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     let worktrees = git::worktree_list(&cwd)?;
     let golden = paths::absolute(
@@ -102,18 +111,7 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     )?;
     let common = git::common_dir_of_main(&golden)?;
     let full = format!("refs/heads/{}", args.branch);
-    // The main worktree is not a klon, so `skip(1)` keeps `merge <base>` from
-    // naming golden itself.
-    let entry = worktrees
-        .iter()
-        .skip(1)
-        .find(|w| w.branch.as_deref() == Some(full.as_str()))
-        .ok_or_else(|| {
-            Error::klon(format!(
-                "no klon has the branch {} checked out",
-                args.branch
-            ))
-        })?;
+    let entry = git::klon_of_branch(&worktrees, &args.branch)?;
     let klon = paths::absolute(&entry.path)?;
     // A lock says that somebody wants this klon kept. The check belongs before
     // the merge: `remove_target` refuses a locked klon too, but by then base
@@ -188,7 +186,15 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     // and the agent that owns the klon can commit inside that window, so klon
     // reads the branch tip before and after and refuses a tip that moved.
     let tested = tip(&golden, &full)?;
-    let hook = gate(&klon, &cfg, yes, json)?;
+    let hook = gate(
+        &klon,
+        &common,
+        &args.branch,
+        &tested,
+        &cfg,
+        args.no_check,
+        json,
+    )?;
     let now = tip(&golden, &full)?;
     if now != tested {
         return Err(Error::klon(format!(
@@ -291,33 +297,96 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Step 3: the merge gate. The `pre_merge` hook wins where the klon has an
-/// executable one; else the approved `[proof] steps` run, in file order.
+/// Step 3: the merge gate. It has two halves, and both can apply.
 ///
-/// Every command runs inside the klon under the envelope, so the write fence
-/// holds a test that writes where it should not. The first failure stops the
-/// merge and golden never moves.
-fn gate(klon: &Path, cfg: &config::Config, yes: bool, json: bool) -> Result<Option<&'static str>> {
-    if let Some(hook) = pre_merge_hook(klon) {
-        let argv = vec![hook.to_string_lossy().into_owned()];
-        exec_step(klon, &argv, &hook.display().to_string(), json)?;
-        return Ok(Some(GATE_HOOK));
-    }
+/// The `pre_merge` hook runs first where the klon has an executable one. It
+/// runs inside the klon under the envelope, so the write fence holds a test
+/// that writes where it should not, and a failure stops the merge before
+/// golden moves.
+///
+/// The C26 receipt gate follows where the repository configures `[proof]
+/// steps`. `merge` does not run those steps: `gh klon check` runs them and
+/// writes a receipt, and `merge` reads it. A long test suite then runs once,
+/// when the agent asks for it, instead of inside every merge. `--no-check`
+/// skips this half.
+///
+/// The answer names the gate that ran, for the `hook` field of the report.
+fn gate(
+    klon: &Path,
+    common: &Path,
+    branch: &str,
+    tested: &str,
+    cfg: &config::Config,
+    no_check: bool,
+    json: bool,
+) -> Result<Option<&'static str>> {
+    let hook = match pre_merge_hook(klon) {
+        Some(hook) => {
+            let argv = vec![hook.to_string_lossy().into_owned()];
+            exec_step(klon, &argv, &hook.display().to_string(), json)?;
+            Some(GATE_HOOK)
+        }
+        None => None,
+    };
     let steps = cfg
         .proof
         .as_ref()
         .and_then(|proof| proof.steps.clone())
         .unwrap_or_default();
     if steps.is_empty() {
-        eprintln!("klon: no pre_merge hook and no [proof] steps; merge runs no gate");
-        return Ok(None);
+        if hook.is_none() {
+            eprintln!("klon: no pre_merge hook and no [proof] steps; merge runs no gate");
+        }
+        return Ok(hook);
     }
-    cfg.ensure_approved(yes, &["proof.steps"])?;
-    for step in &steps {
-        let argv = vec!["sh".to_string(), "-c".to_string(), step.clone()];
-        exec_step(klon, &argv, step, json)?;
+    if no_check {
+        eprintln!("klon: --no-check: merge lands {branch} without a check receipt");
+        return Ok(hook);
     }
+    receipt_gate(klon, common, branch, tested, &steps)?;
     Ok(Some(GATE_PROOF))
+}
+
+/// The C26 receipt gate: the commit that `merge` will land needs a receipt of
+/// its own, for the steps that `.klon.toml` names now, whose verdict is `pass`.
+///
+/// The gate names `tested`, the branch tip that step 5 merges, and never the
+/// klon's live HEAD. The two are the same for an idle klon, because `check`
+/// only ever runs in a klon that has the branch checked out. They part where a
+/// `pre_merge` hook, or any other process, detaches the klon between the
+/// check and the merge: a HEAD read here would then prove an old commit while
+/// step 5 lands a newer one. The tip is also re-read after the gate, so a
+/// branch that moves during a long gate stops the merge (see `run`).
+///
+/// Each refusal names what to do next. `receipt missing` means nobody ran
+/// `check` here; `receipt stale` means the branch moved on, or the steps
+/// changed, since the last one; `receipt failed` means the proof ran and said
+/// no.
+fn receipt_gate(
+    klon: &Path,
+    common: &Path,
+    branch: &str,
+    tested: &str,
+    steps: &[String],
+) -> Result<()> {
+    let again = format!("run gh klon check {branch} again, or pass --no-check");
+    match receipt::verdict(common, tested, branch, &receipt::steps_hash(steps))? {
+        Verdict::Pass => Ok(()),
+        Verdict::Failed => Err(Error::klon(format!(
+            "receipt failed: the [proof] steps did not pass at {} in {}; \
+             fix the branch and {again}",
+            short(tested),
+            klon.display()
+        ))),
+        Verdict::Stale => Err(Error::klon(format!(
+            "receipt stale: no passing receipt covers {} with the current [proof] steps; {again}",
+            short(tested)
+        ))),
+        Verdict::Missing => Err(Error::klon(format!(
+            "receipt missing: nothing has checked {branch}; \
+             run gh klon check {branch}, or pass --no-check"
+        ))),
+    }
 }
 
 /// One gate command inside the klon. The envelope spawns and waits, so `merge`

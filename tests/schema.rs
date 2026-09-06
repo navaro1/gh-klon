@@ -69,6 +69,9 @@ const LIST_ROW: Fields = &[
     ("warming", Ty::Arr),
     // C29: true for a klon that `hibernate` put away. Its directory is gone.
     ("hibernated", Ty::Bool),
+    // The C26 receipt verdict: `pass`, `failed`, `stale`, or null when the
+    // repository names no `[proof] steps` or nothing has checked the branch.
+    ("receipt", Ty::StrOrNull),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -133,6 +136,30 @@ const MERGE: Fields = &[
     ("removed", Ty::Bool),
     ("hook", Ty::StrOrNull),
     ("conflicts", Ty::Arr),
+];
+
+/// The C26 `check` document: the receipt fields, plus the schema name and the
+/// klon path. The path is a fact about this host and stays out of the receipt
+/// file itself.
+const CHECK: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("version", Ty::Num),
+    ("commit", Ty::Str),
+    ("tree", Ty::Str),
+    ("branch", Ty::Str),
+    ("steps_hash", Ty::Str),
+    ("results", Ty::Arr),
+    ("status", Ty::Str),
+    ("duration_ms", Ty::Num),
+    ("created", Ty::Str),
+];
+
+/// One row of the `results` array of `klon.check/1`.
+const CHECK_RESULT: Fields = &[
+    ("cmd", Ty::Str),
+    ("status", Ty::Str),
+    ("duration_ms", Ty::Num),
 ];
 
 const STOP: Fields = &[
@@ -469,6 +496,49 @@ fn the_merge_report_matches_its_documented_schema() {
     assert!(merge["conflicts"].as_array().expect("an array").is_empty());
 }
 
+/// `check --json` (C26). The repository needs a committed `[proof]` table, so
+/// this round runs on its own fixture, and `--yes` approves the steps in an
+/// approval store inside the fixture.
+#[test]
+fn the_check_report_matches_its_documented_schema() {
+    let fx = Fixture::generate(SEED, 30, 3, 3, 2);
+    identity(&fx.golden);
+    std::fs::write(
+        fx.golden.join(".klon.toml"),
+        "[proof]\nsteps = [\"true\"]\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["add", ".klon.toml"],
+        vec!["commit", "-qm", "add the proof steps"],
+    ] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fx.golden)
+            .args(&args)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+    }
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+
+    let out = klon_env(
+        &fx.golden,
+        &[("KLON_CONFIG_HOME", fx.golden.parent().unwrap().as_os_str())],
+        &["--yes", "check", "--json", "feature"],
+    );
+    assert!(out.status.success(), "check failed: {}", stderr(&out));
+    let check = parse(&stdout(&out));
+    check_ok(&check, CHECK);
+    assert_eq!(check["schema"], "klon.check/1");
+    assert_eq!(check["branch"], "feature");
+    assert_eq!(check["status"], "pass");
+    assert_eq!(check["version"], 1);
+    check_rows(&check, "results", CHECK_RESULT);
+    assert_eq!(check["results"].as_array().expect("an array").len(), 1);
+}
+
 /// `doctor --repair` fills `repaired` with rows of the documented shape.
 #[test]
 fn a_repair_row_matches_the_documented_schema() {
@@ -651,6 +721,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "pr": 7,
         "checks": "pass",
         "warming": [],
+        "receipt": "pass",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
@@ -674,6 +745,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "pr": Value::Null,
         "checks": Value::Null,
         "warming": [],
+        "receipt": Value::Null,
         "vs_base": "-",
         "vs_siblings": "-",
         "behind": Value::Null,
@@ -695,6 +767,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "pr": 7,
         "checks": "pass",
         "warming": [],
+        "receipt": "pass",
         "vs_base": Value::Null,
         "vs_siblings": "clean",
         "behind": 0,
@@ -739,6 +812,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "pr": 7,
         "checks": "pass",
         "warming": [],
+        "receipt": "pass",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,

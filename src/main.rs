@@ -18,6 +18,7 @@ mod paths;
 mod probe;
 mod process;
 mod radar;
+mod receipt;
 mod repair;
 mod space;
 mod spare;
@@ -123,6 +124,8 @@ enum Command {
     Sync(cli::sync::Args),
     /// Land a klon's branch in base, then remove the klon. Never pushes.
     Merge(cli::merge::Args),
+    /// Run the approved `[proof] steps` in a klon and write a receipt.
+    Check(cli::check::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
     Pr(cli::pr::Args),
     /// Run a command inside a klon under the envelope.
@@ -178,7 +181,8 @@ fn main() -> ExitCode {
         Command::Hibernate(args) => cli::hibernate::run(args, json),
         Command::Wake(args) => cli::wake::run(args, yes, json),
         Command::Sync(args) => cli::sync::run(args, yes, json),
-        Command::Merge(args) => cli::merge::run(args, yes, json),
+        Command::Merge(args) => cli::merge::run(args, json),
+        Command::Check(args) => cli::check::run(args, yes, json),
         Command::Pr(args) => cli::pr::run(args),
         Command::Run(args) => cli::run::run(args),
         Command::Shell(args) => cli::shell::run(args),
