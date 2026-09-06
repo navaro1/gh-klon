@@ -322,9 +322,32 @@ pub fn run(klon: &Path, golden: &Path) -> Result<()> {
         }
     }
     if alive(klon) && state.pending.is_empty() {
+        // The marker goes first, so the last write this process makes to the
+        // klon happens before the cache warm and cannot invalidate it. The
+        // marker lives in `.klon/`, which `info/exclude` hides, so git holds no
+        // cache node for it today; the order keeps that from being load-bearing.
         let _ = fs::remove_file(marker_path(klon));
+        rewarm_untracked_cache(klon);
     }
     Ok(())
+}
+
+/// Rebuild the untracked cache of the klon after the last directory landed
+/// (R11, G2).
+///
+/// `add` warms the cache before this process starts, so the cache records the
+/// root directory as it was without `target/` or `node_modules/`. The landing
+/// rename changes the root mtime and invalidates that one node, and git 2.34
+/// never writes the repair back, so every later `git status` reopens the root.
+/// One forced status here leaves a cache that matches the finished tree.
+///
+/// A failure costs the klon nothing but that reopen, so the result is dropped.
+fn rewarm_untracked_cache(klon: &Path) {
+    let _ = git::run_env(
+        klon,
+        &["status", "--porcelain"],
+        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
+    );
 }
 
 /// The exclusion set of the original clone, rebuilt from the register.

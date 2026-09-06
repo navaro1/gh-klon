@@ -9,25 +9,17 @@ use std::sync::OnceLock;
 
 /// Run `git -C <cwd> <args>` and return its stdout. A non-zero exit becomes `Error::Git`.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(Error::io("run git"))?;
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
-    } else {
-        Err(Error::Git {
-            code: output.status.code().unwrap_or(1),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
+    run_env(cwd, args, &[])
 }
 
 /// Run `git -C <cwd> <args>` with extra environment variables and return its
-/// stdout. `hibernate` (C29) needs `GIT_INDEX_FILE`, which git reads from the
-/// environment only: no command line option names a second index.
+/// stdout. The pairs are added to the inherited environment, not a replacement
+/// for it, so the caller keeps `PATH` and the git identity.
+///
+/// Two callers need it. `hibernate` (C29) needs `GIT_INDEX_FILE`, which git
+/// reads from the environment only: no command line option names a second
+/// index. `add` (G2) needs `GIT_FORCE_UNTRACKED_CACHE`, which is the only way
+/// to make git 2.34 keep the untracked scan it just made.
 pub fn run_env(cwd: &Path, args: &[&str], envs: &[(&str, &OsStr)]) -> Result<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);

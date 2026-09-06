@@ -8,6 +8,7 @@ use crate::envelope::{env, slots};
 use crate::journal::{self, State};
 use crate::{budget, config, fixup, git, hooks, paths, repair, space, spare, warm, Error, Result};
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
@@ -701,7 +702,21 @@ fn fill(
 
     // One status builds the untracked cache in the fresh index. Without it,
     // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
-    git::run(path, &["status", "--porcelain"])?;
+    //
+    // `GIT_FORCE_UNTRACKED_CACHE=1` is what makes the build survive the exit
+    // (R11, G2). git 2.34 reads `core.untrackedCache=true` when it opens the
+    // index, so it builds the cache in memory, but it marks the index dirty
+    // only when the variable above is set (`read_directory` in `dir.c`).
+    // Without the variable `status` throws the whole scan away, and every
+    // later `status` reopens all 1001 directories: 271 ms of the 452 ms first
+    // call on the 100k fixture. With it, the scan lands in the index and the
+    // untracked step costs 7 ms. Later git versions also honour the config
+    // key, and the variable stays correct there.
+    git::run_env(
+        path,
+        &["status", "--porcelain"],
+        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
+    )?;
     steps.mark("status-warm");
     git::run(
         golden,
@@ -716,17 +731,22 @@ fn fill(
 /// is not rewritten, so two concurrent `add` calls do not fight over git's
 /// `config.lock`, and every `add` after the first spawns no `git config`.
 fn ensure_config(golden: &Path) -> Result<()> {
-    const WANTED: [(&str, &str); 3] = [
+    const WANTED: [(&str, &str); 4] = [
         ("core.checkStat", "minimal"),
         ("core.untrackedCache", "true"),
         ("index.version", "4"),
+        // `true` means one thread per CPU. The 100k index of the bench reads
+        // in 18 ms with it and in 38 ms without (G2). git writes the `IEOT`
+        // extension that the threads need whenever the key is on, so the
+        // first index that `add` writes already carries it.
+        ("index.threads", "true"),
     ];
     let current = match git::run(
         golden,
         &[
             "config",
             "--get-regexp",
-            "^(core\\.checkstat|core\\.untrackedcache|index\\.version)$",
+            "^(core\\.checkstat|core\\.untrackedcache|index\\.version|index\\.threads)$",
         ],
     ) {
         Ok(text) => text,

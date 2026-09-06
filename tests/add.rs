@@ -4,11 +4,12 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::{
-    assert_clean, assert_worktree_parity, freeze_times, git_ok, klon, manifest,
+    assert_clean, assert_worktree_parity, freeze_times, git_env, git_ok, klon, manifest,
     manifest_without_times, stderr, Entry, Fixture, BIN,
 };
 
@@ -78,6 +79,10 @@ fn add_feature_on_the_10k_fixture() {
         "true"
     );
     assert_eq!(git_ok(&fx.golden, &["config", "index.version"]).trim(), "4");
+    assert_eq!(
+        git_ok(&fx.golden, &["config", "index.threads"]).trim(),
+        "true"
+    );
     let exclude = fs::read_to_string(fx.golden.join(".git/info/exclude")).unwrap();
     assert_eq!(exclude.lines().filter(|l| *l == "/.klon/").count(), 1);
 
@@ -570,6 +575,11 @@ fn add_100k() {
     assert!(out.status.success(), "add failed: {}", stderr(&out));
     let add = add_start.elapsed();
 
+    // R11, G2: the untracked cache must already hold every directory node, so
+    // the first status opens none of them. This runs before the timings: the
+    // counters say why a timing is what it is.
+    assert_untracked_cache_is_used(&klon_path, &fx.golden.parent().unwrap().join("trace.txt"));
+
     // R11: the first status re-checks 100k files, the second uses the cache.
     let first_start = Instant::now();
     let first = git_ok(&klon_path, &["status", "--porcelain"]);
@@ -595,5 +605,41 @@ fn add_100k() {
     assert_eq!(
         git_ok(&klon_path, &["rev-parse", "HEAD^{tree}"]),
         git_ok(&fx.golden, &["rev-parse", "feature^{tree}"])
+    );
+}
+
+/// R11, G2: the first `git status` reads the untracked cache, it does not
+/// rebuild it.
+///
+/// git 2.34 writes an untracked scan back to the index only when
+/// `GIT_FORCE_UNTRACKED_CACHE` is set, so without it every `git status`
+/// reopened every directory. The counters prove the state of the cache and,
+/// unlike a timing, do not depend on the host load. This check lives inside
+/// the 100k test because the defect needs a tree whose directories are older
+/// than the index: a small fixture is still racy when `add` warms the cache,
+/// the refresh writes the index for its own reason, and the scan rides along.
+fn assert_untracked_cache_is_used(klon_path: &Path, trace: &Path) {
+    let status = git_env(
+        klon_path,
+        &["status", "--porcelain"],
+        &[("GIT_TRACE2_PERF", trace.to_str().expect("a utf-8 path"))],
+    );
+    assert!(status.status.success(), "status failed");
+    let text = fs::read_to_string(trace).expect("read the trace");
+    // A git build that reports no counter says nothing about the cache. Skip
+    // there instead of failing: every host feature is optional (spec §5).
+    if !text.contains("node-creation") {
+        println!("skipped: this git build reports no untracked cache counters");
+        return;
+    }
+    let counters: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("node-creation:") || l.contains("opendir:"))
+        .collect();
+    println!("untracked cache counters: {counters:?}");
+    assert!(
+        text.contains("node-creation:0"),
+        "the first status rebuilt the untracked cache; add must warm it with \
+         GIT_FORCE_UNTRACKED_CACHE=1. Counters: {counters:?}"
     );
 }
