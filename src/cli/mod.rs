@@ -1,6 +1,7 @@
 //! One file per command. The dispatcher in `main.rs` calls `run`.
 
 pub mod add;
+pub mod bench;
 pub mod doctor;
 pub mod list;
 pub mod pr;

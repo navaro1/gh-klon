@@ -1,6 +1,7 @@
 //! `gh-klon`: a `git worktree` replacement that spawns a warm copy of a project.
 
 mod backend;
+mod bench;
 mod branch;
 mod cli;
 mod config;
@@ -107,6 +108,8 @@ enum Command {
     Shell(cli::shell::Args),
     /// End every process of a klon: SIGTERM, then SIGKILL after 3 s.
     Stop(cli::stop::Args),
+    /// Measure klon against a plain worktree on a generated fixture.
+    Bench(cli::bench::Args),
 }
 
 fn main() -> ExitCode {
@@ -140,6 +143,7 @@ fn main() -> ExitCode {
         Command::Run(args) => cli::run::run(args),
         Command::Shell(args) => cli::shell::run(args),
         Command::Stop(args) => cli::stop::run(args, json),
+        Command::Bench(args) => cli::bench::run(args, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
