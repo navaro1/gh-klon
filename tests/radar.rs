@@ -542,17 +542,21 @@ fn assert_radar_budget(golden: &Path, cost: Duration, fixture: &str) {
          ({} git starts in a row cost {sequential:?})",
         RADAR_PAIRS * 2
     );
-    assert!(
-        cost < sequential,
-        "the radar took {cost:?}, more than {} plain git starts in a row ({sequential:?}); \
-         the pairs no longer run together",
-        RADAR_PAIRS * 2
-    );
+    // Both checks need a quiet host: under a heavy parallel build the pool of
+    // git processes can lose to the sequential run, and the wall clock means nothing.
     match load_and_cpus() {
-        Some((load, cpus)) if cpus >= QUIET_CPUS && load < cpus / 2.0 => assert!(
-            cost < RADAR_LIMIT,
-            "the radar for 5 klons took {cost:?}, over the {RADAR_LIMIT:?} limit"
-        ),
+        Some((load, cpus)) if cpus >= QUIET_CPUS && load < cpus / 2.0 => {
+            assert!(
+                cost < sequential,
+                "the radar took {cost:?}, more than {} plain git starts in a row ({sequential:?}); \
+                 the pairs no longer run together",
+                RADAR_PAIRS * 2
+            );
+            assert!(
+                cost < RADAR_LIMIT,
+                "the radar for 5 klons took {cost:?}, over the {RADAR_LIMIT:?} limit"
+            )
+        }
         Some((load, cpus)) => println!(
             "  the {RADAR_LIMIT:?} limit did not apply: this host has {cpus} cpus at load \
              {load}; the limit needs at least {QUIET_CPUS} cpus and half of them free"
