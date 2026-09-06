@@ -1,16 +1,17 @@
 //! `gh klon check <branch>`: run the approved `[proof] steps` in a klon at a
 //! clean HEAD and write a receipt (handoff §6, R25).
 //!
-//! The command runs five steps in order:
+//! The command runs six steps in order:
 //!
 //! 1. Find the klon that has `branch` checked out.
 //! 2. Refuse a dirty klon. A receipt names a commit, and a dirty tree is not
 //!    that commit, so klon writes nothing at all.
-//! 3. Refuse a repository with no `[proof] steps`, and take the approval for
-//!    the ones it has.
+//! 3. Read the claim table (C27). Refuse a repository with no `[proof] steps`,
+//!    and take the approval for the ones it has.
 //! 4. Run every step inside the klon under the envelope, in file order, and
 //!    stop at the first failure. Refuse a klon whose HEAD moved while they ran.
-//! 5. Write `<common>/klon/receipts/<commit>.json`.
+//! 5. Name every path the klon changed outside its claims (C27).
+//! 6. Write `<common>/klon/receipts/<commit>.json`.
 //!
 //! `merge` then reads that receipt instead of running the steps again, so a
 //! long test suite runs once, when the agent asks for it, and not inside the
@@ -18,7 +19,7 @@
 
 use crate::envelope::{step_stdout, Envelope, Options, Root};
 use crate::receipt::{self, Receipt, StepResult};
-use crate::{config, git, paths, process, Error, Result};
+use crate::{branch, claims, config, git, paths, process, Error, Result};
 use serde::Serialize;
 use std::path::Path;
 use std::time::Instant;
@@ -68,7 +69,12 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         )));
     }
 
-    // --- Step 3: the steps and their approval --------------------------------
+    // --- Step 3: the claims and the steps ------------------------------------
+    // The claim table is read before the first step, not after the last. A
+    // table this klon cannot understand must stop the run at the front, where
+    // it costs a person nothing, and not after a suite that took minutes.
+    let claimed = claims::load(&common)?.paths_of(&args.branch);
+
     let cfg = config::load(&golden)?;
     let steps = cfg
         .proof
@@ -118,7 +124,13 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         )));
     }
 
-    // --- Step 5: the receipt -------------------------------------------------
+    // --- Step 5: the claim escapes -------------------------------------------
+    let escaped = claim_escapes(&klon, &golden, &cfg, &commit, &claimed);
+    for path in &escaped {
+        eprintln!("klon: claim escape: {path}");
+    }
+
+    // --- Step 6: the receipt -------------------------------------------------
     let record = receipt::build(
         &commit,
         &tree,
@@ -126,9 +138,62 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         &receipt::steps_hash(&steps),
         results,
         duration_ms,
+        escaped,
     );
     let file = receipt::write(&common, &record)?;
     report(&args, &klon, &file, &record, json)
+}
+
+/// The paths the klon changed against base that no claim of the klon covers.
+///
+/// A klon that holds no claim owns nothing, so nothing it changed can escape,
+/// and the whole computation is then skipped: a repository that never runs
+/// `claim` pays no extra subprocess here.
+///
+/// The comparison is the three-dot range `<base>...<commit>`, which is the
+/// diff from the merge base of the two to the commit. A commit that base took
+/// after the klon started is therefore not a change of this klon.
+///
+/// Two details keep the answer honest. The range names the receipt's own
+/// commit and not `HEAD`, so a commit that lands here reaches neither the
+/// receipt nor this list. And `--no-renames` turns rename detection off: a
+/// klon that moves an unclaimed file into a claimed directory changes both
+/// paths, and the default output would name the destination only.
+///
+/// A comparison klon cannot make costs one stderr line and an empty list. The
+/// receipt then names no escape, which is what klon reports for a klon with no
+/// claim anyway, and a check must not fail on a question it could not ask.
+fn claim_escapes(
+    klon: &Path,
+    golden: &Path,
+    cfg: &config::Config,
+    commit: &str,
+    claimed: &[String],
+) -> Vec<String> {
+    if claimed.is_empty() {
+        return Vec::new();
+    }
+    let base = match branch::base_of(cfg, golden) {
+        Ok(base) => base,
+        Err(err) => {
+            eprintln!("klon: cannot read the base branch: {err}");
+            return Vec::new();
+        }
+    };
+    let range = format!("{base}...{commit}");
+    let text = match git::run(klon, &["diff", "--name-only", "--no-renames", "-z", &range]) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("klon: cannot read the paths that moved against {base}: {err}");
+            return Vec::new();
+        }
+    };
+    let changed: Vec<String> = text
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    claims::escapes(claimed, &changed)
 }
 
 /// One step inside the klon under the envelope: the write fence, the resource

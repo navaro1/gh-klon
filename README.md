@@ -89,14 +89,14 @@ The table is the product shape from the handoff. The status column says what wor
 | `gh klon add --pr <n>` | A pull request, forks included, from `refs/pull/<n>/head`. | done |
 | `gh klon add --issue <n>` | A new branch named from the issue title. | done |
 | `gh klon add <branch> -- <cmd...>` | Spawn, then run a command inside the envelope. | done |
-| `gh klon list [--json]` | Path, branch, disk delta, RSS, live processes, PR number, checks, receipt, vs-base, vs-siblings, behind. | partial: path, branch, HEAD, dirty, locked, the loopback address, the receipt mark, vs-base, vs-siblings, and behind print today; the disk, RSS, process, PR, and checks columns land with later chunks |
+| `gh klon list [--json]` | Path, branch, disk delta, RSS, live processes, PR number, checks, receipt, claims, vs-base, vs-siblings, behind. | partial: path, branch, HEAD, dirty, locked, the loopback address, the receipt mark, the claim count, vs-base, vs-siblings, and behind print today; the disk, RSS, process, PR, and checks columns land with later chunks |
 | `gh klon rm (<branch> \| --path <p>) [--merged] [--delete-branch] [--force]` | Same as `git worktree remove`. Deletes the branch only with `--merged` or `--delete-branch`. Async delete. Refuses a dirty tree or a tree with live processes without `--force`. | done |
 | `gh klon prune` | Same as `git worktree prune`, plus journal cleanup and a sweep of the receipts older than 30 days. | done |
 | `gh klon pr <branch>` | `gh pr create` from that tree. | done |
 | `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check] [--force] [--json]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | done. `--json` prints one document per klon, one per line. |
 | `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--no-check] [--json]` | Fetch, `pre_merge` hook, the `check` receipt gate, structured merge, advance base, remove. Never pushes. | done. Where `.klon.toml` names `[proof] steps`, the branch tip needs a passing receipt; `--no-check` skips that gate. |
 | `gh klon check <branch> [--json]` | Run the approved `[proof] steps` at a clean HEAD and record a receipt under `<common>/klon/receipts/<commit>.json`. | done |
-| `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
+| `gh klon claim <branch> <paths...> [--release] [--json]` | Record the paths a klon owns. A second klon cannot take an overlapping path. `list` flags an overlap and `check` names every change outside the claims. | done |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
 | `gh klon shell <branch>` | An interactive shell inside the envelope. | done on Linux; macOS gets its fence and scope in v0.4 |
 | `gh klon stop <branch>` | Kill the whole process tree of that klon. | done |
@@ -327,7 +327,8 @@ The receipt lands at `<common>/klon/receipts/<commit>.json`:
   "results": [{ "cmd": "cargo test", "status": "pass", "duration_ms": 8421 }],
   "status": "pass",
   "duration_ms": 8433,
-  "created": "2026-09-06T10:00:00Z"
+  "created": "2026-09-06T10:00:00Z",
+  "claim_escape": []
 }
 ```
 
@@ -342,6 +343,60 @@ recorded, so the file is safe to read, to copy, and to show.
 | `receipt missing` | Nothing has checked the branch. Run `gh klon check <branch>`. |
 | `receipt stale` | The klon committed after the check, or the `[proof] steps` changed. Run the check again. |
 | `receipt failed` | The steps ran and one of them failed. Fix the branch, then check again. |
+
+## `claim` and owned paths
+
+Two agents in two klons edit one repository. Nothing stops them from touching
+one file, and the conflict then appears at the merge, hours later. A claim
+moves that discovery to the front.
+
+```sh
+gh klon claim feature src/api docs/api.md   # take two paths
+gh klon claim feature --release docs/api.md # give one back
+gh klon claim feature --release             # give every path back
+```
+
+A claim names a path inside the klon, relative to the klon root. Two paths
+conflict when they are equal, or when one is a prefix of the other at a
+component boundary: `src/app` conflicts with `src/app/main.rs`, and `src/app`
+does not conflict with `src/apple`. The check and the append run under one
+exclusive `flock` on `<common>/klon/claims.lock`, so of two commands that want
+one path exactly one succeeds:
+
+```
+klon: claim conflict: src/app/main.rs held by feature
+```
+
+`claim` refuses a path with a `..` component, an empty path, a path with a
+symlinked ancestor, and an absolute path outside the klon. The table lives at
+`<common>/klon/claims.json`:
+
+```json
+{
+  "version": 1,
+  "claims": [
+    { "klon": "feature", "path": "src/api", "kind": "dir",
+      "created": "2026-09-06T10:00:00Z" }
+  ]
+}
+```
+
+`list` adds a column with the number of owned paths, and a `!` when one of them
+is also owned by another klon. Only a hand edit can reach that state, because
+the append refuses the pair.
+
+`check` names every path the klon changed against base that no claim of the
+klon covers, and records the list in the receipt:
+
+```
+klon: claim escape: src/other/main.rs
+```
+
+A klon that claimed nothing owns nothing, so nothing it changed escapes. An
+escape does not fail the check; it tells the agent that its work left the paths
+it announced. `rm` and `merge` release the claims of the klon they remove. A
+hibernated klon keeps its claims: its work comes back, and the paths it owns
+must still be its own when it does.
 
 `list` shows the verdict in a receipt column before the radar columns: `✓` for
 a passing receipt of the klon's HEAD, `✗` for a failed one, `stale`, and `-`

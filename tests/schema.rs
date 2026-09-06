@@ -72,6 +72,10 @@ const LIST_ROW: Fields = &[
     // The C26 receipt verdict: `pass`, `failed`, `stale`, or null when the
     // repository names no `[proof] steps` or nothing has checked the branch.
     ("receipt", Ty::StrOrNull),
+    // The C27 claims: the paths the klon owns, and whether one of them is
+    // also owned by another klon.
+    ("claims", Ty::Arr),
+    ("claim_overlap", Ty::Bool),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -153,6 +157,9 @@ const CHECK: Fields = &[
     ("status", Ty::Str),
     ("duration_ms", Ty::Num),
     ("created", Ty::Str),
+    // C27: the paths the klon changed that no claim of the klon covers. It is
+    // empty for a klon that holds no claim.
+    ("claim_escape", Ty::Arr),
 ];
 
 /// One row of the `results` array of `klon.check/1`.
@@ -161,6 +168,18 @@ const CHECK_RESULT: Fields = &[
     ("status", Ty::Str),
     ("duration_ms", Ty::Num),
 ];
+
+/// The C27 `claim` document. `claims` names what the klon took and is empty
+/// for a release; `released` names what it gave back and is empty for a claim.
+const CLAIM: Fields = &[
+    ("schema", Ty::Str),
+    ("branch", Ty::Str),
+    ("claims", Ty::Arr),
+    ("released", Ty::Arr),
+];
+
+/// One row of the `claims` array of `klon.claim/1`.
+const CLAIM_ROW: Fields = &[("path", Ty::Str), ("kind", Ty::Str)];
 
 const STOP: Fields = &[
     ("schema", Ty::Str),
@@ -432,6 +451,26 @@ fn every_command_matches_its_documented_schema() {
         check_ok(&row, SYNC);
         assert_eq!(row["schema"], "klon.sync/1");
     }
+
+    // C27. The claim and the release print one document each. The release
+    // empties the table again, so the rows below see the same state as before.
+    let out = klon(&fx.golden, &["claim", "--json", "feature", "d000"]);
+    assert!(out.status.success(), "claim failed: {}", stderr(&out));
+    let claim = parse(&stdout(&out));
+    check_ok(&claim, CLAIM);
+    assert_eq!(claim["schema"], "klon.claim/1");
+    assert_eq!(claim["branch"], "feature");
+    check_rows(&claim, "claims", CLAIM_ROW);
+    assert_eq!(claim["claims"][0]["path"], "d000");
+    assert_eq!(claim["claims"][0]["kind"], "dir");
+    assert!(claim["released"].as_array().expect("an array").is_empty());
+
+    let out = klon(&fx.golden, &["claim", "--json", "--release", "feature"]);
+    assert!(out.status.success(), "release failed: {}", stderr(&out));
+    let released = parse(&stdout(&out));
+    check_ok(&released, CLAIM);
+    assert_eq!(released["released"][0], "d000");
+    assert!(released["claims"].as_array().expect("an array").is_empty());
 
     // C29. The round trip leaves the klon where it was, so the rows below
     // still find it.
@@ -722,6 +761,8 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "checks": "pass",
         "warming": [],
         "receipt": "pass",
+        "claims": ["src/app"],
+        "claim_overlap": false,
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
@@ -746,6 +787,8 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "checks": Value::Null,
         "warming": [],
         "receipt": Value::Null,
+        "claims": [],
+        "claim_overlap": false,
         "vs_base": "-",
         "vs_siblings": "-",
         "behind": Value::Null,
@@ -768,6 +811,8 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "checks": "pass",
         "warming": [],
         "receipt": "pass",
+        "claims": [],
+        "claim_overlap": false,
         "vs_base": Value::Null,
         "vs_siblings": "clean",
         "behind": 0,

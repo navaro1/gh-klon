@@ -15,6 +15,7 @@
 //! `merge` never runs `git push`. Landing a branch and publishing it are two
 //! decisions, and only the user makes the second one.
 
+use crate::claims;
 use crate::cli::rm;
 use crate::config::{self, Ff};
 use crate::envelope::{env, step_stdout, Envelope, Options, Root};
@@ -587,6 +588,9 @@ fn remove(
         );
         return Ok(false);
     }
+    // The owner names are read before the tree moves: one of them lives in
+    // `<klon>/.klon/env`, and the removal takes that file with it.
+    let owners = claims::owners(klon, Some(branch));
     rm::remove_target(
         golden,
         common,
@@ -596,6 +600,13 @@ fn remove(
         rm::Guard::Merged,
         false,
     )?;
+    // The branch landed and the klon is gone, so its C27 claims go too. A
+    // stale claim would block the next klon that wants those paths forever.
+    for name in &owners {
+        if let Err(err) = claims::release_all(common, name) {
+            eprintln!("{err}");
+        }
+    }
     Ok(true)
 }
 

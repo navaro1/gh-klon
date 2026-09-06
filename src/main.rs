@@ -4,6 +4,7 @@ mod backend;
 mod bench;
 mod branch;
 mod budget;
+mod claims;
 mod cli;
 mod config;
 mod envelope;
@@ -126,6 +127,8 @@ enum Command {
     Merge(cli::merge::Args),
     /// Run the approved `[proof] steps` in a klon and write a receipt.
     Check(cli::check::Args),
+    /// Record the paths a klon owns, so a second klon cannot take them.
+    Claim(cli::claim::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
     Pr(cli::pr::Args),
     /// Run a command inside a klon under the envelope.
@@ -183,6 +186,7 @@ fn main() -> ExitCode {
         Command::Sync(args) => cli::sync::run(args, yes, json),
         Command::Merge(args) => cli::merge::run(args, json),
         Command::Check(args) => cli::check::run(args, yes, json),
+        Command::Claim(args) => cli::claim::run(args, json),
         Command::Pr(args) => cli::pr::run(args),
         Command::Run(args) => cli::run::run(args),
         Command::Shell(args) => cli::shell::run(args),
