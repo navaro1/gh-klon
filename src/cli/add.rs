@@ -6,11 +6,38 @@ use crate::backend::{self, Backend, Exclusions};
 use crate::branch;
 use crate::envelope::{env, slots};
 use crate::journal::{self, State};
-use crate::{config, fixup, git, paths, repair, Error, Result};
+use crate::{config, fixup, git, paths, repair, spare, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
+
+/// The `KLON_DEBUG=1` timing lines: one per step of the transaction, so a
+/// reader can see where the time goes.
+struct Steps {
+    on: bool,
+    last: Instant,
+}
+
+impl Steps {
+    fn new() -> Steps {
+        Steps {
+            on: crate::debug(),
+            last: Instant::now(),
+        }
+    }
+
+    /// Print the time since the previous mark under `step`, then restart.
+    fn mark(&mut self, step: &str) {
+        if self.on {
+            eprintln!(
+                "klon: debug: add {step} {:.1} ms",
+                self.last.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        self.last = Instant::now();
+    }
+}
 
 /// The JSON schema name. A field removal or a type change bumps the suffix.
 pub const SCHEMA: &str = "klon.add/1";
@@ -50,6 +77,9 @@ pub struct Args {
     /// then keeps golden's absolute paths in its build artifacts.
     #[arg(long)]
     pub no_fixup: bool,
+    /// Skip the hot spare for this call: clone directly and start no builder.
+    #[arg(long)]
+    pub no_spare: bool,
     /// A command to run in the new klon, after `--`. `add` runs it through
     /// `run` and exits with its exit code.
     #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
@@ -63,8 +93,20 @@ struct Report<'a> {
     path: &'a Path,
     branch: &'a str,
     head: String,
-    backend: &'static str,
+    /// The backend that filled the tree: the spare's own when the spare
+    /// served this `add`, else the selected one.
+    backend: &'a str,
+    /// True when the hot spare served this `add` (C9).
+    spare: bool,
     duration_ms: u64,
+}
+
+/// What `fill` may take from the hot spare (C9).
+struct SparePolicy<'a> {
+    /// False when a switch turned the spare off for this call.
+    on: bool,
+    /// The `--backend` override. A spare made by another backend is skipped.
+    wanted: Option<&'a str>,
 }
 
 /// Directories inside golden where a klon may live.
@@ -80,6 +122,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         ));
     }
     let started = Instant::now();
+    let mut steps = Steps::new();
     let cwd = std::env::current_dir().map_err(Error::io("read the current directory"))?;
     let common = git::common_dir(&cwd)?;
     check_git_path(&common)?;
@@ -105,6 +148,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // One load: the path template and the `[fixup] skip` globs come from the
     // same file, and a second load would repeat its warning lines.
     let config = config::load(&golden)?;
+    let use_spare = spare::enabled(config.spare, args.no_spare);
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
         None => match args.path_mode {
@@ -143,6 +187,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     // the journal entry and before the first repository change (R5). The
     // destination decides whether a block-sharing backend can reach it.
     let choice = backend::select(&golden, &common, Some(&path), args.backend.as_deref())?;
+    steps.mark("resolve-and-probe");
 
     // Step 0: the journal entry precedes the first repository change.
     let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&branch))?;
@@ -166,6 +211,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         return Err(err);
     }
     record.reach(State::Registered)?;
+    steps.mark("register");
 
     let result = fill(
         &golden,
@@ -176,15 +222,27 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         choice.backend.as_ref(),
         &config,
         args.no_fixup,
+        SparePolicy {
+            on: use_spare,
+            wanted: args.backend.as_deref(),
+        },
         &mut record,
+        &mut steps,
     );
     if result.is_err() && cleanup(&golden, &path) {
         // The rollback finished, so the entry has no work left either.
         record.close()?;
     }
-    result?;
+    let spare_backend = result?;
     record.reach(State::Ready)?;
     record.close()?;
+
+    // Step 8: the next spare. The builder is detached and low priority, and a
+    // failure to start it costs one line, never the klon.
+    if use_spare {
+        spare::start_after(&golden, config.spare, args.no_spare);
+        steps.mark("spare-start");
+    }
 
     if json {
         let report = Report {
@@ -192,7 +250,8 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             path: &path,
             branch: &branch,
             head: git::run(&path, &["rev-parse", "HEAD"])?.trim().to_string(),
-            backend: choice.backend.name(),
+            backend: spare_backend.as_deref().unwrap_or(choice.backend.name()),
+            spare: spare_backend.is_some(),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         };
         println!(
@@ -263,10 +322,17 @@ fn check_git_path(path: &Path) -> Result<()> {
     }
 }
 
-/// Step 1: refuse a non-empty path and a path inside golden outside the allowed places.
+/// Step 1: refuse a non-empty path, a path that klon reserves for its spare
+/// and its trash, and a path inside golden outside the allowed places.
 fn check_path(golden: &Path, path: &Path) -> Result<()> {
     if path.is_file() || paths::is_non_empty_dir(path) {
         return Err(Error::klon(format!("path not empty: {}", path.display())));
+    }
+    if let Some(name) = spare::reserved(golden, path) {
+        return Err(Error::klon(format!(
+            "path {} is reserved: klon keeps its spare and its trash under {name}",
+            path.display()
+        )));
     }
     if let Ok(rel) = path.strip_prefix(golden) {
         let allowed = ALLOWED_INSIDE_GOLDEN.iter().any(|d| rel.starts_with(d))
@@ -323,7 +389,8 @@ fn refuse_checked_out(worktrees: &[git::Worktree], branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Steps 3 to 10. Runs after git registered the worktree.
+/// Steps 3 to 10. Runs after git registered the worktree. The answer names
+/// the backend of the hot spare when the spare filled the working directory.
 #[allow(clippy::too_many_arguments)]
 fn fill(
     golden: &Path,
@@ -334,20 +401,34 @@ fn fill(
     backend: &dyn Backend,
     config: &config::Config,
     no_fixup: bool,
+    policy: SparePolicy,
     record: &mut journal::Record,
-) -> Result<()> {
+    steps: &mut Steps,
+) -> Result<Option<String>> {
     let admin_dir = read_admin_dir(path)?;
     exclude_klon_dir(common)?;
 
-    // Step 4: clone golden minus .git, the destination, and every registered worktree.
-    let others = worktrees
-        .iter()
-        .map(|w| paths::absolute(&w.path))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|p| p != golden);
-    let exclude = Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
-    backend.clone(golden, path, &exclude)?;
+    // Step 4: the spare, when one is ready (C9); else clone golden minus .git,
+    // the destination, and every registered worktree.
+    let spare_backend = match policy.on {
+        true => match spare::claim(golden, path, &admin_dir, policy.wanted)? {
+            spare::Claim::Used(name) => Some(name),
+            spare::Claim::Direct => None,
+        },
+        false => None,
+    };
+    let used_spare = spare_backend.is_some();
+    if !used_spare {
+        let others = worktrees
+            .iter()
+            .map(|w| paths::absolute(&w.path))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|p| p != golden);
+        let exclude = Exclusions::new(golden, others.chain(std::iter::once(path.to_path_buf())));
+        backend.clone(golden, path, &exclude)?;
+    }
+    steps.mark(if used_spare { "claim" } else { "clone" });
 
     // Step 5: the .git file points at the admin entry that git created.
     fs::write(
@@ -357,43 +438,51 @@ fn fill(
     .map_err(Error::io("write .git"))?;
     record.reach(State::Cloned)?;
 
-    // Step 6: golden's index with a fresh mtime. `--no-checkout` wrote no index.
+    // Step 6: an index with a fresh mtime. `--no-checkout` wrote no index. The
+    // spare brings the index of the moment it was made, which describes its
+    // files exactly; a direct clone takes golden's.
     let index = admin_dir.join("index");
-    fs::copy(common.join("index"), &index).map_err(Error::io("copy the index"))?;
-    // A split index refers to a shared file beside the original index.
-    let shared = git::run(
-        golden,
-        &["rev-parse", "--path-format=absolute", "--shared-index-path"],
-    )?;
-    let shared = shared.strip_suffix('\n').unwrap_or(&shared);
-    if !shared.is_empty() {
-        let shared = Path::new(shared);
-        let name = shared
-            .file_name()
-            .ok_or_else(|| Error::klon("invalid shared index path"))?;
-        fs::copy(shared, admin_dir.join(name)).map_err(Error::io("copy the shared index"))?;
+    let from_spare = used_spare && spare::take_index(path, &admin_dir)?;
+    if !from_spare {
+        fs::copy(common.join("index"), &index).map_err(Error::io("copy the index"))?;
+        // A split index refers to a shared file beside the original index.
+        let shared = git::run(
+            golden,
+            &["rev-parse", "--path-format=absolute", "--shared-index-path"],
+        )?;
+        let shared = shared.strip_suffix('\n').unwrap_or(&shared);
+        if !shared.is_empty() {
+            let shared = Path::new(shared);
+            let name = shared
+                .file_name()
+                .ok_or_else(|| Error::klon("invalid shared index path"))?;
+            fs::copy(shared, admin_dir.join(name)).map_err(Error::io("copy the shared index"))?;
+        }
     }
     fs::File::open(&index)
         .and_then(|f| f.set_modified(SystemTime::now()))
         .map_err(Error::io("touch the index"))?;
+    if used_spare {
+        // The builder's record and the claim's stub must not reach the klon.
+        spare::drop_metadata(path)?;
+    }
+    steps.mark("index");
 
     // Step 7: shared config that makes the first `git status` cheap.
-    for (key, value) in [
-        ("core.checkStat", "minimal"),
-        ("core.untrackedCache", "true"),
-        ("index.version", "4"),
-    ] {
-        git::run(golden, &["config", key, value])?;
-    }
+    ensure_config(golden)?;
+    steps.mark("config");
 
     // Steps 8 to 10.
     git::run(path, &["checkout", "-q", "--force", branch])?;
+    steps.mark("checkout");
     git::run(path, &["clean", "-fdq"])?;
+    steps.mark("clean");
     // Step 5b: the ignored directories still name golden. `git clean` ran
     // first, so every entry that the pass walks is an ignored one (handoff §4).
     // It runs before the envelope, so the pass never reads the new `.klon/`.
     if !no_fixup {
         fixup::run(golden, path, config)?;
+        steps.mark("fixup");
     }
 
     // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
@@ -401,6 +490,7 @@ fn fill(
     // written before the status below, so the untracked cache already knows it.
     let ip = slots::allocate(common, branch, path)?;
     env::write(path, branch, &ip)?;
+    steps.mark("env");
 
     // The state comes after the envelope, not before it. `doctor --repair`
     // reads `checked-out` as "only the unlock is left" and finishes there, so a
@@ -412,10 +502,44 @@ fn fill(
     // One status builds the untracked cache in the fresh index. Without it,
     // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
     git::run(path, &["status", "--porcelain"])?;
+    steps.mark("status-warm");
     git::run(
         golden,
         &["worktree", "unlock", path.to_str().unwrap_or_default()],
     )?;
+    steps.mark("unlock");
+    Ok(spare_backend)
+}
+
+/// The three keys that make the first `git status` cheap (handoff §4). One
+/// read tells which of them golden lacks; a key that already holds its value
+/// is not rewritten, so two concurrent `add` calls do not fight over git's
+/// `config.lock`, and every `add` after the first spawns no `git config`.
+fn ensure_config(golden: &Path) -> Result<()> {
+    const WANTED: [(&str, &str); 3] = [
+        ("core.checkStat", "minimal"),
+        ("core.untrackedCache", "true"),
+        ("index.version", "4"),
+    ];
+    let current = match git::run(
+        golden,
+        &[
+            "config",
+            "--get-regexp",
+            "^(core\\.checkstat|core\\.untrackedcache|index\\.version)$",
+        ],
+    ) {
+        Ok(text) => text,
+        // Exit 1 means that no key matched.
+        Err(Error::Git { code: 1, .. }) => String::new(),
+        Err(err) => return Err(err),
+    };
+    for (key, value) in WANTED {
+        let wanted = format!("{} {value}", key.to_ascii_lowercase());
+        if !current.lines().any(|line| line == wanted) {
+            git::run(golden, &["config", key, value])?;
+        }
+    }
     Ok(())
 }
 

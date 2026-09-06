@@ -283,7 +283,8 @@ fn pause_if_requested(state: State) {
 
 /// The same injection at a point that is not a journal state. `init` (C7) calls
 /// it with `between-mv`, the window between its two renames, which no state can
-/// name because golden does not exist there.
+/// name because golden does not exist there. The spare claim (C9) calls it with
+/// `spare-claim` and `spare-moved`, before and between its own two renames.
 pub fn pause_at(point: &str) {
     let requested = std::env::var("KLON_TEST_PAUSE_AT").unwrap_or_default();
     if requested != point {

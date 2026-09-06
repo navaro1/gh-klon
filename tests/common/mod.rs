@@ -55,13 +55,18 @@ pub fn klon(cwd: &Path, args: &[&str]) -> Output {
 /// Run `gh-klon <args>` in `cwd` with extra environment variables. The git
 /// config stays isolated. Tests that need an isolated `HOME` or config
 /// directory use this.
+///
+/// The hot spare is off (`KLON_SPARE=0`): a detached builder would run on
+/// while the fixture is deleted, and it would add noise to every timing. The
+/// spare tests pass `KLON_SPARE=1` in `envs`, which wins.
 pub fn klon_env(cwd: &Path, envs: &[(&str, &OsStr)], args: &[&str]) -> Output {
     let mut command = Command::new(BIN);
     command
         .args(args)
         .current_dir(cwd)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KLON_SPARE", "0");
     for (key, value) in envs {
         command.env(key, value);
     }

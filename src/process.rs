@@ -2,6 +2,7 @@
 //! check, the live-process scan, and the detached background delete.
 
 use crate::{git, Error, Result};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -44,14 +45,14 @@ fn live_process_os(dir: &Path) -> Option<u32> {
     None
 }
 
-/// Start a detached `rm -rf` of `target` at the lowest disk and cpu priority.
-/// The call returns at once; the delete continues after `klon` exits.
-/// Every optional tool is checked on PATH before the command uses it, so a
-/// missing tool can never leave the delete silently undone. Each absence
-/// costs one stderr line.
-pub fn spawn_background_delete(target: &Path) -> Result<()> {
+/// The `setsid nice -n 19 ionice -c 3` prefix of a detached low-priority
+/// command, minus every tool that PATH lacks. Each absence costs one stderr
+/// line that names `job`, so a missing tool can never leave the work silently
+/// undone. `ionice` is a Linux tool; on macOS the spare builder lowers its
+/// own priority with `PRIO_DARWIN_BG` instead.
+fn low_priority_prefix(job: &str) -> Vec<&'static str> {
     let mut missing: Vec<&'static str> = Vec::new();
-    let mut words: Vec<&str> = Vec::new();
+    let mut words: Vec<&'static str> = Vec::new();
     if tool_on_path("setsid") {
         words.push("setsid");
     } else {
@@ -62,6 +63,7 @@ pub fn spawn_background_delete(target: &Path) -> Result<()> {
     } else {
         missing.push("nice");
     }
+    #[cfg(target_os = "linux")]
     if tool_on_path("ionice") {
         words.extend(["ionice", "-c", "3"]);
     } else {
@@ -69,24 +71,52 @@ pub fn spawn_background_delete(target: &Path) -> Result<()> {
     }
     if !missing.is_empty() {
         eprintln!(
-            "klon: {} missing from PATH; the delete runs without it",
+            "klon: {} missing from PATH; the {job} runs without it",
             missing.join(" and ")
         );
     }
-    words.extend(["rm", "-rf", "--"]);
-    let (program, prefix) = words.split_first().expect("rm is always appended");
+    words
+}
+
+/// Start `words` detached, with every stream on `/dev/null`. The call returns
+/// at once; the child continues after `klon` exits.
+fn spawn_detached(words: &[&OsStr]) -> std::io::Result<()> {
+    let (program, rest) = words.split_first().expect("a program word");
     Command::new(program)
-        .args(prefix)
-        .arg(target)
+        .args(rest)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
-        .map_err(Error::io(format!(
-            "start the background delete of {}",
-            target.display()
-        )))
+}
+
+/// Start a detached `rm -rf` of `target` at the lowest disk and cpu priority.
+/// The call returns at once; the delete continues after `klon` exits.
+pub fn spawn_background_delete(target: &Path) -> Result<()> {
+    let mut words: Vec<&OsStr> = low_priority_prefix("delete")
+        .into_iter()
+        .map(OsStr::new)
+        .collect();
+    words.extend(["rm", "-rf", "--"].map(OsStr::new));
+    words.push(target.as_os_str());
+    spawn_detached(&words).map_err(Error::io(format!(
+        "start the background delete of {}",
+        target.display()
+    )))
+}
+
+/// Start a detached `gh-klon <args>` at the lowest disk and cpu priority. The
+/// binary is this process, so the child runs the same klon.
+pub fn spawn_detached_klon(args: &[&OsStr], job: &str) -> Result<()> {
+    let exe = std::env::current_exe().map_err(Error::io("find the klon binary"))?;
+    let mut words: Vec<&OsStr> = low_priority_prefix(job)
+        .into_iter()
+        .map(OsStr::new)
+        .collect();
+    words.push(exe.as_os_str());
+    words.extend_from_slice(args);
+    spawn_detached(&words).map_err(Error::io(format!("start the {job}")))
 }
 
 /// True when an executable `name` sits in a PATH directory.

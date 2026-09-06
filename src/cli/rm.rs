@@ -8,6 +8,7 @@ use crate::envelope::slots;
 use crate::journal::{self, State};
 use crate::paths;
 use crate::process;
+use crate::spare;
 use crate::{git, Error, Result};
 use serde::Serialize;
 use std::fs;
@@ -41,6 +42,9 @@ pub struct Args {
     /// Remove a dirty klon or one with live processes.
     #[arg(long)]
     pub force: bool,
+    /// Start no hot-spare builder after the removal.
+    #[arg(long)]
+    pub no_spare: bool,
 }
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -131,6 +135,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         eprintln!("klon: {err}");
     }
     record.close()?;
+    // Step 8: the next spare (R40). The start costs a stat, a lock probe, and
+    // one spawn, well inside the 100 ms budget of R8.
+    spare::start_after(&golden, spare::configured_depth(&golden), args.no_spare);
 
     if let Some((name, evidence)) = merged_branch {
         branch::delete_branch(&golden, &name, &evidence)?;

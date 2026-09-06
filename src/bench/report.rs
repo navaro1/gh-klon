@@ -81,7 +81,8 @@ pub struct Record {
     pub profile_shape: Profile,
     /// The klon backend that filled the tree, or `git-worktree-add`.
     pub backend: String,
-    /// True when a hot spare served the `add`. C9 sets it; v0 has no spare.
+    /// True when a hot spare was ready before every `add` of the record (C9).
+    /// An `add` cell carries two klon records, one per value.
     pub spare: bool,
     /// True when klon dropped the page cache between the samples.
     pub cold: bool,
@@ -379,8 +380,8 @@ impl Report {
             self.environment.git_version
         );
         println!(
-            "{:<16} {:<18} {:>4} {:>9} {:>9} {:>9} {:>6} verdict",
-            "cell", "backend", "runs", "p50 ms", "p95 ms", "steady", "budget"
+            "{:<16} {:<18} {:<5} {:>4} {:>9} {:>9} {:>9} {:>6} verdict",
+            "cell", "backend", "spare", "runs", "p50 ms", "p95 ms", "steady", "budget"
         );
         for record in &self.records {
             let steady = match record.steady_p50_ms {
@@ -388,9 +389,10 @@ impl Report {
                 None => "-".to_string(),
             };
             println!(
-                "{:<16} {:<18} {:>4} {:>9.1} {:>9.1} {:>9} {:>6} {}",
+                "{:<16} {:<18} {:<5} {:>4} {:>9.1} {:>9.1} {:>9} {:>6} {}",
                 record.cell,
                 record.backend,
+                if record.spare { "yes" } else { "no" },
                 record.runs,
                 record.p50_ms,
                 record.p95_ms,
