@@ -10,6 +10,7 @@ mod extras;
 mod fixup;
 mod gh;
 mod git;
+mod hooks;
 mod journal;
 mod paths;
 mod probe;
