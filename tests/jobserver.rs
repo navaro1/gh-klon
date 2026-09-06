@@ -637,6 +637,10 @@ fn write_workspace(root: &std::path::Path) {
 /// Every compile process of this klon: `rustc` and a build script both take one
 /// jobserver token, and the `KLON_ID` tag keeps another agent's parallel build
 /// out of the count.
+///
+/// cargo also asks `rustc` what it supports before it schedules any work, with
+/// `rustc -vV` and `rustc --print=...`. Those calls take no token, so counting
+/// them would report a breach that never happened.
 #[cfg(target_os = "linux")]
 fn compile_processes(name: &str) -> usize {
     let tag = format!("KLON_ID={name}").into_bytes();
@@ -656,12 +660,23 @@ fn compile_processes(name: &str) -> usize {
         let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        let Some(argv0) = cmdline.split(|byte| *byte == 0).next() else {
+        let words: Vec<String> = cmdline
+            .split(|byte| *byte == 0)
+            .filter(|word| !word.is_empty())
+            .map(|word| String::from_utf8_lossy(word).into_owned())
+            .collect();
+        let Some(argv0) = words.first() else {
             continue;
         };
-        let argv0 = String::from_utf8_lossy(argv0);
         let program = argv0.rsplit('/').next().unwrap_or_default();
         if program != "rustc" && !program.contains("build-script") {
+            continue;
+        }
+        // A question to rustc, not a compilation. It holds no token.
+        if words
+            .iter()
+            .any(|word| word == "-vV" || word.starts_with("--print"))
+        {
             continue;
         }
         let Ok(bytes) = fs::read(entry.path().join("environ")) else {

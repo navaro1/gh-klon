@@ -37,18 +37,21 @@
 //!
 //! ## How klon tells an idle store from a busy one
 //!
-//! `run` takes a **shared `flock`** on the store before it hands the
-//! descriptors to the command. The lock sits on the open file description, so
-//! the copies the command inherits carry it, and the kernel drops it when the
-//! last of them closes. A signal that ends the whole tree therefore releases
-//! the lock at the same moment the fifo loses its buffer.
+//! `run` takes a **shared `flock`** on a marker file beside the fifo before it
+//! hands the descriptors to the command, and passes that descriptor down as
+//! well. The lock sits on the open file description, so the copies the command
+//! inherits carry it, and the kernel drops it when the last of them closes. A
+//! signal that ends the whole tree therefore releases the lock at the same
+//! moment the fifo loses its buffer.
 //!
 //! A top-up asks the one question it needs with an **exclusive `flock` that
 //! must succeed at once**. Success proves that no klon holds the store, so
 //! klon may fill it. Any failure means a klon holds it, so klon writes
-//! nothing. The test is exact, needs no process table, and gives macOS the
-//! same answer as Linux (measured: `flock` works on a fifo, two shared holders
-//! stack, and a duplicate keeps the lock alive).
+//! nothing. The test is exact and needs no process table, so macOS gets the
+//! same answer as Linux.
+//!
+//! The marker is a plain file, not the fifo itself: `flock` on a fifo works on
+//! Linux and fails with `ENOTSUP` on macOS (measured in CI).
 
 use crate::envelope::{Envelope, Part};
 use crate::{Error, Result};
@@ -445,13 +448,13 @@ fn top_up_at(anchor: &File, path: &Path, target: usize, job: Job) -> Result<Repo
     };
     // A full store needs no repair, so `run` pays one `ioctl` and no probe.
     if job == Job::Keep && report.available == target {
-        hold(anchor, path)?;
+        hold(dir)?;
         return Ok(report);
     }
     // A second open file description on the same buffer. `O_NONBLOCK` on it
     // never reaches a client, because no copy of it leaves this process.
     let mut scratch = open_store_now(path)?;
-    report.live = probe(&scratch);
+    report.live = probe(dir);
     if report.live == Holders::Idle {
         // No klon holds the store, and none can start: a new `run` must first
         // take the lock this call holds. Nothing can take or give a token now,
@@ -470,24 +473,44 @@ fn top_up_at(anchor: &File, path: &Path, target: usize, job: Job) -> Result<Repo
             report.dropped = take(&mut scratch, report.available - target)?;
         }
     }
-    // The probe lock goes first: it sits on the same fifo, so the shared lock
-    // below would wait on it.
     drop(scratch);
     if job == Job::Keep {
-        hold(anchor, path)?;
+        hold(dir)?;
     }
     drop(serial);
     Ok(report)
 }
 
+/// `<dir>/jobserver.holders`: the file whose shared `flock` says that a klon
+/// holds the store. It is a plain file, because `flock` on a fifo answers
+/// `ENOTSUP` on macOS. It is never read or written; only its lock matters.
+fn marker_path(dir: &Path) -> PathBuf {
+    dir.join("jobserver.holders")
+}
+
+/// Open the marker. `append` and not `truncate`, so two klons that open it
+/// together never fight over its length; the file stays empty for ever.
+fn open_marker(dir: &Path) -> Result<File> {
+    let path = marker_path(dir);
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&path)
+        .map_err(Error::io(format!("open {}", path.display())))
+}
+
 /// Ask whether any klon holds the store. An exclusive lock that the kernel
 /// grants at once proves that no `run` holds its shared lock, so the store is
 /// idle. Every other answer, a failure included, counts as busy: klon must
-/// never write a token that a live client still owns.
-fn probe(file: &File) -> Holders {
-    // SAFETY: the descriptor is open and owned by `file`. The lock releases
-    // when the caller drops that file.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+/// never write a token that a live client still owns. The lock releases at the
+/// end of this call, when the file drops.
+fn probe(dir: &Path) -> Holders {
+    let Ok(marker) = open_marker(dir) else {
+        return Holders::Busy;
+    };
+    // SAFETY: the descriptor is open and owned by `marker`.
+    let rc = unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         Holders::Idle
     } else {
@@ -497,25 +520,32 @@ fn probe(file: &File) -> Holders {
 
 /// Mark the store as held for the life of this command.
 ///
-/// The lock sits on the open file description, so the copies `run` hands to
-/// the command carry it, and the kernel drops it when the last of them closes.
-/// A `kill -9` of the whole tree therefore releases the marker at the same
-/// moment the fifo loses its buffer, and no stale marker can outlive a klon.
+/// The lock sits on the open file description, and the descriptor goes to the
+/// command across `exec`, so the kernel drops the lock when the last process
+/// of the tree closes it. A `kill -9` of the whole tree therefore releases the
+/// marker at the same moment the fifo loses its buffer, and no stale marker
+/// can outlive a klon. klon never closes the descriptor on purpose, exactly as
+/// it never closes the two ends of the store.
 ///
 /// The wait is bounded: the caller holds the serialization lock, and the only
-/// other lock a klon takes on this fifo is shared, which never conflicts.
-fn hold(anchor: &File, path: &Path) -> Result<()> {
+/// other lock a klon takes on the marker is shared, which never conflicts.
+fn hold(dir: &Path) -> Result<()> {
+    let marker = open_marker(dir)?;
+    let path = marker_path(dir);
     loop {
-        // SAFETY: the descriptor is open and owned by `anchor`.
-        let rc = unsafe { libc::flock(anchor.as_raw_fd(), libc::LOCK_SH) };
+        // SAFETY: the descriptor is open and owned by `marker`.
+        let rc = unsafe { libc::flock(marker.as_raw_fd(), libc::LOCK_SH) };
         if rc == 0 {
-            return Ok(());
+            break;
         }
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::Interrupted {
             return Err(Error::io(format!("hold {}", path.display()))(err));
         }
     }
+    // The copy carries the lock and survives `exec`; the original closes here.
+    let _kept = inherit_dup(marker.as_raw_fd(), &path)?;
+    Ok(())
 }
 
 /// Take `count` tokens out of the store. The descriptor is non-blocking, so a
@@ -658,7 +688,8 @@ mod tests {
     }
 
     /// The marker `run` takes is what tells a busy store from an idle one, on
-    /// every system and with no process table.
+    /// every system and with no process table. The lock lands on a plain file
+    /// beside the fifo, because `flock` on a fifo fails on macOS.
     #[test]
     fn a_held_store_is_busy_and_the_top_up_writes_nothing() {
         let store = Store::new();
