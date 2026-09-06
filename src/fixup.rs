@@ -382,9 +382,24 @@ impl Pass {
         };
         let meta = fs::symlink_metadata(path).map_err(Error::io(format!("stat {relative}")))?;
         let new = format!("{}{rest}", self.replacement);
-        fs::remove_file(path).map_err(Error::io(format!("replace {relative}")))?;
-        std::os::unix::fs::symlink(&new, path).map_err(Error::io(format!("relink {relative}")))?;
-        crate::backend::set_symlink_times(path, &meta)?;
+        // A new link beside the old one, then one rename. `symlink` cannot
+        // write over an existing name, and a remove followed by a create would
+        // lose the link if the create failed in between.
+        let temp = temp_beside(path);
+        let build = || -> io::Result<()> {
+            std::os::unix::fs::symlink(&new, &temp)?;
+            let times = filetime::FileTime::from_last_modification_time(&meta);
+            let access = filetime::FileTime::from_last_access_time(&meta);
+            filetime::set_symlink_file_times(&temp, access, times)
+        };
+        if let Err(err) = build() {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::io(format!("relink {relative}"))(err));
+        }
+        if let Err(err) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(Error::io(format!("relink {relative}"))(err));
+        }
         Ok(Some(Change::symlink(&relative)))
     }
 
@@ -477,9 +492,7 @@ fn write_log(klon: &Path, lines: &[Change]) -> Result<()> {
 /// change that store for every project on the host. The rename gives the klon
 /// its own inode and leaves the shared one alone (R4).
 fn replace_content(path: &Path, bytes: &[u8], meta: &fs::Metadata) -> Result<()> {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(TEMP_SUFFIX);
-    let temp = PathBuf::from(name);
+    let temp = temp_beside(path);
     let write = || -> io::Result<()> {
         fs::write(&temp, bytes)?;
         fs::set_permissions(&temp, fs::Permissions::from_mode(meta.permissions().mode()))
@@ -540,6 +553,15 @@ fn walk_error(context: String, err: &ignore::Error) -> Error {
         .map(std::io::Error::kind)
         .unwrap_or(std::io::ErrorKind::Other);
     Error::io(context)(io::Error::new(kind, err.to_string()))
+}
+
+/// The temporary name that a rewrite renames over `path`. It sits in the same
+/// directory, so the rename never crosses a filesystem. The walk skips the
+/// suffix, so a temporary file that outlives its rewrite is never visited.
+fn temp_beside(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(TEMP_SUFFIX);
+    PathBuf::from(name)
 }
 
 /// True when `path` is `.next/cache`, `.ninja_log`, or `.ninja_deps`.
