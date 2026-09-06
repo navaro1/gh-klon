@@ -103,15 +103,19 @@ pub fn merged_evidence(golden: &Path, branch: &str) -> Result<Merged> {
 
 /// Delete the local branch after `rm --merged` removed its klon. `git branch
 /// -d` is the safe delete; it refuses the squash merge, where the merged
-/// evidence is the pull request and the commits are not an ancestor. There a
-/// force is safe only while the branch tip is still a commit that a merged
-/// pull request landed; a newer tip means work that no pull request merged.
+/// evidence is the pull request and the commits are not an ancestor. A force
+/// then needs a fresh proof at delete time, because another process can move
+/// the branch between the gate and this call: the ancestor check repeats
+/// against `base`, and the pull request proof compares the live tip.
 pub fn delete_branch(golden: &Path, branch: &str, evidence: &Merged) -> Result<()> {
     if git::run(golden, &["branch", "-d", branch]).is_ok() {
         return Ok(());
     }
     let forced = match evidence {
-        Merged::Ancestor => true,
+        Merged::Ancestor => {
+            let base = base(golden)?;
+            git::run(golden, &["merge-base", "--is-ancestor", branch, &base]).is_ok()
+        }
         Merged::PullRequest(heads) => {
             let tip = git::run(golden, &["rev-parse", &format!("refs/heads/{branch}")])?;
             heads
@@ -123,8 +127,7 @@ pub fn delete_branch(golden: &Path, branch: &str, evidence: &Merged) -> Result<(
         git::run(golden, &["branch", "-D", branch]).map(|_| ())
     } else {
         Err(Error::klon(format!(
-            "{branch} has commits after its merged pull request; the klon is removed \
-             but the branch stays"
+            "{branch} moved on since the merge proof; the klon is removed but the branch stays"
         )))
     }
 }

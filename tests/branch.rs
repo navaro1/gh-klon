@@ -421,7 +421,7 @@ fn rm_merged_keeps_a_branch_that_moved_on_after_its_merged_pr() {
     let out = klon_gh(&repo.fx.golden, &path_env, &["rm", "--merged", "stale"]);
     assert!(!out.status.success(), "the forced delete must refuse");
     assert!(
-        stderr(&out).contains("after its merged pull request"),
+        stderr(&out).contains("moved on since the merge proof"),
         "stderr: {}",
         stderr(&out)
     );
