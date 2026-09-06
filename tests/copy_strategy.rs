@@ -99,7 +99,15 @@ fn wait_for_landing(klon_path: &Path, dirs: &[&str]) {
 #[test]
 fn add_returns_before_the_big_copy_and_the_manifest_matches_after_it() {
     let fx = warm_fixture();
-    let out = klon_env(&fx.golden, &no_sudo(), &["--json", "add", "feature"]);
+    // `KLON_TEST_WARM_PAUSE` holds the warm process just before its first
+    // rename until the gate file exists, so the window this test proves is
+    // deterministic. The detached warm process inherits the variable from this
+    // `add` process. The gate file sits beside the fixture, outside golden and
+    // outside the klon.
+    let gate = fx.golden.parent().unwrap().join("warm-gate");
+    let mut envs: Vec<(&str, &OsStr)> = no_sudo();
+    envs.push(("KLON_TEST_WARM_PAUSE", gate.as_os_str()));
+    let out = klon_env(&fx.golden, &envs, &["--json", "add", "feature"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
     assert_no_sudo_prompt(&stderr(&out));
     let klon_path = fx.default_klon_path();
@@ -118,7 +126,21 @@ fn add_returns_before_the_big_copy_and_the_manifest_matches_after_it() {
     // The tracked checkout is complete, so the klon is usable at once.
     assert!(klon_path.join(fx.tracked_rel(0)).is_file());
 
-    // `list` reports the klon as warming until the rename lands.
+    // The warm process fills the staging copy and then waits for the gate.
+    // Wait for the staging copy first, so the checks below observe the held
+    // window and not the start of the copy.
+    let staging = klon_path.join("build.klon-warming");
+    let started = Instant::now();
+    while !staging.is_dir() {
+        assert!(
+            started.elapsed() < LANDING,
+            "the warm process never created {staging:?}; warm.log:\n{}",
+            fs::read_to_string(klon_path.join(".klon").join("warm.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // `list` reports the klon as warming while the rename waits for the gate.
     let listed = klon(&fx.golden, &["list"]);
     assert!(listed.status.success(), "list failed: {}", stderr(&listed));
     assert!(
@@ -126,6 +148,10 @@ fn add_returns_before_the_big_copy_and_the_manifest_matches_after_it() {
         "list must show warming while a directory is missing:\n{}",
         stdout(&listed)
     );
+
+    // Write the gate file: the warm process lands the staging copy with its
+    // one rename.
+    fs::write(&gate, b"").expect("write the warm gate file");
 
     wait_for_landing(&klon_path, &["build"]);
 

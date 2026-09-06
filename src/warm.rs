@@ -289,6 +289,8 @@ pub fn run(klon: &Path, golden: &Path) -> Result<()> {
     };
     let config = config::load(golden)?;
     let exclude = clone_exclusions(golden, klon);
+    // The test-only pause fires once, before the first rename of the run.
+    let mut test_pause = true;
     for step in state.steps.clone() {
         // `rm` can take the klon away at any point. Every step checks first,
         // so the warm process never writes into a directory that is on its way
@@ -297,7 +299,15 @@ pub fn run(klon: &Path, golden: &Path) -> Result<()> {
             return Ok(());
         }
         let outcome = match &step.action {
-            Action::Copy => land(golden, klon, &step.dir, &exclude, &config, state.no_fixup),
+            Action::Copy => land(
+                golden,
+                klon,
+                &step.dir,
+                &exclude,
+                &config,
+                state.no_fixup,
+                &mut test_pause,
+            ),
             Action::Reinstall { command } => reinstall(klon, command),
         };
         match outcome {
@@ -340,7 +350,8 @@ fn alive(klon: &Path) -> bool {
 }
 
 /// Copy one ignored directory of golden into the klon through a staging name
-/// and one rename.
+/// and one rename. `pause_test` spends the test-only pause of
+/// `wait_for_test_gate` before this call's rename, once per warm run.
 fn land(
     golden: &Path,
     klon: &Path,
@@ -348,6 +359,7 @@ fn land(
     exclude: &Exclusions,
     config: &Config,
     no_fixup: bool,
+    pause_test: &mut bool,
 ) -> Result<()> {
     let source = golden.join(dir);
     let landed = klon.join(dir);
@@ -383,11 +395,33 @@ fn land(
     if !no_fixup {
         fixup::run_dir(golden, klon, config, &staging, &landed)?;
     }
+    if *pause_test {
+        *pause_test = false;
+        wait_for_test_gate();
+    }
     if !alive(klon) {
         let _ = fs::remove_dir_all(&staging);
         return Ok(());
     }
     fs::rename(&staging, &landed).map_err(Error::io(format!("land {} in {}", dir, klon.display())))
+}
+
+/// Test-only pause point, in the style of `KLON_TEST_PAUSE_AT` in the journal.
+/// `KLON_TEST_WARM_PAUSE=<path>` holds the warm process just before its first
+/// rename until the file at `<path>` exists, so a test can observe the window
+/// between the filled staging copy and the landing. klon never sets this
+/// variable itself and no command reads it for any other purpose. The wait
+/// polls every 50 ms and gives up after 60 s, so a test that never writes the
+/// file cannot hang the suite.
+fn wait_for_test_gate() {
+    let Some(gate) = std::env::var_os("KLON_TEST_WARM_PAUSE") else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// True when the klon's own branch ignores the directory `dir`.
