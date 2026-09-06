@@ -207,12 +207,26 @@ fn run_exports_the_pipe_style_handshake() {
     );
     assert!(out.status.success(), "run failed: {}", stderr(&out));
     let flags = stdout(&out).trim().to_string();
-    let auth = flags
-        .strip_prefix("-j --jobserver-auth=")
-        .unwrap_or_else(|| panic!("unexpected MAKEFLAGS {flags}"));
-    let (read, write) = auth.split_once(',').expect("two descriptor numbers");
-    let read: i32 = read.parse().expect("a read descriptor");
-    let write: i32 = write.parse().expect("a write descriptor");
+    let words: Vec<&str> = flags.split_whitespace().collect();
+    assert_eq!(words.first(), Some(&"-j"), "unexpected MAKEFLAGS {flags}");
+    // Both flag names go out: the name changed in make 4.2, and macOS ships
+    // make 3.81, which knows only the old one.
+    let pairs: Vec<(i32, i32)> = ["--jobserver-auth=", "--jobserver-fds="]
+        .iter()
+        .map(|name| {
+            let value = words
+                .iter()
+                .find_map(|word| word.strip_prefix(name))
+                .unwrap_or_else(|| panic!("{name} is missing from MAKEFLAGS {flags}"));
+            let (read, write) = value.split_once(',').expect("two descriptor numbers");
+            (
+                read.parse().expect("a read descriptor"),
+                write.parse().expect("a write descriptor"),
+            )
+        })
+        .collect();
+    assert_eq!(pairs[0], pairs[1], "both names must name the same two ends");
+    let (read, write) = pairs[0];
     // The pipe style names two numbers, never `fifo:<path>`: make 4.3 stops
     // with a fatal error on that form (handoff §11).
     assert!(!flags.contains("fifo:"), "klon must not use the fifo style");

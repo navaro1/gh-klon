@@ -9,9 +9,16 @@
 //! klon speaks the **pipe style** of the handshake. `run` opens the fifo once
 //! for reading and writing, duplicates the descriptor into a read end and a
 //! write end, clears `FD_CLOEXEC` on both, and exports
-//! `MAKEFLAGS=-j --jobserver-auth=<read>,<write>`. The other style,
-//! `--jobserver-auth=fifo:<path>`, is a **fatal error** on make 4.3, which
-//! Ubuntu 22.04 and 24.04 ship (handoff §11), so klon never emits it.
+//! `MAKEFLAGS=-j --jobserver-auth=<read>,<write> --jobserver-fds=<read>,<write>`.
+//! The other style, `--jobserver-auth=fifo:<path>`, is a **fatal error** on
+//! make 4.3, which Ubuntu 22.04 and 24.04 ship (handoff §11), so klon never
+//! emits it.
+//!
+//! Both flag names go out, because the name changed in make 4.2. macOS ships
+//! make 3.81, which knows only `--jobserver-fds`; it ignores the newer name
+//! instead of stopping, and then honours the bare `-j` as **unlimited** unless
+//! the old name is there as well (measured in CI). make 4.3 takes either name
+//! and takes both together (measured). cargo and ninja read the newer name.
 //!
 //! ## The store lives as long as the klons do
 //!
@@ -220,7 +227,7 @@ fn connect(envelope: &Envelope) -> Result<Part> {
     let write = inherit_dup(anchor.as_raw_fd(), &path)?;
     drop(anchor);
 
-    let auth = format!("-j --jobserver-auth={read},{write}");
+    let auth = format!("-j --jobserver-auth={read},{write} --jobserver-fds={read},{write}");
     let mut vars: Vec<(String, String)> = HANDSHAKE_VARS
         .iter()
         .map(|key| ((*key).to_string(), auth.clone()))
