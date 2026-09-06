@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use common::{git_ok, klon, stderr, stdout, Fixture, BIN};
+use common::{git_ok, klon, klon_env, stderr, stdout, Fixture, BIN};
 
 const SEED: u64 = 23;
 
@@ -267,6 +267,48 @@ fn outbound_traffic_works_inside_the_namespace() {
         out.status.success(),
         "curl inside the namespace failed: {}",
         stderr(&out)
+    );
+}
+
+/// C23 x C18: pasta starts under the write fence. The fence is on by default,
+/// and pasta writes `/proc/self/uid_map` inside it, so `allow_set` holds a
+/// `/proc` rule. The `KLON_DEBUG` lines are the proof the rule is there.
+#[test]
+fn pasta_starts_under_the_write_fence() {
+    if !has_pasta() {
+        println!("skipped: pasta is not on PATH");
+        return;
+    }
+    let fx = fixture();
+    add(&fx, "feature");
+    let _ports = hold_ports();
+    let out = klon_env(
+        &fx.golden,
+        &[("KLON_DEBUG", std::ffi::OsStr::new("1"))],
+        &[
+            "run",
+            "feature",
+            "--netns",
+            "--",
+            "sh",
+            "-c",
+            "echo under the fence",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "run --netns failed under the fence: {}",
+        stderr(&out)
+    );
+    assert_eq!(stdout(&out).trim(), "under the fence");
+    let text = stderr(&out);
+    assert!(
+        text.contains("klon: fence: allow "),
+        "the write fence must be on for this test: {text}"
+    );
+    assert!(
+        text.contains("klon: fence: allow /proc"),
+        "the fence must hold a /proc rule for pasta's uid_map: {text}"
     );
 }
 
