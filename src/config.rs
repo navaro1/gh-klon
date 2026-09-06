@@ -11,6 +11,43 @@ use std::path::{Path, PathBuf};
 /// The path template klon uses when `.klon.toml` names none. It resolves against golden.
 pub const DEFAULT_PATH_TEMPLATE: &str = "../{repo}.wt/{branch}";
 
+/// The path convention of a host harness (research record §19). `add
+/// --path-mode` sets the path template from this table; the `claude` mode
+/// also renames the branch to `worktree-<name>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PathMode {
+    /// `../{repo}.wt/{branch}` next to golden: klon's own convention.
+    #[value(name = "sibling")]
+    Sibling,
+    /// `{repo}/.claude/worktrees/{name}` with the branch `worktree-{name}`:
+    /// the Claude Code convention. The `add` argument is the name.
+    #[value(name = "claude")]
+    Claude,
+    /// `~/.t3/worktrees/{repo}/{branch}`: the t3 code convention.
+    #[value(name = "t3")]
+    T3,
+    /// `$CODEX_HOME/worktrees/{branch}`, default `~/.codex`: the Codex
+    /// convention. Codex itself detaches; klon keeps a branch, because its
+    /// `rm`, `sync`, and `merge` commands key on branches.
+    #[value(name = "codex")]
+    Codex,
+}
+
+impl PathMode {
+    /// The path template that the mode sets. `~` expands to `$HOME`.
+    pub fn template(self) -> String {
+        match self {
+            PathMode::Sibling => DEFAULT_PATH_TEMPLATE.to_string(),
+            PathMode::Claude => ".claude/worktrees/{name}".to_string(),
+            PathMode::T3 => "~/.t3/worktrees/{repo}/{branch}".to_string(),
+            PathMode::Codex => {
+                let home = std::env::var("CODEX_HOME").unwrap_or_else(|_| "~/.codex".to_string());
+                format!("{home}/worktrees/{{branch}}")
+            }
+        }
+    }
+}
+
 /// What `add` does when a klon would cross the disk budget. Read by the budget chunk.
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -238,27 +275,34 @@ impl Config {
     /// Klon refuses a template that resolves to `/`, the home directory, or the repository.
     pub fn resolve_path(&self, golden: &Path, branch: &str) -> Result<PathBuf> {
         let template = self.path.as_deref().unwrap_or(DEFAULT_PATH_TEMPLATE);
-        let filled = fill_template(template, golden, branch)?;
-        let filled = PathBuf::from(&filled);
-        let joined = if filled.is_absolute() {
-            filled
-        } else {
-            golden.join(filled)
-        };
-        let resolved = crate::paths::absolute(&joined)?;
-        if resolved == Path::new("/") {
-            return Err(refused(template, "/"));
-        }
-        if let Ok(home) = std::env::var("HOME") {
-            if !home.is_empty() && resolved == crate::paths::absolute(Path::new(&home))? {
-                return Err(refused(template, "the home directory"));
-            }
-        }
-        if resolved == golden {
-            return Err(refused(template, "the repository root"));
-        }
-        Ok(resolved)
+        resolve_filled(golden, template, branch, branch)
     }
+}
+
+/// Resolve a path template against golden. The modes call this with their own
+/// template; `{name}` is the raw `add` argument and equals `branch` outside
+/// the `claude` mode.
+pub fn resolve_filled(golden: &Path, template: &str, branch: &str, name: &str) -> Result<PathBuf> {
+    let filled = expand_tilde(&fill_template(template, golden, branch, name)?)?;
+    let filled = PathBuf::from(&filled);
+    let joined = if filled.is_absolute() {
+        filled
+    } else {
+        golden.join(filled)
+    };
+    let resolved = crate::paths::absolute(&joined)?;
+    if resolved == Path::new("/") {
+        return Err(refused(template, "/"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && resolved == crate::paths::absolute(Path::new(&home))? {
+            return Err(refused(template, "the home directory"));
+        }
+    }
+    if resolved == golden {
+        return Err(refused(template, "the repository root"));
+    }
+    Ok(resolved)
 }
 
 fn refused(template: &str, what: &str) -> Error {
@@ -267,8 +311,21 @@ fn refused(template: &str, what: &str) -> Error {
     ))
 }
 
-/// Replace the placeholders klon supports: `{repo}` and `{branch}`.
-fn fill_template(template: &str, golden: &Path, branch: &str) -> Result<String> {
+/// Expand a leading `~` or `~/` to `$HOME`. The `t3` and `codex` templates use it.
+fn expand_tilde(filled: &str) -> Result<String> {
+    if !(filled == "~" || filled.starts_with("~/")) {
+        return Ok(filled.to_string());
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| Error::klon("the path template uses ~ but HOME is not set"))?;
+    if home.is_empty() {
+        return Err(Error::klon("the path template uses ~ but HOME is empty"));
+    }
+    Ok(format!("{home}{}", &filled[1..]))
+}
+
+/// Replace the placeholders klon supports: `{repo}`, `{branch}`, and `{name}`.
+fn fill_template(template: &str, golden: &Path, branch: &str, name: &str) -> Result<String> {
     let repo = golden
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -284,9 +341,10 @@ fn fill_template(template: &str, golden: &Path, branch: &str) -> Result<String> 
         match &tail[1..end] {
             "repo" => filled.push_str(&repo),
             "branch" => filled.push_str(branch),
-            name => {
+            "name" => filled.push_str(name),
+            other => {
                 return Err(Error::klon(format!(
-                    "path template uses unknown placeholder {{{name}}}; klon supports {{repo}} and {{branch}}"
+                    "path template uses unknown placeholder {{{other}}}; klon supports {{repo}}, {{branch}}, and {{name}}"
                 )))
             }
         }
