@@ -118,8 +118,13 @@ pub struct Correctness {
     pub matched: bool,
     /// The comparison of golden's ignored directory with the new tree's.
     pub ignored_manifest: String,
-    /// `git status --porcelain` in the new tree.
+    /// The branch and the commit that the new tree holds.
+    pub tracked: String,
+    /// `git status --porcelain` in the new tree, after a forced content check.
     pub status: String,
+    /// Whether the measured removal left the tree behind. An M6 cell alone
+    /// fills it; every other cell removes nothing.
+    pub removal: String,
 }
 
 /// A cell that did not run.
@@ -410,12 +415,28 @@ fn verdict(record: &Record) -> String {
 }
 
 impl Correctness {
-    /// Why the check failed, in one phrase.
+    /// Why the check failed: every verdict that is not a pass, in one phrase.
     pub fn reason(&self) -> String {
         if self.matched {
             return "none".to_string();
         }
-        format!("{}; {}", self.ignored_manifest, self.status)
+        let failed: Vec<&str> = [
+            self.ignored_manifest.as_str(),
+            self.tracked.as_str(),
+            self.status.as_str(),
+            self.removal.as_str(),
+        ]
+        .into_iter()
+        .filter(|verdict| {
+            verdict.starts_with("mismatch")
+                || verdict.starts_with("dirty")
+                || verdict.starts_with("the ")
+        })
+        .collect();
+        if failed.is_empty() {
+            return "unknown".to_string();
+        }
+        failed.join("; ")
     }
 }
 

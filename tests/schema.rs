@@ -173,7 +173,9 @@ const BENCH_PROFILE_SHAPE: Fields = &[
 const BENCH_CORRECTNESS: Fields = &[
     ("matched", Ty::Bool),
     ("ignored_manifest", Ty::Str),
+    ("tracked", Ty::Str),
     ("status", Ty::Str),
+    ("removal", Ty::Str),
 ];
 
 const DOCTOR_REPAIR_ROW: Fields = &[

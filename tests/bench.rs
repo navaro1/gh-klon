@@ -276,6 +276,62 @@ fn the_run_order_is_recorded() {
     );
 }
 
+/// The M6 cell measures a removal, so its correctness check runs one and proves
+/// the tree is gone. A removal that returns success and leaves the tree would
+/// otherwise report a fast, wrong result.
+#[test]
+fn the_removal_cell_proves_the_tree_is_gone() {
+    let run = Run::new();
+    let out = run.bench(
+        &[("KLON_FIXTURE", OsStr::new("100k"))],
+        &["bench", "--cell", "m6-rm-100k", "--json"],
+    );
+    assert!(out.status.success(), "bench failed: {}", stderr(&out));
+    let report = parse(&stdout(&out));
+    for record in report["records"].as_array().expect("records") {
+        assert_eq!(record["metric"], "M6");
+        assert_eq!(
+            record["correctness"]["removal"], "removed",
+            "the check must remove the tree and say so"
+        );
+        assert_eq!(record["timing_valid"], true);
+    }
+}
+
+/// The M4 cell reports the first call and the later calls as two series.
+#[test]
+fn the_status_cell_reports_the_first_and_the_steady_series() {
+    let run = Run::new();
+    let out = run.bench(
+        &[("KLON_FIXTURE", OsStr::new("100k"))],
+        &["bench", "--cell", "m4-status-100k", "--json"],
+    );
+    assert!(out.status.success(), "bench failed: {}", stderr(&out));
+    let report = parse(&stdout(&out));
+    for record in report["records"].as_array().expect("records") {
+        let first = record["first_p50_ms"].as_f64().expect("first_p50_ms");
+        let steady = record["steady_p50_ms"].as_f64().expect("steady_p50_ms");
+        assert!(first > 0.0 && steady > 0.0, "found {first} and {steady}");
+        assert_eq!(
+            record["first_p50_ms"], record["p50_ms"],
+            "the primary series is the first call"
+        );
+        // Three steady calls per sample, three samples.
+        assert_eq!(numbers(&record["steady_samples_ms"]).len(), 9);
+        assert_eq!(record["pass_steady_p50_ms"], 150);
+        // The correctness check names the branch and the commit it found, so a
+        // tree on another clean branch cannot pass.
+        let tracked = record["correctness"]["tracked"]
+            .as_str()
+            .expect("a tracked verdict");
+        assert!(tracked.starts_with("on feature at "), "found {tracked}");
+        assert_eq!(
+            record["correctness"]["removal"],
+            "not-applicable: the cell removes no tree"
+        );
+    }
+}
+
 // --- The command line ----------------------------------------------------------
 
 /// A 100k cell needs `KLON_FIXTURE=100k`. Without it the run skips the cell and

@@ -10,23 +10,45 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=KLON_COMMIT");
-    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    // A new commit or a staged change must give a new string. A build script
-    // that names one watched path loses cargo's default watch, so both files
-    // are named here.
-    if let Some(git_dir) = git_dir(Path::new(&dir)) {
-        for name in ["HEAD", "index"] {
-            let path = git_dir.join(name);
-            if path.exists() {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
+    let root = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let root = Path::new(&root);
+    // A build script that names one watched path loses cargo's default watch of
+    // the crate, so this names every input of the string below: the sources,
+    // because `git describe --dirty` reads them, and the git files that change
+    // when a commit lands.
+    for path in watched(root) {
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
         }
     }
-    println!("cargo:rustc-env=KLON_COMMIT={}", commit(&dir));
+    println!("cargo:rustc-env=KLON_COMMIT={}", commit(root));
+}
+
+/// Every path whose change can change the commit string.
+fn watched(root: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = ["src", "tests", "bench", "Cargo.toml", "Cargo.lock"]
+        .iter()
+        .map(|name| root.join(name))
+        .collect();
+    let Some(git_dir) = git_dir(root) else {
+        return paths;
+    };
+    // `HEAD` and the index change on a checkout and on a staged edit.
+    paths.push(git_dir.join("HEAD"));
+    paths.push(git_dir.join("index"));
+    // A commit on a branch rewrites the branch reference, not `HEAD`. The
+    // references of a linked worktree live in the common directory, and a
+    // packed reference lives in one file there.
+    let common = common_dir(&git_dir);
+    paths.push(common.join("packed-refs"));
+    if let Some(reference) = head_reference(&git_dir) {
+        paths.push(common.join(reference));
+    }
+    paths
 }
 
 /// The git directory of `root`. In a linked worktree `.git` is a file that
-/// holds `gitdir: <path>`, so the watched `HEAD` lives there.
+/// holds `gitdir: <path>`.
 fn git_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
     if dot_git.is_dir() {
@@ -37,7 +59,30 @@ fn git_dir(root: &Path) -> Option<PathBuf> {
     Some(root.join(target))
 }
 
-fn commit(dir: &str) -> String {
+/// The common directory that holds the references. A linked worktree names it
+/// in `<git dir>/commondir`; a main worktree is its own.
+fn common_dir(git_dir: &Path) -> PathBuf {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => {
+            let target = Path::new(text.trim());
+            if target.is_absolute() {
+                target.to_path_buf()
+            } else {
+                git_dir.join(target)
+            }
+        }
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
+/// The reference that `HEAD` points at, for example `refs/heads/main`. A
+/// detached `HEAD` names none: its own file already holds the commit.
+fn head_reference(git_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    Some(text.trim().strip_prefix("ref: ")?.to_string())
+}
+
+fn commit(dir: &Path) -> String {
     if let Ok(text) = std::env::var("KLON_COMMIT") {
         let text = text.trim().to_string();
         if !text.is_empty() {

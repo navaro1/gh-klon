@@ -213,15 +213,13 @@ fn group(
     let mut samples: Vec<Vec<Sample>> = checked.iter().map(|_| Vec::new()).collect();
     let mut orders: Vec<Vec<usize>> = checked.iter().map(|_| Vec::new()).collect();
     for (step, index) in plan.into_iter().enumerate() {
-        if cold {
-            drop.run()?;
-        }
         samples[index].push(sample(
             cell,
             fixture,
             checked[index].tool,
             manifest.runs.steady_calls,
             step,
+            cold.then_some(drop),
         )?);
         orders[index].push(step);
     }
@@ -261,19 +259,32 @@ fn group(
 }
 
 /// One sample. Only the measured command is inside the timer.
+///
+/// `drop` is Some for a cold sample. The page cache is dropped after the tree
+/// that the sample needs exists and just before the timed command: a drop
+/// before the setup would let the setup warm the cache again, and the record
+/// would call a warm measurement cold.
 fn sample(
     cell: &Cell,
     fixture: &Fixture,
     tool: Tool,
     steady_calls: u32,
     step: usize,
+    drop: Option<&DropCaches>,
 ) -> Result<Sample> {
     let path = fixture
         .root()
         .join(format!("{}-{}-{step}", cell.name, tool.tag()));
     let golden = fixture.golden();
+    let chill = || -> Result<()> {
+        match drop {
+            Some(drop) => drop.run(),
+            None => Ok(()),
+        }
+    };
     match cell.action {
         Action::Add => {
+            chill()?;
             let primary_ms = timed(&mut create_command(tool, golden, &path))?.0;
             teardown(golden, &path)?;
             Ok(Sample {
@@ -283,7 +294,10 @@ fn sample(
         }
         Action::Status => {
             create(tool, golden, &path)?;
+            chill()?;
             let primary_ms = timed(&mut status_command(&path))?.0;
+            // The steady calls measure a warm index on purpose: M4 asks what a
+            // later `git status` costs, not what a second cold one costs.
             let mut steady_ms = Vec::new();
             for _ in 0..steady_calls {
                 steady_ms.push(timed(&mut status_command(&path))?.0);
@@ -296,12 +310,18 @@ fn sample(
         }
         Action::Rm => {
             create(tool, golden, &path)?;
+            chill()?;
             let primary_ms = timed(&mut remove_command(tool, golden, &path))?.0;
             // `klon rm` returns before the delete finishes. Wait for the
             // background process, so the next sample starts from a clean disk.
             drain_trash(golden)?;
+            // A removal that returns success and leaves the tree is a defect,
+            // not a fast result. Stop instead of cleaning up after it.
             if path.exists() {
-                teardown(golden, &path)?;
+                return Err(Error::klon(format!(
+                    "the measured removal left {} in place",
+                    path.display()
+                )));
             }
             Ok(Sample {
                 primary_ms,
@@ -445,6 +465,10 @@ fn drain_trash(golden: &Path) -> Result<()> {
 /// Build one tree, compare it with golden, and remove it again. The verdict
 /// decides whether the timing of the cell counts (R14).
 ///
+/// An M6 cell measures the removal, so the check runs the removal too and
+/// proves the tree is gone. A removal that returns success and leaves the tree
+/// would otherwise report a fast, wrong result.
+///
 /// `KLON_BENCH_INJECT_MISMATCH=1` damages the tree first. It exists so that a
 /// test can prove the void path works; klon never sets it itself.
 fn verify(cell: &Cell, fixture: &Fixture, tool: Tool) -> Result<Checked> {
@@ -456,14 +480,39 @@ fn verify(cell: &Cell, fixture: &Fixture, tool: Tool) -> Result<Checked> {
     if inject_mismatch() {
         inject(&path)?;
     }
-    let correctness = check(golden, &path, tool);
-    teardown(golden, &path)?;
-    let correctness = correctness?;
+    let mut correctness = check(golden, &path, tool)?;
+    if cell.action == Action::Rm {
+        let (ok, detail) = removal_verdict(golden, &path, tool);
+        correctness.matched = correctness.matched && ok;
+        correctness.removal = detail;
+    }
+    if path.exists() {
+        teardown(golden, &path)?;
+    }
     Ok(Checked {
         tool,
         backend,
         correctness,
     })
+}
+
+/// Run the removal that an M6 cell measures, and answer whether the tree is
+/// gone. A failed command is a verdict here, not the end of the run: the report
+/// then voids the cell and still holds its samples.
+fn removal_verdict(golden: &Path, path: &Path, tool: Tool) -> (bool, String) {
+    if let Err(why) = timed(&mut remove_command(tool, golden, path)) {
+        return (false, format!("the removal failed: {why}"));
+    }
+    if let Err(why) = drain_trash(golden) {
+        return (false, format!("the background delete failed: {why}"));
+    }
+    if path.exists() {
+        return (
+            false,
+            format!("the removal left {} in place", path.display()),
+        );
+    }
+    (true, "removed".to_string())
 }
 
 fn inject_mismatch() -> bool {
@@ -507,8 +556,12 @@ fn first_file(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// The two manifest tests of a tree: the ignored directory against golden's,
-/// and a clean `git status`.
+/// The manifest tests of a new tree:
+///
+/// 1. The ignored directory against golden's, byte for byte and time for time.
+/// 2. The tracked side: the tree holds the branch that the cell asked for, at
+///    golden's commit for it.
+/// 3. A clean `git status`, after klon forced git to compare content.
 fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
     let ignored_manifest = match tool {
         Tool::Klon => {
@@ -523,6 +576,8 @@ fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
         // to compare. That absence is the point of the baseline, not a fault.
         Tool::Baseline => "not-applicable: the baseline copies no ignored state".to_string(),
     };
+    let (tracked_ok, tracked) = tracked_verdict(golden, tree)?;
+    force_content_check(tree)?;
     let porcelain = fixture::git(tree, &["status", "--porcelain"])?;
     let status = if porcelain.trim().is_empty() {
         "clean".to_string()
@@ -530,10 +585,76 @@ fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
         format!("dirty: {}", porcelain.lines().next().unwrap_or("").trim())
     };
     Ok(Correctness {
-        matched: !ignored_manifest.starts_with("mismatch") && status == "clean",
+        matched: !ignored_manifest.starts_with("mismatch") && tracked_ok && status == "clean",
         ignored_manifest,
+        tracked,
         status,
+        removal: "not-applicable: the cell removes no tree".to_string(),
     })
+}
+
+/// The tracked side of the manifest test. A tree on another branch can be
+/// perfectly clean, so a clean `git status` alone proves nothing: the tree must
+/// hold the branch that the cell asked for, at golden's commit for it.
+fn tracked_verdict(golden: &Path, tree: &Path) -> Result<(bool, String)> {
+    let reference = format!("refs/heads/{}", fixture::BRANCH);
+    let want = fixture::git(golden, &["rev-parse", &reference])?;
+    let got = fixture::git(tree, &["rev-parse", "HEAD"])?;
+    if want.trim() != got.trim() {
+        return Ok((
+            false,
+            format!(
+                "mismatch: HEAD is {} and {} is {}",
+                got.trim(),
+                fixture::BRANCH,
+                want.trim()
+            ),
+        ));
+    }
+    match fixture::git(tree, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(name) if name.trim() == fixture::BRANCH => {
+            Ok((true, format!("on {} at {}", fixture::BRANCH, got.trim())))
+        }
+        Ok(name) => Ok((
+            false,
+            format!(
+                "mismatch: the tree is on {} and not on {}",
+                name.trim(),
+                fixture::BRANCH
+            ),
+        )),
+        // `symbolic-ref` exits non-zero on a detached HEAD.
+        Err(_) => Ok((
+            false,
+            format!(
+                "mismatch: the tree has a detached HEAD, not {}",
+                fixture::BRANCH
+            ),
+        )),
+    }
+}
+
+/// Make the next `git status` compare content instead of stat information.
+///
+/// `add` sets `core.checkStat=minimal`, so git compares the size and the whole
+/// second of the mtime. An edit that keeps both is invisible: that is the
+/// documented blind spot. An index older than every working-tree file makes
+/// every entry racily clean, and git then re-reads the file content
+/// (handoff §11). The re-hash is outside every timer.
+fn force_content_check(tree: &Path) -> Result<()> {
+    let path = fixture::git(
+        tree,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    let path = Path::new(path.trim());
+    if !path.is_file() {
+        return Err(Error::klon(format!(
+            "the tree has no index at {}",
+            path.display()
+        )));
+    }
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(0, 0))
+        .map_err(Error::io(format!("re-time {}", path.display())))
 }
 
 /// One entry of a tree manifest.
