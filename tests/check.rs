@@ -204,6 +204,28 @@ fn one_more_commit_makes_the_receipt_stale_and_no_check_proceeds() {
     assert!(!klon_dir.exists(), "the merge removes the klon");
 }
 
+/// A step that commits inside its own klon moves HEAD under the run. The steps
+/// then saw two trees and prove neither commit, so `check` writes nothing.
+#[test]
+fn a_klon_that_commits_during_the_run_gets_no_receipt() {
+    let fx = repo("\"echo during > during.txt && git add during.txt && git commit -qm during\"");
+    let klon_dir = add(&fx, "feature");
+    let before = head(&klon_dir);
+
+    let out = run(&fx, &["check", "feature"]);
+    assert!(!out.status.success(), "a moved HEAD must fail the check");
+    assert!(
+        stderr(&out).contains("while the steps ran"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert_ne!(head(&klon_dir), before, "the step must have committed");
+    assert!(
+        receipt_files(&fx).is_empty(),
+        "a klon that moved gets no receipt"
+    );
+}
+
 /// The gate must judge the commit that `merge` lands, not the klon's live
 /// HEAD. A `pre_merge` hook runs before the receipt gate and can detach the
 /// klon onto the checked commit, while the branch tip that step 5 merges has

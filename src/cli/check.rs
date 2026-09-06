@@ -9,7 +9,7 @@
 //! 3. Refuse a repository with no `[proof] steps`, and take the approval for
 //!    the ones it has.
 //! 4. Run every step inside the klon under the envelope, in file order, and
-//!    stop at the first failure.
+//!    stop at the first failure. Refuse a klon whose HEAD moved while they ran.
 //! 5. Write `<common>/klon/receipts/<commit>.json`.
 //!
 //! `merge` then reads that receipt instead of running the steps again, so a
@@ -104,6 +104,19 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         }
     }
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // A test suite takes minutes, and the agent that owns the klon can commit
+    // inside that window. The steps then saw two trees, and the run proves
+    // neither commit. klon writes nothing and says so, the same way `merge`
+    // refuses a branch tip that moved under its gate.
+    let now = rev(&klon, "HEAD")?;
+    if now != commit {
+        return Err(Error::klon(format!(
+            "{} moved from {} to {} while the steps ran; run check again",
+            args.branch,
+            short(&commit),
+            short(&now)
+        )));
+    }
 
     // --- Step 5: the receipt -------------------------------------------------
     let record = receipt::build(

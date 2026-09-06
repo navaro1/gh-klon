@@ -310,6 +310,11 @@ with no `[proof] steps`. Each step runs as `sh -c` inside the klon under the
 envelope, in file order, and the run stops at the first failure. The steps need
 one approval per `.klon.toml` content hash, the same as the `[warm] steps`.
 
+A test suite takes minutes, and the agent that owns the klon can commit inside
+that window. `check` reads HEAD before the first step and again after the last
+one, and it writes nothing when the two differ: the steps saw two trees and
+prove neither commit.
+
 The receipt lands at `<common>/klon/receipts/<commit>.json`:
 
 ```json
