@@ -197,7 +197,11 @@ fn init_leftovers(golden: &Path) -> Result<Vec<PathBuf>> {
             found.push(path);
         }
     }
-    let (Some(parent), Some(name)) = (golden.parent(), golden.file_name()) else {
+    // The parent comes from a resolved sibling, not from `golden` itself, so
+    // every path in the answer starts at the same root. On macOS `/var` is a
+    // symlink to `/private/var`, and a list from two roots sorts by two roots.
+    let resolved = cli_init::sibling(golden, cli_init::OLD_SUFFIX)?;
+    let (Some(parent), Some(name)) = (resolved.parent(), golden.file_name()) else {
         return Ok(found);
     };
     let prefix = format!("{}{}.", name.to_string_lossy(), cli_init::OLD_SUFFIX);
