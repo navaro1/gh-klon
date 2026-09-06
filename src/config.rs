@@ -88,6 +88,42 @@ pub struct Fixup {
     pub skip: Option<Vec<String>>,
 }
 
+/// How `gh klon merge` joins a klon's branch to base (C25, R24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Ff {
+    /// Write a merge commit every time. This is the default.
+    NoFf,
+    /// Move base forward only when the branch already holds it. A branch that
+    /// needs a merge commit fails instead.
+    FfOnly,
+}
+
+impl Ff {
+    /// The `git merge` flag of the mode.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Ff::NoFf => "--no-ff",
+            Ff::FfOnly => "--ff-only",
+        }
+    }
+
+    /// The name in `.klon.toml` and in the `mode` field of `klon.merge/1`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Ff::NoFf => "no-ff",
+            Ff::FfOnly => "ff-only",
+        }
+    }
+}
+
+/// The `[merge]` table (C25).
+#[derive(Debug, Default, Deserialize)]
+pub struct MergeSection {
+    /// `no-ff` or `ff-only`. The `merge` flags win over this key.
+    pub ff: Option<Ff>,
+}
+
 /// The `[hardlink]` table. Read by the v2 hardlink backend.
 #[allow(dead_code)]
 #[derive(Debug, Default, Deserialize)]
@@ -122,6 +158,8 @@ pub struct Config {
     pub copy: Option<CopySection>,
     /// Paths the fixup pass must not rewrite.
     pub fixup: Option<Fixup>,
+    /// How `merge` joins a branch to base (C25).
+    pub merge: Option<MergeSection>,
     /// Paths to hardlink in v2. Read by the hardlink backend.
     #[allow(dead_code)]
     pub hardlink: Option<Hardlink>,
@@ -141,6 +179,7 @@ const KNOWN_TOP: &[&str] = &[
     "fence",
     "copy",
     "fixup",
+    "merge",
     "hardlink",
 ];
 
@@ -151,6 +190,7 @@ const KNOWN_TABLES: &[(&str, &[&str])] = &[
     ("fence", &["allow"]),
     ("copy", &["reinstall", "inline_limit"]),
     ("fixup", &["skip"]),
+    ("merge", &["ff"]),
     ("hardlink", &["paths"]),
 ];
 

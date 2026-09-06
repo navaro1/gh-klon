@@ -29,6 +29,7 @@ pub use fence_linux::Fence;
 pub struct Fence;
 
 use crate::{Error, Result};
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -296,6 +297,21 @@ pub enum Root<'a> {
     /// klon tags and no envelope variables, and the caller turns the fence
     /// off through `Options` when golden is the write target.
     Golden(&'a Path),
+}
+
+/// Where a step of `up` (C22) or of the `merge` gate (C25) writes its stdout.
+/// Under `--json` klon owns that stream, and a step that prints one line would
+/// put it in front of the document, so the step writes to stderr instead.
+pub fn step_stdout(json: bool) -> Result<Option<Stdio>> {
+    if !json {
+        return Ok(None);
+    }
+    let fd = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(Stdio::from)
+        .map_err(Error::io("duplicate stderr for the step output"))?;
+    Ok(Some(fd))
 }
 
 /// The fence of this run, or None when the caller or the environment turns

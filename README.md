@@ -94,7 +94,7 @@ The table is the product shape from the handoff. The status column says what wor
 | `gh klon prune` | Same as `git worktree prune`, plus journal cleanup. | done |
 | `gh klon pr <branch>` | `gh pr create` from that tree. | done |
 | `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check] [--force] [--json]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | done. `--json` prints one document per klon, one per line. |
-| `gh klon merge <branch>` | Fetch, `pre_merge` hook, structured merge, fast-forward base, remove. Never pushes. | planned for v0.2 |
+| `gh klon merge <branch> [--no-ff\|--ff-only] [--keep] [--json]` | Fetch, `pre_merge` hook, structured merge, advance base, remove. Never pushes. | done. The receipt gate of `check` arrives with v0.2. |
 | `gh klon check <branch>` | v0.2. Run `[proof] steps` at a clean HEAD and record a receipt. | planned for v0.2 |
 | `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
 | `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
@@ -242,6 +242,45 @@ The answer stores the SHA-256 of `.klon.toml` in `<config home>/klon/approvals.t
 refuses with `needs approval` and runs nothing. A one-byte change to `.klon.toml`
 asks again. The config home is `KLON_CONFIG_HOME`, else `XDG_CONFIG_HOME`, else
 `~/.config`. Unknown keys draw one warning and never fail the load.
+
+The `[merge]` table says how `merge` joins a branch to base. `no-ff` is the
+default and writes a merge commit; `ff-only` refuses a branch that needs one.
+The `--no-ff` and `--ff-only` flags win over the key.
+
+```toml
+[merge]
+ff = "no-ff"                     # or "ff-only"
+```
+
+## `merge`
+
+`gh klon merge <branch>` lands a klon's branch in base and removes the klon.
+It never pushes. The steps run in this order, and each one refuses before the
+next one changes anything:
+
+1. Refuse a locked klon, a golden that holds a merge that stopped, a dirty
+   golden, a dirty klon, and a golden that is not on `base`.
+2. `git fetch origin`. A repository with no `origin` remote draws one line.
+3. Run the merge gate inside the klon under the envelope: the executable
+   `<klon>/.klon/hooks/pre_merge`, else the approved `[proof] steps`. The first
+   failure prints `pre_merge failed: <cmd>` and golden never moves. klon reads
+   the branch tip before and after the gate and refuses a tip that moved, so
+   the commit that lands is the commit the gate proved.
+4. Configure the mergiraf merge driver when `mergiraf` is on PATH. klon writes
+   `merge.mergiraf.driver` to the repository config and two generated lines to
+   `<common>/info/attributes`. A host without mergiraf keeps git's line merge,
+   and klon drops its own generated lines and keys again.
+5. Merge the commit the gate proved. On a conflict klon prints the conflicting
+   paths and aborts, so golden stays where it stood. A merge that a `commit-msg`
+   hook refuses is aborted too: git leaves that one with no conflicting path.
+6. Remove the klon. `--keep` skips the removal, and a klon with a live process
+   stays with one line. The branch itself stays: `rm --merged` deletes that.
+   From step 5 on, a failure costs the removal and never the command: the merge
+   is in golden's history, and no report may call that a failure.
+
+`merge` sets `merge.conflictStyle` and `rerere.enabled=true` in the repository
+config. `zdiff3` needs git 2.35; an older git gets `diff3`, because it rejects
+the value it does not know and every merge in the repository would then fail.
 
 ## The journal and `doctor`
 

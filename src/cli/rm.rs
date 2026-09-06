@@ -87,57 +87,20 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         None
     };
-    // A lock protects a klon from removal on purpose; even --force honours it.
-    if worktrees
-        .iter()
-        .any(|w| w.locked && same_dir(&w.path, &target))
-    {
-        return Err(Error::klon(format!(
-            "{} is locked; unlock it with git worktree unlock first",
-            target.display()
-        )));
-    }
-
-    // Steps 2 and 3: refuse a dirty tree and a tree with live processes.
-    if target.exists() && !args.force {
-        if process::dirty(&target)? {
-            return Err(Error::klon(format!(
-                "{} is dirty; use --force to remove it",
-                target.display()
-            )));
-        }
-        // The scan reads the current directory of every process. A `run`
-        // command that changed directory escapes it, so `rm` can remove its
-        // klon and hand the loopback address to the next one; the new klon
-        // then reports EADDRINUSE. The `run` tags would catch that command,
-        // but reading `/proc/<pid>/environ` for every process measured 165 ms
-        // on this host against the 100 ms budget of R8 (113 ms without the
-        // read, 280 ms with it, same load). C20 puts the tree in a cgroup and
-        // answers the same question with one read.
-        if let Some(pid) = process::live_process(&target) {
-            return Err(Error::klon(format!(
-                "{} has a live process (pid {pid}); use --force to remove it",
-                target.display()
-            )));
-        }
-    }
-
-    // Steps 4 to 6: rename into .trash, drop the git file, prune, delete later.
-    // The journal entry precedes the rename, so `doctor --repair` can finish
-    // the tail after a crash.
-    let mut record = journal::Record::start(&common, journal::Op::Rm, &target, branch.as_deref())?;
-    record.reach(State::Removing)?;
-    let trash = remove_worktree(&golden, &common, &target)?;
-    // Step 7: the loopback address goes back to the pool, so the next `add`
-    // takes it again. A failure here costs an address, never the removal, and
-    // `rm` must still return inside 100 ms (R8).
-    if let Err(err) = slots::release(&common, &target) {
-        eprintln!("klon: {err}");
-    }
-    record.close()?;
-    // Step 8: the next spare (R40). The start costs a stat, a lock probe, and
-    // one spawn, well inside the 100 ms budget of R8.
-    spare::start_after(&golden, spare::configured_depth(&golden), args.no_spare);
+    let guard = if args.force {
+        Guard::Force
+    } else {
+        Guard::Strict
+    };
+    let trash = remove_target(
+        &golden,
+        &common,
+        &worktrees,
+        &target,
+        branch.as_deref(),
+        guard,
+        args.no_spare,
+    )?;
 
     if let Some((name, evidence)) = merged_branch {
         branch::delete_branch(&golden, &name, &evidence)?;
@@ -157,6 +120,87 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What the removal refuses about the state of the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guard {
+    /// Refuse a dirty tree and a tree with live processes. Plain `rm`.
+    Strict,
+    /// Remove the tree whatever it holds. `rm --force`.
+    Force,
+    /// Refuse only a tree with live processes. `merge` (C25) picks this after
+    /// base took the branch: the tracked work is in base, so a file the merge
+    /// gate left behind must not keep the klon alive, but a process that still
+    /// runs there owns the directory and klon never kills it.
+    Merged,
+}
+
+/// Steps 2 to 8 of the removal, after the caller resolved `target`. `rm` and
+/// `merge` (C25) share it. The answer is the trash path, or None when the klon
+/// never reached the trash.
+pub fn remove_target(
+    golden: &Path,
+    common: &Path,
+    worktrees: &[git::Worktree],
+    target: &Path,
+    branch: Option<&str>,
+    guard: Guard,
+    no_spare: bool,
+) -> Result<Option<PathBuf>> {
+    refuse_reserved(target, golden)?;
+    // A lock protects a klon from removal on purpose; even --force honours it.
+    if worktrees
+        .iter()
+        .any(|w| w.locked && same_dir(&w.path, target))
+    {
+        return Err(Error::klon(format!(
+            "{} is locked; unlock it with git worktree unlock first",
+            target.display()
+        )));
+    }
+
+    // Steps 2 and 3: refuse a dirty tree and a tree with live processes.
+    if target.exists() && guard != Guard::Force {
+        if guard == Guard::Strict && process::dirty(target)? {
+            return Err(Error::klon(format!(
+                "{} is dirty; use --force to remove it",
+                target.display()
+            )));
+        }
+        // The scan reads the current directory of every process. A `run`
+        // command that changed directory escapes it, so `rm` can remove its
+        // klon and hand the loopback address to the next one; the new klon
+        // then reports EADDRINUSE. The `run` tags would catch that command,
+        // but reading `/proc/<pid>/environ` for every process measured 165 ms
+        // on this host against the 100 ms budget of R8 (113 ms without the
+        // read, 280 ms with it, same load). C20 puts the tree in a cgroup and
+        // answers the same question with one read.
+        if let Some(pid) = process::live_process(target) {
+            return Err(Error::klon(format!(
+                "{} has a live process (pid {pid}); use --force to remove it",
+                target.display()
+            )));
+        }
+    }
+
+    // Steps 4 to 6: rename into .trash, drop the git file, prune, delete later.
+    // The journal entry precedes the rename, so `doctor --repair` can finish
+    // the tail after a crash.
+    let mut record = journal::Record::start(common, journal::Op::Rm, target, branch)?;
+    record.reach(State::Removing)?;
+    let trash = remove_worktree(golden, common, target)?;
+    // Step 7: the loopback address goes back to the pool, so the next `add`
+    // takes it again. A failure here costs an address, never the removal, and
+    // `rm` must still return inside 100 ms (R8).
+    if let Err(err) = slots::release(common, target) {
+        eprintln!("klon: {err}");
+    }
+    record.close()?;
+    // Step 8: the next spare (R40). The start costs a stat, a lock probe, and
+    // one spawn, well inside the 100 ms budget of R8.
+    spare::start_after(golden, spare::configured_depth(golden), no_spare);
+    Ok(trash)
 }
 
 /// Step 1: find the registered worktree for the branch or the path.

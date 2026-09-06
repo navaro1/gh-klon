@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{klon, klon_env, stderr, stdout, Fixture};
+use common::{identity, klon, klon_env, stderr, stdout, Fixture};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
 
@@ -97,6 +97,20 @@ const RM: Fields = &[
     ("path", Ty::Str),
     ("branch", Ty::StrOrNull),
     ("trash", Ty::StrOrNull),
+];
+
+/// The C25 `merge` document. `hook` names the gate that ran and is null when
+/// the repository has none. `conflicts` is empty for every merge that landed.
+const MERGE: Fields = &[
+    ("schema", Ty::Str),
+    ("branch", Ty::Str),
+    ("base", Ty::Str),
+    ("head_before", Ty::Str),
+    ("head_after", Ty::Str),
+    ("mode", Ty::Str),
+    ("removed", Ty::Bool),
+    ("hook", Ty::StrOrNull),
+    ("conflicts", Ty::Arr),
 ];
 
 const STOP: Fields = &[
@@ -360,6 +374,29 @@ fn every_command_matches_its_documented_schema() {
         rm["trash"].is_string(),
         "the klon reaches the trash on ext4"
     );
+}
+
+/// `merge --json` (C25). The merge removes the klon, so this round runs on its
+/// own fixture. The repository gets a committer identity, because `git merge`
+/// writes a commit and the harness keeps the global config empty.
+#[test]
+fn the_merge_report_matches_its_documented_schema() {
+    let fx = Fixture::generate(SEED, 30, 3, 3, 2);
+    identity(&fx.golden);
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+
+    let out = klon(&fx.golden, &["merge", "--json", "feature"]);
+    assert!(out.status.success(), "merge failed: {}", stderr(&out));
+    let merge = parse(&stdout(&out));
+    check_ok(&merge, MERGE);
+    assert_eq!(merge["schema"], "klon.merge/1");
+    assert_eq!(merge["branch"], "feature");
+    assert_eq!(merge["base"], "main");
+    assert_eq!(merge["mode"], "no-ff");
+    assert_eq!(merge["removed"], true);
+    assert!(merge["hook"].is_null(), "the fixture has no gate");
+    assert!(merge["conflicts"].as_array().expect("an array").is_empty());
 }
 
 /// `doctor --repair` fills `repaired` with rows of the documented shape.
