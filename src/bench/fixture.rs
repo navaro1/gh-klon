@@ -584,6 +584,9 @@ pub fn build_command(
         }
         Kind::Rust => {
             command.args(["build", "--offline"]);
+            if let Some(jobs) = smoke_jobs() {
+                command.args(["-j", &jobs.to_string()]);
+            }
         }
         Kind::Pnpm => {
             command.args(["install", "--offline", "--child-concurrency=1"]);
@@ -600,6 +603,20 @@ pub fn build_command(
         }
     }
     command
+}
+
+/// The job cap that a smoke build takes, or None for a measured run.
+///
+/// A smoke run measures nothing: it proves the shape of a report. It runs
+/// inside `cargo test`, beside the other test binaries of this suite and beside
+/// the builds of whoever else is on the machine, so it must not claim every
+/// core. Two jobs is the same cap that the C11 zero-compile tests take, and for
+/// the same reason.
+///
+/// A measured run takes no cap. Bounding a real M12 build is the jobserver's
+/// work, and that is exactly what the cell measures.
+fn smoke_jobs() -> Option<usize> {
+    (std::env::var("KLON_BENCH_SMOKE").as_deref() == Ok("1")).then_some(2)
 }
 
 /// The units that one build compiled, from its combined output.
