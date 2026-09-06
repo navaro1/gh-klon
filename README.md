@@ -4,15 +4,28 @@
 A klon holds the tracked files of its branch plus the ignored files of golden, the main checkout.
 The design is in `docs/klon-handoff.md`. The build order is in `docs/klon-spec.md`.
 
-## Status
+## Install
 
-C0 is done: `gh klon add <branch> [--path <p>]` with the `copy` backend for an existing local branch.
-C10 is done: the `.klon.toml` loader, the command approval gate, and `gh klon up [--yes]`.
-C3 is done: `gh klon rm`, `gh klon prune`, and `gh klon list`.
-C4 is done: the journal, `gh klon doctor [--json] [--repair]`, and `--json` on four commands.
-C8 is done: `gh klon bench`, the versioned manifest, and the M1, M4, and M6 cells.
+Install klon as a `gh` extension from the precompiled release:
 
-## Install for local development
+```sh
+gh extension install navaro1/gh-klon
+```
+
+`gh` downloads the release asset that matches its platform. Every release carries four assets:
+
+| Asset suffix | Platform |
+|---|---|
+| `linux-amd64` | Linux x86-64, glibc |
+| `linux-arm64` | Linux arm64, glibc |
+| `darwin-amd64` | macOS 13 or newer, Intel |
+| `darwin-arm64` | macOS 13 or newer, Apple silicon |
+
+klon needs git 2.34.1 or newer. The Linux binaries build on Ubuntu 22.04, so they need a glibc
+of that vintage; an older host builds klon from source (see below). Every host feature is
+optional. `gh klon doctor` reports what this host has, and an absent feature never stops a command.
+
+### Local development
 
 Run this line from the repository root:
 
@@ -23,13 +36,77 @@ cargo build --release && ln -sf target/release/gh-klon gh-klon && gh extension i
 `gh` needs the executable in the repository root. `/gh-klon` is in `.gitignore`.
 Check the install with `gh klon --version`.
 
-## Use
+## Quick start
 
 ```sh
-gh klon add feature                       # creates ../<repo>.wt/feature
-gh klon add feature --path /some/empty/dir
-gh klon up --yes                          # runs the approved [warm] steps in golden
+gh klon add feature                   # a warm copy of golden at ../<repo>.wt/feature
+gh klon list                          # every klon: branch, HEAD, dirty flag, radar columns
+gh klon run feature -- cargo test     # a command inside the klon envelope
+gh klon shell feature                 # an interactive shell inside the envelope
+gh klon rm feature                    # rename to .trash, delete in the background
+gh klon doctor                        # what this host has, and the open journal entries
 ```
+
+## What `doctor` prints
+
+`doctor` runs in any git repository. It reports the git version, the filesystem of golden, the
+selected backend, and one row per host feature. This sample comes from klon v0.1.0 on Ubuntu
+22.04 with ext4. The row list grows as chunks land.
+
+```text
+git                         2.34.1
+filesystem                  ext4
+backend                     copy: reflink unsupported
+btrfs-progs                 absent: btrfs is not on PATH
+cgroup.controllers          present: memory pids
+fence.residual              present: refs/heads/main stays writable under the fence: git needs <common>/refs; hooks and config stay read-only
+inotify.max_user_instances  present: 128
+inotify.max_user_watches    present: 65536
+landlock                    present: ABI 3
+loopback                    present: 127.0.0.2 accepts a bind
+make                        present: GNU Make 4.3
+ninja                       absent: ninja is not on PATH
+pasta                       absent: pasta is not on PATH
+radar                       present: legacy merge-tree
+reflink                     absent: reflink unsupported: EOPNOTSUPP
+scope                       present: systemd 249 scope: MemoryHigh=63966M TasksMax=4096
+slots                       present: no address in use
+systemd-run                 present: systemd 249 (249.11-0ubuntu3.22)
+journal: no open entry
+```
+
+On macOS, `backend` reports `copy` until the v0.4 milestone adds the `apfs-clone` backend.
+
+## Commands
+
+The table is the product shape from the handoff. The status column says what works today.
+
+| Command | Meaning | Status |
+|---|---|---|
+| `gh klon add <branch>` | Same as `git worktree add`. O(1) when a spare or a snapshot exists. Warm. Branch resolution follows git DWIM. | done. The spare is not here yet; a btrfs snapshot gives the O(1) spawn. |
+| `gh klon add origin/<branch>` | An explicit remote-tracking branch. | done |
+| `gh klon add --pr <n>` | A pull request, forks included, from `refs/pull/<n>/head`. | done |
+| `gh klon add --issue <n>` | A new branch named from the issue title. | done |
+| `gh klon add <branch> -- <cmd...>` | Spawn, then run a command inside the envelope. | done |
+| `gh klon list [--json]` | Path, branch, disk delta, RSS, live processes, PR number, checks, vs-base, vs-siblings, behind. | partial: path, branch, HEAD, dirty, locked, the loopback address, vs-base, vs-siblings, and behind print today; the disk, RSS, process, PR, and checks columns land with later chunks |
+| `gh klon rm (<branch> \| --path <p>) [--merged] [--delete-branch] [--force]` | Same as `git worktree remove`. Deletes the branch only with `--merged` or `--delete-branch`. Async delete. Refuses a dirty tree or a tree with live processes without `--force`. | done |
+| `gh klon prune` | Same as `git worktree prune`, plus journal cleanup. | done |
+| `gh klon pr <branch>` | `gh pr create` from that tree. | done |
+| `gh klon sync <branch> [--merge\|--onto <base>\|--fresh\|--all\|--check]` | Fetch, then fast-forward or rebase. `--check` is a dry run through `merge-tree`. | partial: only `sync <branch> --check` works; the other forms land with C14 |
+| `gh klon merge <branch>` | Fetch, `pre_merge` hook, structured merge, fast-forward base, remove. Never pushes. | planned for v0.2 |
+| `gh klon check <branch>` | v0.2. Run `[proof] steps` at a clean HEAD and record a receipt. | planned for v0.2 |
+| `gh klon claim <branch> <paths...>` | v0.2. Record owned paths. `list` flags overlaps. | planned for v0.2 |
+| `gh klon run <branch> -- <cmd...>` | Execute inside the envelope: fence, scope, env. | done on Linux; macOS gets its fence and scope in v0.4 |
+| `gh klon shell <branch>` | An interactive shell inside the envelope. | done on Linux; macOS gets its fence and scope in v0.4 |
+| `gh klon stop <branch>` | Kill the whole process tree of that klon. | done |
+| `gh klon up` | In golden: fetch, `merge --ff-only`, approved `[warm] steps`, then a new spare. | partial: the fetch and the `[warm] steps` work; the spare lands with C9 |
+| `gh klon hibernate <branch>` / `wake <branch>` | Stash the diff to `refs/klon/<name>` and delete the folder. `wake` is `add` plus apply. | planned |
+| `gh klon init [--volume <size>] [--undo]` | One time. Make golden a btrfs subvolume, or create a sudo-free btrfs loop volume. Prints the plan and waits for `y`. `--undo` reverses it. | done |
+| `gh klon doctor [--json] [--repair]` | Backend, git version, fence ABI, cgroup delegation, inotify limits, make and ninja versions, pasta, journal repair. | done. The row list grows as chunks land. |
+| `gh klon bench [--json]` | Measure M1 to M12 on this repository against a manifest. | partial: the M1, M4, and M6 cells exist today |
+| `gh klon lo0` | macOS. Print the `lo0` alias command and the LaunchDaemon one-liner. | planned for v0.4 |
+
+## How `add` works
 
 `add` does these steps:
 
@@ -135,8 +212,8 @@ gh klon doctor              # the host report and the open entries
 gh klon doctor --repair     # close every open entry, one printed line per action
 ```
 
-`doctor` reports the git version, the filesystem of golden, `btrfs-progs`, the two
-inotify limits, `make`, `ninja`, and `pasta`. Each host feature reports `present`,
+`doctor` reports the git version, the filesystem of golden, the selected backend,
+and one row per host feature. Each host feature reports `present`,
 `absent`, or `broken` with a reason. A feature that this host does not have never
 stops a command.
 
@@ -244,11 +321,27 @@ under snap could not reach its own fixture there.
 the result, and a smoke run gives its own `fixture_hash`, so a shortened run can
 never pass for a measurement.
 
-## Known blind spot
+## Known limitations
 
-With `core.checkStat=minimal`, git compares only the size and the mtime of a file.
-An edit that keeps the byte count and the mtime is invisible to `git status`.
-Build tools change the mtime, so the risk is small.
+- The `core.checkStat=minimal` blind spot. Git compares only the size and the
+  mtime of a file. An edit that keeps the byte count and the mtime is invisible
+  to `git status`. Build tools change the mtime, so the risk is small.
+- The git floor is 2.34.1. Features that a newer git brings degrade to the
+  legacy form. The conflict radar on git 2.34 runs the legacy `git merge-tree`
+  form; `doctor` reports it.
+- macOS until v0.4. klon uses the `copy` backend and runs every command without
+  a fence and without a scope. `doctor` reports each absent part. The v0.4
+  milestone adds the `apfs-clone` backend, the Seatbelt fence, and the QoS clamp.
+- The btrfs delete needs root or a mount option. `btrfs subvolume delete`,
+  `list`, and `show` need root. Where the mount carries `user_subvol_rm_allowed`,
+  klon deletes a subvolume without root. Everywhere else `rm` falls back to a
+  background `rm -rf`.
+- The `btrfs-volume` loop setup needs an active local session. `udisksctl`
+  grants `loop-setup` and `mount` without a password only in the active session
+  of a local user. A session over SSH asks for a password or fails, and klon
+  prints the reason.
+- The release binaries need a glibc of the Ubuntu 22.04 vintage on Linux. An
+  older host builds klon from source.
 
 ## Tests
 
