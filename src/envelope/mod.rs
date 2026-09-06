@@ -17,6 +17,7 @@ pub mod env;
 #[cfg(target_os = "linux")]
 pub mod fence_linux;
 pub mod jobserver;
+pub mod netns;
 pub mod scope;
 pub mod slots;
 
@@ -58,6 +59,9 @@ pub struct Options {
     /// and `shell` want. `up` points a warm step at stderr under `--json`,
     /// because klon owns stdout for its document there.
     pub stdout: Option<Stdio>,
+    /// C23: wrap the command in a pasta network namespace. `Some` holds the
+    /// port list, and `None` keeps the command on the host network.
+    pub netns: Option<Vec<u16>>,
 }
 
 /// The envelope of one klon.
@@ -155,8 +159,9 @@ impl Envelope {
 
     /// The parts in the order they wrap the command: the scope holds the
     /// namespace, and the namespace holds the command. The Linux fence is not
-    /// a wrapper: the child applies it in process (see `command`). The
-    /// jobserver adds no wrapper on either system.
+    /// a wrapper: the child applies it in process (see `command`), except
+    /// under `--netns`, where the netns part carries it inside the namespace
+    /// (see `netns`). The jobserver adds no wrapper on either system.
     fn parts(&self) -> impl Iterator<Item = &Part> {
         [&self.scope, &self.netns, &self.jobserver]
             .into_iter()
@@ -195,7 +200,9 @@ impl Envelope {
             });
         }
         // The fence is the last step before the exec, so every wrapper and
-        // the command itself run inside it (C18).
+        // the command itself run inside it (C18). With `--netns` the fence
+        // is not set here: netns moves it inside the namespace, because
+        // pasta cannot run under it.
         #[cfg(target_os = "linux")]
         if let Some(fence) = &self.fence {
             let step = fence.child_step()?;
@@ -253,6 +260,15 @@ impl Envelope {
         // the scope made is joined from inside the child, so the fence opens
         // its `cgroup.procs`.
         envelope.fence = fence(path, &envelope, options.no_fence, guard.cgroup())?;
+        // C23: the pasta wrapper is outermost here. `enable` runs after the
+        // fence for a reason: the kernel denies mount, umount, and pivot_root
+        // inside a Landlock domain, so pasta cannot sandbox itself under the
+        // fence. `enable` takes the fence out of the envelope and moves it
+        // inside the namespace as the `__fence-exec` re-exec, so the command
+        // keeps it. A host without pasta prints one line and does nothing.
+        if let Some(ports) = options.netns.as_deref() {
+            netns::enable(&mut envelope, ports, guard.cgroup())?;
+        }
         // The child leads a new session, so the terminal never signals it:
         // Ctrl-C and a `kill` of the wrapper reach only this process. klon
         // relays each of them to the child's process group, so the whole tree

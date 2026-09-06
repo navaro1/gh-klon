@@ -139,6 +139,14 @@ enum Command {
     Stop(cli::stop::Args),
     /// Measure klon against a plain worktree on a generated fixture.
     Bench(cli::bench::Args),
+    /// Apply the write fence to a command and exec it. The `--netns` wrapper
+    /// starts this inside the pasta namespace (C23); a person never types it.
+    #[command(name = "__fence-exec", hide = true)]
+    FenceExec(cli::fence_exec::Args),
+    /// Relay namespace DNS queries to a routable resolver. `__fence-exec`
+    /// starts this inside the pasta namespace (C23); a person never types it.
+    #[command(name = "__dns-forward", hide = true)]
+    DnsForward(cli::dns_forward::Args),
     /// Build the hot spare of a repository. `add`, `up`, and `rm` start this
     /// detached; a user never needs it.
     #[command(hide = true)]
@@ -165,11 +173,15 @@ fn main() -> ExitCode {
                 | Command::Shell(_)
                 | Command::SpareBuild(_)
                 | Command::Warm(_)
+                | Command::FenceExec(_)
+                | Command::DnsForward(_)
         )
     {
         eprintln!(
             "{}",
-            Error::klon("--json is not available for prune, pr, run, shell, spare-build, and warm",)
+            Error::klon(
+                "--json is not available for prune, pr, run, shell, spare-build, warm, __fence-exec, and __dns-forward",
+            )
         );
         return ExitCode::from(1);
     }
@@ -192,6 +204,8 @@ fn main() -> ExitCode {
         Command::Shell(args) => cli::shell::run(args),
         Command::Stop(args) => cli::stop::run(args, json),
         Command::Bench(args) => cli::bench::run(args, json),
+        Command::FenceExec(args) => cli::fence_exec::run(args),
+        Command::DnsForward(args) => cli::dns_forward::run(args),
         Command::SpareBuild(args) => cli::spare_build::run(args),
         Command::Warm(args) => cli::warm::run(args),
     };

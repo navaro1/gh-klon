@@ -218,6 +218,7 @@ fn exec_step(klon: &Path, step: &str, json: bool) -> (receipt::Status, u64) {
     let options = Options {
         no_fence: false,
         stdout,
+        netns: None,
     };
     let status = match Envelope::spawn_and_wait(Root::Klon(klon), &argv, options) {
         Ok(status) if status.success() => receipt::Status::Pass,

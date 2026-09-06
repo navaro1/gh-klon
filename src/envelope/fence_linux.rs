@@ -257,6 +257,18 @@ fn allow_set(
     for device in ["/dev/null", "/dev/shm", "/dev/tty", "/dev/ptmx", "/dev/pts"] {
         push(PathBuf::from(device), device.to_string(), false);
     }
+    // pasta (C23) opens `/dev/net/tun` read-write to build the tap device of
+    // the namespace. Without write access the open dies with EACCES and pasta
+    // exits, so the rule rides with the `/proc` one: no repository path lives
+    // under `/dev`, and the device keeps its own file permissions.
+    push(PathBuf::from("/dev/net/tun"), "/dev/net/tun".into(), false);
+    // pasta (C23) runs inside the fence and writes `/proc/self/uid_map` to
+    // set up its user namespace. The rule must cover all of `/proc`, because
+    // Landlock pins directory inodes when klon adds the rule: `/proc/self`
+    // would name the pid of klon, not of the child that runs pasta. No
+    // repository path lives under `/proc`, so golden stays read-only, and
+    // another user's entries keep their file permissions.
+    push(PathBuf::from("/proc"), "/proc".into(), false);
     for entry in allow {
         match allow_entry(entry, klon, dirs) {
             Ok(path) => push(path, format!("[fence] allow {entry}"), false),
