@@ -1,5 +1,5 @@
-//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>]`: the `add`
-//! transaction from handoff §4, copy backend only.
+//! `gh klon add <branch> [--pr <n>] [--issue <n>] [--path <p>] [--path-mode <m>]`:
+//! the `add` transaction from handoff §4, copy backend only.
 
 use crate::backend::copy;
 use crate::branch;
@@ -28,9 +28,21 @@ pub struct Args {
     #[arg(long, conflicts_with = "branch")]
     pub issue: Option<u64>,
     /// The klon path. Default: the `path` template from `.klon.toml`, else
-    /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}` and `{branch}`.
+    /// `../<repo>.wt/<branch>` next to golden. The template supports `{repo}`, `{branch}`,
+    /// and `{name}`.
     #[arg(long)]
     pub path: Option<PathBuf>,
+    /// The path convention of a host harness (research record §19). It sets
+    /// the path template and, for `claude`, renames the branch to
+    /// `worktree-<name>`. `--path` is the explicit escape hatch, so the two
+    /// conflict.
+    #[arg(
+        long,
+        value_enum,
+        requires = "branch",
+        conflicts_with_all = ["path", "pr", "issue"]
+    )]
+    pub path_mode: Option<config::PathMode>,
 }
 
 /// The `add --json` document.
@@ -58,11 +70,30 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         .map(|w| paths::absolute(&w.path))
         .ok_or_else(|| Error::klon("not inside a git repository"))??;
     // The branch form is resolved first: it names the default klon path and
-    // may create the branch (handoff §4, git DWIM).
-    let branch = resolve_branch(&golden, &args)?;
+    // may create the branch (handoff §4, git DWIM). The claude mode renames
+    // the branch first: the argument is the worktree name (research §19).
+    let branch = match args.path_mode {
+        Some(config::PathMode::Claude) => {
+            let raw = args.branch.as_deref().ok_or_else(|| {
+                Error::klon(
+                    "--path-mode claude names the worktree, as in: add x --path-mode claude",
+                )
+            })?;
+            branch::resolve(&golden, &format!("worktree-{raw}"))?
+        }
+        _ => resolve_branch(&golden, &args)?,
+    };
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
-        None => config::load(&golden)?.resolve_path(&golden, &branch)?,
+        None => match args.path_mode {
+            Some(mode) => config::resolve_filled(
+                &golden,
+                &mode.template(),
+                &branch,
+                &klon_name(&args, &branch),
+            )?,
+            None => config::load(&golden)?.resolve_path(&golden, &branch)?,
+        },
     };
     // Refuse unsupported paths before any repository mutation.
     for p in [&golden, &common, &path] {
@@ -199,6 +230,15 @@ fn check_path(golden: &Path, path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `{name}` of the template: the raw `add` argument in the claude mode,
+/// the branch everywhere else, where no separate name exists.
+fn klon_name(args: &Args, branch: &str) -> String {
+    match args.path_mode {
+        Some(config::PathMode::Claude) => args.branch.clone().unwrap_or_else(|| branch.to_string()),
+        _ => branch.to_string(),
+    }
 }
 
 /// Resolve the branch form to a local branch name (handoff §4). The
