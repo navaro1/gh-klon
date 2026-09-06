@@ -168,15 +168,27 @@ fn submodule_paths(golden: &Path) -> Vec<PathBuf> {
     if !golden.join(".gitmodules").is_file() {
         return Vec::new();
     }
+    // The pattern is anchored. A plain `path` also matches `submodule.<name>.url`
+    // when the name holds `path`, and a branch called `main` would then exclude
+    // golden's own `main/` directory. `-z` gives `key\nvalue\0` records, so a
+    // path with a space or a newline still parses.
     let out = crate::git::run(
         golden,
-        &["config", "--file", ".gitmodules", "--get-regexp", "path"],
+        &[
+            "config",
+            "-z",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
     );
     let Ok(text) = out else {
         return Vec::new();
     };
-    text.lines()
-        .filter_map(|line| line.split_once(' '))
+    text.split('\0')
+        .filter_map(|record| record.split_once('\n'))
+        .filter(|(key, _)| key.starts_with("submodule.") && key.ends_with(".path"))
         .map(|(_, value)| PathBuf::from(value))
         .filter(|p| p.is_relative() && !p.as_os_str().is_empty())
         .collect()
@@ -188,10 +200,15 @@ fn submodule_paths(golden: &Path) -> Vec<PathBuf> {
 struct Includes {
     /// The lines, compiled as a gitignore matcher.
     patterns: Option<Gitignore>,
-    /// Every directory that an include line names or sits below, relative to
+    /// Every directory that a plain include line sits below, relative to
     /// golden. The walk must descend into these, because a `.klonignore` line
     /// that excludes a directory would otherwise hide its included children.
     ancestors: HashSet<PathBuf>,
+    /// The literal head of every include line that holds a wildcard. klon
+    /// cannot name the directories below a wildcard, so it descends into all of
+    /// them. An excluded directory can therefore appear empty in the klon; that
+    /// is the price of a wildcard include, and `.worktreeinclude` is opt-in.
+    open: Vec<PathBuf>,
 }
 
 impl Includes {
@@ -202,25 +219,35 @@ impl Includes {
         };
         let mut builder = ignore::gitignore::GitignoreBuilder::new(golden);
         let mut ancestors = HashSet::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        let mut open = Vec::new();
+        for raw in text.lines() {
+            // gitignore keeps a leading space and an escaped trailing one, so
+            // the raw line is the pattern. The trimmed copy only answers
+            // whether the line is blank or a comment.
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let looks_empty = line.trim();
+            if looks_empty.is_empty() || looks_empty.starts_with('#') {
                 continue;
             }
             let _ = builder.add_line(Some(file.clone()), line);
-            for dir in ancestor_dirs(line) {
-                ancestors.insert(dir);
+            let (dirs, wildcard) = ancestor_dirs(line);
+            if wildcard {
+                open.push(dirs.last().cloned().unwrap_or_default());
             }
+            ancestors.extend(dirs);
         }
         Includes {
             patterns: builder.build().ok(),
             ancestors,
+            open,
         }
     }
 
     /// True when `rel` is included, or is a directory on the way to one.
     fn covers(&self, rel: &Path, is_dir: bool) -> bool {
-        if is_dir && self.ancestors.contains(rel) {
+        if is_dir
+            && (self.ancestors.contains(rel) || self.open.iter().any(|head| rel.starts_with(head)))
+        {
             return true;
         }
         self.patterns
@@ -229,19 +256,29 @@ impl Includes {
     }
 }
 
-/// The directories that an include line sits below, up to the first glob.
-/// `build/keep/**` gives `build` and `build/keep`; `*.log` gives nothing.
-fn ancestor_dirs(line: &str) -> Vec<PathBuf> {
+/// The directories that an include line sits below, up to the first wildcard,
+/// and whether a wildcard follows them.
+///
+/// `build/keep/**` gives `[build, build/keep]` and true. `build/keep/k.txt`
+/// gives `[build, build/keep]` and false. `*.log` gives `[]` and true, so the
+/// walk descends everywhere, which is what that line asks for.
+fn ancestor_dirs(line: &str) -> (Vec<PathBuf>, bool) {
     let line = line.strip_prefix('!').unwrap_or(line);
-    let literal = match line.find(['*', '?', '[']) {
-        Some(cut) => &line[..cut],
+    let cut = line.find(['*', '?', '[']);
+    let literal = match cut {
+        // A wildcard can start inside a name, as in `build/ke*p.txt`, so the
+        // literal head keeps whole components only.
+        Some(cut) => match line[..cut].rfind('/') {
+            Some(slash) => &line[..=slash],
+            None => "",
+        },
         None => line,
     };
     let mut out = Vec::new();
     let mut walk = PathBuf::new();
     let parts: Vec<&str> = literal.split('/').filter(|p| !p.is_empty()).collect();
-    // The last part is the entry itself when the line ends in no separator, so
-    // it is a parent only when a separator follows it.
+    // The last part is the entry itself when no separator follows it, so it
+    // becomes a parent only when one does.
     let last = if literal.ends_with('/') {
         parts.len()
     } else {
@@ -251,7 +288,7 @@ fn ancestor_dirs(line: &str) -> Vec<PathBuf> {
         walk.push(part);
         out.push(walk.clone());
     }
-    out
+    (out, cut.is_some())
 }
 
 // --- Shared filesystem helpers -------------------------------------------------
@@ -718,6 +755,40 @@ mod tests {
     fn only_the_block_sharing_backend_needs_one_filesystem() {
         assert!(!copy::Copy.same_filesystem_only());
         assert!(reflink::Reflink.same_filesystem_only());
+    }
+
+    /// A wildcard include has to keep every directory below its literal head
+    /// reachable, or the walk prunes the directory that holds the wanted file.
+    #[test]
+    fn an_include_line_gives_its_parent_directories() {
+        let dirs = |line: &str| -> (Vec<String>, bool) {
+            let (list, wild) = ancestor_dirs(line);
+            (list.iter().map(|p| p.display().to_string()).collect(), wild)
+        };
+        assert_eq!(
+            dirs("/build/cache/keep/"),
+            (vec_of(&["build", "build/cache", "build/cache/keep"]), false)
+        );
+        assert_eq!(
+            dirs("build/keep/k.txt"),
+            (vec_of(&["build", "build/keep"]), false)
+        );
+        assert_eq!(dirs("build/**/keep.txt"), (vec_of(&["build"]), true));
+        // A wildcard can open inside a name, so the head keeps whole components.
+        assert_eq!(dirs("build/ke*p.txt"), (vec_of(&["build"]), true));
+        assert_eq!(dirs("*.log"), (Vec::new(), true));
+        assert_eq!(dirs("keep.txt"), (Vec::new(), false));
+    }
+
+    fn vec_of(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An empty head must open every directory, because `*.log` matches at
+    /// every depth.
+    #[test]
+    fn an_empty_head_is_a_prefix_of_every_path() {
+        assert!(Path::new("build/deep").starts_with(Path::new("")));
     }
 
     #[test]

@@ -152,6 +152,73 @@ fn worktreeinclude_takes_back_a_klonignore_exclusion() {
     );
 }
 
+/// The submodule query must match only the `path` key. An unanchored pattern
+/// also returns `submodule.<name>.url` and `.branch` when the name holds
+/// `path`, and a branch named `main` would then drop golden's own `main/`.
+#[test]
+fn a_submodule_named_path_does_not_exclude_its_branch_name() {
+    let fx = fixture();
+    ignore_more(&fx, "/vendor/\n/main/\n");
+    fs::write(
+        fx.golden.join(".gitmodules"),
+        "[submodule \"path-lib\"]\n\tpath = vendor/lib\n\turl = https://example.com/lib.git\n\tbranch = main\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.golden.join("vendor/lib")).unwrap();
+    fs::write(fx.golden.join("vendor/lib/keep.txt"), "sub\n").unwrap();
+    fs::create_dir(fx.golden.join("main")).unwrap();
+    fs::write(fx.golden.join("main/file.txt"), "not a submodule\n").unwrap();
+
+    let klon_path = add(&fx, &[]);
+    assert!(
+        klon_path.join("main/file.txt").exists(),
+        "the branch name of a submodule must not exclude a directory"
+    );
+    assert!(
+        !klon_path.join("vendor/lib").exists(),
+        "the submodule path itself stays out"
+    );
+}
+
+/// A wildcard include must reach through the directories that `.klonignore`
+/// excludes, or the walk prunes the directory that holds the wanted file.
+#[test]
+fn a_wildcard_worktreeinclude_reaches_a_deep_file() {
+    let fx = fixture();
+    let deep = fx.golden.join("build").join("deep").join("deeper");
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(deep.join("keep.txt"), "keep me\n").unwrap();
+    fs::write(deep.join("drop.txt"), "drop me\n").unwrap();
+    fs::write(fx.golden.join(".klonignore"), "/build/\n").unwrap();
+    fs::write(fx.golden.join(".worktreeinclude"), "build/**/keep.txt\n").unwrap();
+
+    let klon_path = add(&fx, &[]);
+    assert!(
+        klon_path.join("build/deep/deeper/keep.txt").exists(),
+        "a wildcard include must reach through the excluded directories"
+    );
+    assert!(
+        !klon_path.join("build/deep/deeper/drop.txt").exists(),
+        "only the matching file comes back"
+    );
+}
+
+/// gitignore keeps a trailing space when a backslash escapes it, so the raw
+/// line is the pattern.
+#[test]
+fn a_worktreeinclude_line_keeps_an_escaped_trailing_space() {
+    let fx = fixture();
+    fs::write(fx.golden.join("build").join("keep "), "keep\n").unwrap();
+    fs::write(fx.golden.join(".klonignore"), "/build/\n").unwrap();
+    fs::write(fx.golden.join(".worktreeinclude"), "/build/keep\\ \n").unwrap();
+
+    let klon_path = add(&fx, &[]);
+    assert!(
+        klon_path.join("build/keep ").exists(),
+        "an escaped trailing space names a real file"
+    );
+}
+
 #[test]
 fn worktreeinclude_does_not_take_back_a_nested_git() {
     let fx = fixture();
@@ -269,6 +336,57 @@ fn a_binary_file_without_an_extension_is_not_rewritten() {
         fs::read(klon_path.join("build/program")).unwrap(),
         bytes,
         "a file with a NUL byte must stay byte for byte the same"
+    );
+}
+
+/// The searcher stops at the first hit, so a NUL byte after the hit never
+/// reaches it. The pass scans the whole file for a NUL of its own.
+#[test]
+fn a_file_with_a_nul_byte_after_the_hit_is_not_rewritten() {
+    let fx = fixture();
+    let golden_text = fx.golden.to_str().unwrap();
+    let mut bytes = format!("dir: {golden_text}\n").into_bytes();
+    bytes.extend_from_slice(&[b'x'; 200]);
+    bytes.push(0);
+    bytes.extend_from_slice(&[b'y'; 200]);
+    fs::write(fx.golden.join("build").join("late-nul.dat"), &bytes).unwrap();
+
+    let klon_path = add(&fx, &[]);
+    assert_eq!(
+        fs::read(klon_path.join("build/late-nul.dat")).unwrap(),
+        bytes,
+        "a NUL anywhere in the file must stop the rewrite"
+    );
+}
+
+/// R15 asks klon to rewrite the path. A refused write means the klon would
+/// keep golden's path, so `add` must fail instead of reporting success.
+#[test]
+fn a_refused_rewrite_fails_the_add() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture();
+    let golden_text = fx.golden.to_str().unwrap();
+    let locked = fx.golden.join("build").join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("conf.yaml"), format!("dir: {golden_text}\n")).unwrap();
+    // A read-only directory refuses the temporary file that a rewrite renames.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = klon(&fx.golden, &["add", "feature"]);
+    // Let the harness delete the fixture even after the test fails.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !out.status.success(),
+        "add must fail when the pass cannot rewrite a file"
+    );
+    assert!(
+        stderr(&out).contains("conf.yaml"),
+        "the error must name the file: {}",
+        stderr(&out)
+    );
+    assert!(
+        !fx.default_klon_path().exists(),
+        "the failed add must roll the klon back"
     );
 }
 

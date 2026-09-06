@@ -87,19 +87,23 @@ pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
     pass.walk(first, rest, &found);
 
     let mut summary = Summary::default();
-    let mut log = found.changes.into_inner().expect("fixup lock");
-    for path in found.doomed.into_inner().expect("fixup lock") {
-        let removed = if path.is_dir() {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
+    let mut log = std::mem::take(&mut *found.changes.lock().expect("fixup lock"));
+    let doomed = std::mem::take(&mut *found.doomed.lock().expect("fixup lock"));
+    for path in doomed {
+        // `symlink_metadata`, not `is_dir`: a `.next/cache` symlink that points
+        // outside the klon must lose the link, never the target.
+        let removed = match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(err) => Err(err),
         };
         match removed {
             Ok(()) => {
                 summary.deleted += 1;
                 log.push(Change::deleted(pass.relative(&path)));
             }
-            Err(err) => eprintln!("klon: fixup: delete {}: {err}", path.display()),
+            // R3 counts the delete list, so a refused delete is a real failure.
+            Err(err) => found.record(Error::io(format!("delete {}", path.display()))(err)),
         }
     }
     for change in &log {
@@ -115,6 +119,14 @@ pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
         log.sort_by(|a, b| a.line.cmp(&b.line));
         write_log(klon, &log)?;
     }
+    // The log records what did happen before the failure closes the run.
+    let mut failures = found.failures.into_inner().expect("fixup lock");
+    if !failures.is_empty() {
+        for err in failures.iter().skip(1) {
+            eprintln!("klon: fixup: {err}");
+        }
+        return Err(failures.remove(0));
+    }
     Ok(summary)
 }
 
@@ -123,6 +135,27 @@ pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
 struct Shared {
     changes: Mutex<Vec<Change>>,
     doomed: Mutex<Vec<PathBuf>>,
+    /// Failures that the pass cannot shrug off. `run` returns the first one, so
+    /// `add` rolls back instead of handing over a klon that still names golden.
+    failures: Mutex<Vec<Error>>,
+}
+
+impl Shared {
+    /// Record one failure, or print it and carry on when it is a race.
+    ///
+    /// An entry can vanish while the walk runs: a build daemon or a background
+    /// delete owns the same ignored tree. A missing entry is therefore a
+    /// warning. Everything else, a refused write above all, means the klon
+    /// would keep golden's path, which R15 forbids.
+    fn record(&self, err: Error) {
+        if let Error::Io { source, .. } = &err {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("klon: fixup: {err}");
+                return;
+            }
+        }
+        self.failures.lock().expect("fixup lock").push(err);
+    }
 }
 
 /// One line of the log, with the kind that the summary counts.
@@ -277,7 +310,7 @@ impl Pass {
         match outcome {
             Ok(None) => {}
             Ok(Some(change)) => found.changes.lock().expect("fixup lock").push(change),
-            Err(err) => eprintln!("klon: fixup: {err}"),
+            Err(err) => found.record(err),
         }
         ignore::WalkState::Continue
     }
@@ -306,11 +339,18 @@ impl Pass {
         if memchr::memmem::find(&bytes, self.needle.as_bytes()).is_none() {
             return Ok(None);
         }
+        // The searcher stops at the first hit, so it may never reach a NUL byte
+        // that sits after it. This scans the whole file, and `String::from_utf8`
+        // would accept a NUL. Both rails have to hold before a rewrite.
+        if memchr::memchr(0, &bytes).is_some() {
+            return Ok(None);
+        }
         if !holds_needle(searcher, self.needle.as_bytes(), &bytes, &relative)? {
             return Ok(None);
         }
-        // The searcher already refused a NUL byte. This refuses every other
-        // byte sequence that is not text, so the splice cannot cut a codepoint.
+        // The NUL scan above answered the binary question. This refuses every
+        // other byte sequence that is not text, so the splice cannot cut a
+        // codepoint in two.
         let Ok(text) = String::from_utf8(bytes) else {
             return Ok(None);
         };
