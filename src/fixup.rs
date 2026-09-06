@@ -13,9 +13,10 @@
 //! | Rail | Reason |
 //! |---|---|
 //! | at most 1 MB | a big artifact is a database or an image, not a config |
-//! | free of a NUL byte | `grep-searcher` stops on binary content |
-//! | valid UTF-8 | a byte splice inside a multi-byte sequence would corrupt it |
 //! | outside the skip list | a known binary extension, or a `[fixup] skip` glob |
+//! | free of a NUL byte anywhere | a NUL marks a binary file, and `String::from_utf8` accepts one |
+//! | text to `grep-searcher` | its own binary rule, applied before any write |
+//! | valid UTF-8 | a byte splice inside a multi-byte sequence would corrupt it |
 //!
 //! klon also rewrites a symlink whose target points into golden (handoff §12
 //! Q8), and deletes `.next/cache`, `.ninja_log`, and `.ninja_deps`, which hold
