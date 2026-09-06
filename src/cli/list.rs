@@ -1,18 +1,20 @@
 //! `gh klon list`: one line per klon with path, branch, short HEAD, a dirty flag,
 //! the five C30 extras columns (disk, RSS, live processes, PR, checks), the C12
-//! warm column, and the three C24 radar columns: `<path> <branch> <head>[ *] |
-//! <disk> | <rss> | <procs> | <pr> | <checks> | <warm> | <vs-base> |
-//! <vs-siblings> | behind <n>`. The radar columns close the line, so a reader
-//! that cuts the last three fields keeps working. The main worktree is not a
-//! klon and never appears. `--json` prints the same rows with the full HEAD,
-//! and `--no-gh` skips the pull request fetch.
+//! warm column, the C26 receipt column, and the three C24 radar columns:
+//! `<path> <branch> <head>[ *] | <disk> | <rss> | <procs> | <pr> | <checks> |
+//! <warm> | <receipt> | <vs-base> | <vs-siblings> | behind <n>`. The radar
+//! columns close the line, so a reader that cuts the last three fields keeps
+//! working. The main worktree is not a klon and never appears. `--json` prints
+//! the same rows with the full HEAD, and `--no-gh` skips the pull request
+//! fetch.
 
 use crate::envelope::env;
 use crate::extras;
 use crate::paths;
 use crate::radar;
+use crate::receipt;
 use crate::warm;
-use crate::{git, hibernate, Error, Result};
+use crate::{config, git, hibernate, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -70,6 +72,11 @@ struct Row {
     /// True for a klon that `gh klon hibernate` put away (C29). Its directory
     /// is gone; its work sits on `refs/klon/hibernate/<name>`.
     hibernated: bool,
+    /// The C26 check receipt of the klon's HEAD: `pass`, `failed`, or `stale`.
+    /// It is null when the repository configures no `[proof] steps`, when
+    /// nothing has ever checked the branch, or when klon cannot read the
+    /// receipt directory.
+    receipt: Option<&'static str>,
     #[serde(flatten)]
     radar: radar::Row,
 }
@@ -86,6 +93,15 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let common = git::common_dir(&cwd)?;
     let targets = radar::targets(&worktrees);
     let radar_rows = radar::scan(&golden, &common, &targets);
+    // The receipt column compares against the steps that `.klon.toml` names
+    // now, so the hash is read once for the whole list. A repository with no
+    // `[proof] steps` has nothing to prove, and every receipt column is then
+    // null.
+    let proof_steps = config::load(&golden)
+        .ok()
+        .and_then(|cfg| cfg.proof.and_then(|proof| proof.steps))
+        .unwrap_or_default();
+    let steps_hash = (!proof_steps.is_empty()).then(|| receipt::steps_hash(&proof_steps));
     let mut rows = Vec::new();
     for (worktree, radar) in worktrees.iter().skip(1).zip(radar_rows) {
         let path = paths::absolute(&worktree.path)?;
@@ -117,6 +133,12 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             pr: number,
             checks,
             warming: warm::pending(&path),
+            receipt: receipt_of(
+                &common,
+                worktree.head.as_deref(),
+                branch.as_deref(),
+                steps_hash.as_deref(),
+            ),
             branch,
             locked: worktree.locked,
             hibernated: false,
@@ -147,6 +169,15 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             pr: None,
             checks: None,
             warming: Vec::new(),
+            // The receipt is not a measurement of the tree: it sits in the
+            // common directory and survives the hibernation, so the sleeping
+            // klon still reports what its recorded HEAD proved.
+            receipt: receipt_of(
+                &common,
+                Some(record.head.as_str()),
+                Some(record.branch.as_str()),
+                steps_hash.as_deref(),
+            ),
             branch: Some(record.branch),
             locked: false,
             hibernated: true,
@@ -212,10 +243,44 @@ fn extra_columns(row: &Row) -> String {
         true => "-".to_string(),
         false => format!("warming {}", row.warming.join(",")),
     };
+    let receipt = row
+        .receipt
+        .map(mark)
+        .unwrap_or_else(|| receipt::Verdict::Missing.column());
     format!(
-        "| {disk} | {rss} | {} | {pr} | {checks} | {warm}",
+        "| {disk} | {rss} | {} | {pr} | {checks} | {warm} | {receipt}",
         row.procs
     )
+}
+
+/// The `list` mark of a receipt verdict. The JSON name and the mark stay in
+/// one place, so the two can never drift apart.
+fn mark(name: &str) -> &'static str {
+    for verdict in [
+        receipt::Verdict::Pass,
+        receipt::Verdict::Failed,
+        receipt::Verdict::Stale,
+    ] {
+        if verdict.json() == Some(name) {
+            return verdict.column();
+        }
+    }
+    receipt::Verdict::Missing.column()
+}
+
+/// The C26 receipt verdict of one klon. A klon with no HEAD, no branch, or a
+/// repository with no `[proof] steps` has nothing to prove and reports null.
+/// A receipt directory that klon cannot read costs the column, never the list.
+fn receipt_of(
+    common: &Path,
+    head: Option<&str>,
+    branch: Option<&str>,
+    steps_hash: Option<&str>,
+) -> Option<&'static str> {
+    let (head, branch, steps_hash) = (head?, branch?, steps_hash?);
+    receipt::verdict(common, head, branch, steps_hash)
+        .ok()?
+        .json()
 }
 
 /// The HEAD of a klon: the full object name for JSON, the short one for a
