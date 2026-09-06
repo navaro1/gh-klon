@@ -65,14 +65,24 @@ fn parse(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|err| panic!("not one JSON document: {err}\n{text}"))
 }
 
-/// The one record of `report` whose backend is not the baseline.
+/// The klon record of `report` that measured a direct clone.
 fn klon_record(report: &Value) -> &Value {
     report["records"]
         .as_array()
         .expect("records")
         .iter()
-        .find(|r| r["backend"] != "git-worktree-add")
+        .find(|r| r["backend"] != "git-worktree-add" && r["spare"] == false)
         .expect("a klon record")
+}
+
+/// The klon record of `report` that measured an `add` with a hot spare (C9).
+fn spare_record(report: &Value) -> &Value {
+    report["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .find(|r| r["backend"] != "git-worktree-add" && r["spare"] == true)
+        .expect("a spare record")
 }
 
 fn baseline_record(report: &Value) -> &Value {
@@ -129,13 +139,17 @@ fn the_json_report_holds_the_samples_and_the_environment() {
     );
 
     let records = report["records"].as_array().expect("records");
-    assert_eq!(records.len(), 2, "one klon record and one baseline record");
+    assert_eq!(
+        records.len(),
+        3,
+        "a direct klon record, a spare klon record, and a baseline record"
+    );
 
     let klon = klon_record(&report);
     assert_eq!(klon["cell"], "m1-add-10k");
     assert_eq!(klon["metric"], "M1");
     assert_eq!(klon["runs"], 3);
-    assert_eq!(klon["spare"], false, "v0 has no hot spare");
+    assert_eq!(klon["spare"], false, "the direct clone record");
     assert_eq!(
         klon["cache_drop"], "warm-only",
         "this host cannot drop caches"
@@ -158,6 +172,18 @@ fn the_json_report_holds_the_samples_and_the_environment() {
     assert_eq!(klon["pass_p50_ms"], 1000);
     assert_eq!(klon["first_p50_ms"], Value::Null, "M1 has no first series");
     assert_eq!(klon["steady_p50_ms"], Value::Null);
+
+    // C9: the same cell measures an `add` with a hot spare ready, as its own
+    // record with `spare: true` and the same backend.
+    let spare = spare_record(&report);
+    assert_eq!(spare["cell"], "m1-add-10k");
+    assert_eq!(spare["backend"], klon["backend"]);
+    assert_eq!(spare["runs"], 3);
+    assert_eq!(numbers(&spare["samples_ms"]).len(), 3);
+    assert_eq!(spare["timing_valid"], true);
+    assert_eq!(spare["correctness"]["ignored_manifest"], "match");
+    assert_eq!(spare["correctness"]["status"], "clean");
+    assert_eq!(spare["pass_p50_ms"], 1000);
 
     // The third acceptance line: the baseline runs on the same fixture and
     // brings its own samples.
@@ -238,6 +264,9 @@ fn an_injected_mismatch_voids_the_timing() {
     // The samples are still there. The report voids the timing; it does not
     // hide it.
     assert_eq!(numbers(&klon["samples_ms"]).len(), 3);
+    // The spare record is checked the same way, so a damaged spare tree
+    // cannot pass either.
+    assert_eq!(spare_record(&report)["timing_valid"], false);
 
     // The baseline holds no ignored state, so the damage lands on a tracked
     // file and `git status` catches it instead.

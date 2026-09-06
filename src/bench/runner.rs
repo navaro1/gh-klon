@@ -46,8 +46,12 @@ pub struct Options {
 /// Which tool a record measures.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool {
-    /// `gh klon`, with the backend that this host probes.
+    /// `gh klon add --no-spare`: a direct clone with the backend that this
+    /// host probes.
     Klon,
+    /// `gh klon add` with a hot spare ready before the timer starts (C9). The
+    /// M1 budget of R12 binds this record.
+    KlonSpare,
     /// Plain `git worktree add` and `git worktree remove`.
     Baseline,
 }
@@ -56,7 +60,17 @@ impl Tool {
     fn tag(self) -> &'static str {
         match self {
             Tool::Klon => "klon",
+            Tool::KlonSpare => "klon-spare",
             Tool::Baseline => "base",
+        }
+    }
+
+    /// The tools of one cell. Only an `add` cell measures the spare: a status
+    /// or a removal reads the same tree whichever way it was filled.
+    fn for_cell(cell: &Cell) -> Vec<Tool> {
+        match cell.action {
+            Action::Add => vec![Tool::Klon, Tool::KlonSpare, Tool::Baseline],
+            Action::Status | Action::Rm => vec![Tool::Klon, Tool::Baseline],
         }
     }
 }
@@ -157,11 +171,10 @@ fn run_cell(
     drop: &DropCaches,
     order_seed: u64,
 ) -> Result<Vec<Record>> {
-    let tools = [Tool::Klon, Tool::Baseline];
     // The verdict of a tool does not change between the warm and the cold
     // group, so one check per tool serves both records.
     let mut checked = Vec::new();
-    for tool in tools {
+    for tool in Tool::for_cell(cell) {
         checked.push(verify(cell, fixture, tool)?);
     }
 
@@ -233,8 +246,7 @@ fn group(
             profile: cell.profile.clone(),
             profile_shape: manifest.profile_of(cell),
             backend: check.backend.clone(),
-            // C9 adds the hot spare. No v0 `add` uses one.
-            spare: false,
+            spare: check.tool == Tool::KlonSpare,
             cold,
             cache_drop: drop.label(cold),
             timer: cell.timer.clone(),
@@ -284,9 +296,12 @@ fn sample(
     };
     match cell.action {
         Action::Add => {
+            prepare(tool, golden)?;
             chill()?;
-            let primary_ms = timed(&mut create_command(tool, golden, &path))?.0;
+            let (primary_ms, stdout) = timed(&mut create_command(tool, golden, &path))?;
+            check_spare(tool, &stdout)?;
             teardown(golden, &path)?;
+            settle(tool, golden)?;
             Ok(Sample {
                 primary_ms,
                 steady_ms: Vec::new(),
@@ -353,14 +368,21 @@ fn timed(command: &mut Command) -> Result<(f64, String)> {
 }
 
 /// The command that creates a tree at `path`.
+///
+/// The plain klon tool passes `--no-spare`, so its number is the direct
+/// clone. The spare tool sets `KLON_SPARE=1`, which beats a `KLON_SPARE=0`
+/// that the test harness may have put in the environment of `bench`.
 fn create_command(tool: Tool, golden: &Path, path: &Path) -> Command {
     match tool {
-        Tool::Klon => {
+        Tool::Klon | Tool::KlonSpare => {
             let mut command = Command::new(klon_binary());
-            command
-                .current_dir(golden)
-                .args(["add", "--json", fixture::BRANCH, "--path"])
-                .arg(path);
+            command.current_dir(golden).args(["add", "--json"]);
+            if tool == Tool::Klon {
+                command.arg("--no-spare");
+            } else {
+                command.env("KLON_SPARE", "1");
+            }
+            command.args([fixture::BRANCH, "--path"]).arg(path);
             fixture::isolate(&mut command);
             command
         }
@@ -372,15 +394,15 @@ fn create_command(tool: Tool, golden: &Path, path: &Path) -> Command {
     }
 }
 
-/// The command that removes the tree at `path`.
+/// The command that removes the tree at `path`. `rm` starts no builder here:
+/// a clone in the background would add noise to the next sample.
 fn remove_command(tool: Tool, golden: &Path, path: &Path) -> Command {
     match tool {
-        Tool::Klon => {
+        Tool::Klon | Tool::KlonSpare => {
             let mut command = Command::new(klon_binary());
             command
                 .current_dir(golden)
-                .arg("rm")
-                .arg("--path")
+                .args(["rm", "--no-spare", "--path"])
                 .arg(path);
             fixture::isolate(&mut command);
             command
@@ -393,15 +415,57 @@ fn remove_command(tool: Tool, golden: &Path, path: &Path) -> Command {
     }
 }
 
+/// Before a spare sample: a spare must be ready, outside the timer. The
+/// build waits for any builder that a previous sample started.
+fn prepare(tool: Tool, golden: &Path) -> Result<()> {
+    match tool {
+        Tool::KlonSpare => crate::spare::ensure(golden),
+        Tool::Klon | Tool::Baseline => Ok(()),
+    }
+}
+
+/// After a spare sample: the measured `add` started the next builder. Wait
+/// for it, so the next sample of any tool runs on a quiet disk.
+fn settle(tool: Tool, golden: &Path) -> Result<()> {
+    match tool {
+        Tool::KlonSpare => {
+            crate::spare::wait_for_builder(golden, std::time::Duration::from_secs(300))
+        }
+        Tool::Klon | Tool::Baseline => Ok(()),
+    }
+}
+
+/// A spare sample whose `add` did not use the spare measured a direct clone
+/// under the wrong label. That is a defect of the run, not a slow result.
+fn check_spare(tool: Tool, stdout: &str) -> Result<()> {
+    if tool == Tool::KlonSpare && !spare_of(stdout)? {
+        return Err(Error::klon(
+            "the spare sample did not use the spare; the report would mislabel a direct clone",
+        ));
+    }
+    Ok(())
+}
+
+/// The `spare` field of an `add --json` document.
+fn spare_of(stdout: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|err| Error::klon(format!("read the add report: {err}")))?;
+    value["spare"]
+        .as_bool()
+        .ok_or_else(|| Error::klon("the add report has no spare field"))
+}
+
 fn status_command(path: &Path) -> Command {
     fixture::isolated_git(path, &["status", "--porcelain"])
 }
 
 /// Create a tree outside the timer. The answer is the backend that filled it.
 fn create(tool: Tool, golden: &Path, path: &Path) -> Result<String> {
+    prepare(tool, golden)?;
     let (_, stdout) = timed(&mut create_command(tool, golden, path))?;
+    check_spare(tool, &stdout)?;
     match tool {
-        Tool::Klon => backend_of(&stdout),
+        Tool::Klon | Tool::KlonSpare => backend_of(&stdout),
         Tool::Baseline => Ok(BASELINE.to_string()),
     }
 }
@@ -489,6 +553,7 @@ fn verify(cell: &Cell, fixture: &Fixture, tool: Tool) -> Result<Checked> {
     if path.exists() {
         teardown(golden, &path)?;
     }
+    settle(tool, golden)?;
     Ok(Checked {
         tool,
         backend,
@@ -564,7 +629,7 @@ fn first_file(dir: &Path) -> Result<Option<PathBuf>> {
 /// 3. A clean `git status`, after klon forced git to compare content.
 fn check(golden: &Path, tree: &Path, tool: Tool) -> Result<Correctness> {
     let ignored_manifest = match tool {
-        Tool::Klon => {
+        Tool::Klon | Tool::KlonSpare => {
             let want = golden.join(fixture::IGNORED_DIR);
             let got = tree.join(fixture::IGNORED_DIR);
             match compare(&want, &got)? {

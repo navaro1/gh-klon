@@ -105,8 +105,7 @@ pub struct Config {
     /// `refuse` or `hibernate`. Read by the budget chunk.
     #[allow(dead_code)]
     pub disk_budget_action: Option<BudgetAction>,
-    /// Hot-spare pool depth. Read by the spare chunk.
-    #[allow(dead_code)]
+    /// Hot-spare pool depth (C9). `0` disables the spare; v0 knows one depth.
     pub spare: Option<u32>,
     /// Steps `gh klon up` runs in golden. Needs approval.
     pub warm: Option<Section>,

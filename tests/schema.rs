@@ -36,6 +36,8 @@ const ADD: Fields = &[
     ("branch", Ty::Str),
     ("head", Ty::Str),
     ("backend", Ty::Str),
+    // C9: true when the hot spare served the add.
+    ("spare", Ty::Bool),
     ("duration_ms", Ty::Num),
 ];
 
@@ -358,7 +360,11 @@ fn the_bench_report_matches_its_documented_schema() {
     check_ok(&bench["environment"], BENCH_ENVIRONMENT);
     check_rows(&bench, "records", BENCH_RECORD);
     let records = bench["records"].as_array().expect("an array");
-    assert_eq!(records.len(), 2, "the klon record and the baseline record");
+    assert_eq!(
+        records.len(),
+        3,
+        "the direct klon record, the spare klon record, and the baseline record"
+    );
     for record in records {
         check_ok(&record["profile_shape"], BENCH_PROFILE_SHAPE);
         check_ok(&record["correctness"], BENCH_CORRECTNESS);
@@ -375,6 +381,7 @@ fn an_object_without_path_fails_the_add_schema() {
         "branch": "feature",
         "head": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
         "backend": "copy",
+        "spare": false,
         "duration_ms": 12,
     });
     let why = check(&doc, ADD).expect_err("a missing path must fail");
@@ -389,6 +396,7 @@ fn a_retyped_field_fails() {
         "branch": "feature",
         "head": "0f0f",
         "backend": "copy",
+        "spare": false,
         "duration_ms": "12",
     });
     let why = check(&doc, ADD).expect_err("a string duration must fail");
@@ -403,8 +411,9 @@ fn an_added_field_passes() {
         "branch": "feature",
         "head": "0f0f",
         "backend": "copy",
+        "spare": false,
         "duration_ms": 12,
-        "spare_used": true,
+        "extra": true,
     });
     check_ok(&doc, ADD);
 }

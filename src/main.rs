@@ -15,6 +15,7 @@ mod probe;
 mod process;
 mod radar;
 mod repair;
+mod spare;
 mod time;
 
 use clap::{Parser, Subcommand};
@@ -71,6 +72,11 @@ impl fmt::Display for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// True when `KLON_DEBUG=1` asks for the timing lines on stderr.
+pub fn debug() -> bool {
+    std::env::var("KLON_DEBUG").as_deref() == Ok("1")
+}
+
 #[derive(Parser)]
 #[command(name = "gh-klon", version, about, long_about = None)]
 struct Cli {
@@ -113,6 +119,10 @@ enum Command {
     Stop(cli::stop::Args),
     /// Measure klon against a plain worktree on a generated fixture.
     Bench(cli::bench::Args),
+    /// Build the hot spare of a repository. `add`, `up`, and `rm` start this
+    /// detached; a user never needs it.
+    #[command(hide = true)]
+    SpareBuild(cli::spare_build::Args),
 }
 
 fn main() -> ExitCode {
@@ -125,12 +135,17 @@ fn main() -> ExitCode {
     if json
         && matches!(
             command,
-            Command::Up | Command::Prune | Command::Pr(_) | Command::Run(_) | Command::Shell(_)
+            Command::Up
+                | Command::Prune
+                | Command::Pr(_)
+                | Command::Run(_)
+                | Command::Shell(_)
+                | Command::SpareBuild(_)
         )
     {
         eprintln!(
             "{}",
-            Error::klon("--json is not available for up, prune, pr, run, and shell")
+            Error::klon("--json is not available for up, prune, pr, run, shell, and spare-build")
         );
         return ExitCode::from(1);
     }
@@ -148,6 +163,7 @@ fn main() -> ExitCode {
         Command::Shell(args) => cli::shell::run(args),
         Command::Stop(args) => cli::stop::run(args, json),
         Command::Bench(args) => cli::bench::run(args, json),
+        Command::SpareBuild(args) => cli::spare_build::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
