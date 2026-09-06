@@ -98,10 +98,7 @@ fn btrfs_dir(test: &str, big: bool) -> Option<Arc<BtrfsDir>> {
     if let Some(alive) = slot.as_ref().and_then(Weak::upgrade) {
         return Some(alive);
     }
-    let made = match build_btrfs_dir(test, big) {
-        Some(dir) => Arc::new(dir),
-        None => return None,
-    };
+    let made = Arc::new(build_btrfs_dir(test, big)?);
     *slot = Some(Arc::downgrade(&made));
     Some(made)
 }

@@ -112,7 +112,7 @@ pub fn copy_tree(
     for dir in plan.dirs.iter().rev() {
         let meta = match fs::symlink_metadata(&dir.from) {
             Ok(meta) => meta,
-            Err(err) if vanished(&dir.from) => continue,
+            Err(_) if vanished(&dir.from) => continue,
             Err(err) => return Err(Error::io(format!("stat {}", dir.from.display()))(err)),
         };
         set_times(&dir.to, &meta)?;
@@ -153,7 +153,7 @@ fn collect(
 ) -> Result<()> {
     let entries = match fs::read_dir(src) {
         Ok(entries) => entries,
-        Err(err) if vanished(src) => return Ok(()),
+        Err(_) if vanished(src) => return Ok(()),
         Err(err) => return Err(Error::io(format!("read {}", src.display()))(err)),
     };
     for entry in entries {
@@ -161,7 +161,7 @@ fn collect(
         let from = entry.path();
         let meta = match fs::symlink_metadata(&from) {
             Ok(meta) => meta,
-            Err(err) if vanished(&from) => continue,
+            Err(_) if vanished(&from) => continue,
             Err(err) => return Err(Error::io(format!("stat {}", from.display()))(err)),
         };
         let kind = meta.file_type();
@@ -172,7 +172,7 @@ fn collect(
         if kind.is_symlink() {
             let target = match fs::read_link(&from) {
                 Ok(target) => target,
-                Err(err) if vanished(&from) => continue,
+                Err(_) if vanished(&from) => continue,
                 Err(err) => return Err(Error::io(format!("readlink {}", from.display()))(err)),
             };
             std::os::unix::fs::symlink(&target, &to)
@@ -239,7 +239,7 @@ fn clone_one(pair: &Pair) -> Result<()> {
     }
     let meta = match fs::symlink_metadata(&pair.from) {
         Ok(meta) => meta,
-        Err(err) if vanished(&pair.from) => return Ok(()),
+        Err(_) if vanished(&pair.from) => return Ok(()),
         Err(err) => return Err(Error::io(format!("stat {}", pair.from.display()))(err)),
     };
     // `reflink` gives the clone the source mode. Set it again, so a platform
