@@ -4,6 +4,7 @@ pub mod add;
 pub mod bench;
 pub mod check;
 pub mod claim;
+pub mod dns_forward;
 pub mod doctor;
 pub mod fence_exec;
 pub mod hibernate;

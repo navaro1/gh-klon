@@ -24,6 +24,7 @@
 
 use crate::envelope::{env, Envelope, Part};
 use crate::{probe, Error, Result};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 /// The ports pasta maps when neither `--netns-ports` nor `.klon.toml` names
@@ -66,6 +67,48 @@ struct FencedExec {
     /// The join itself happens outside pasta, so the rule only keeps the
     /// moved fence identical to the fence a run without `--netns` builds.
     cgroup: Option<PathBuf>,
+    /// The DNS rescue plan: the stub address to bind inside the namespace,
+    /// and the routable upstreams to relay to (see `rescue_from`).
+    dns: Option<(IpAddr, Vec<IpAddr>)>,
+}
+
+/// Every `nameserver` address of a `resolv.conf` text, in file order.
+fn parse_nameservers(text: &str) -> Vec<IpAddr> {
+    text.lines()
+        .map(str::split_whitespace)
+        .filter_map(|mut words| match (words.next(), words.next()) {
+            (Some("nameserver"), Some(addr)) => addr.parse().ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The DNS rescue plan: when every nameserver of the host resolver is a
+/// loopback address, the namespace cannot reach it (a loopback packet stays
+/// on the namespace's own `lo`), so resolution would fail inside. When the
+/// alternate resolver file holds routable nameservers, klon binds the first
+/// stub address inside the namespace and relays to those.
+fn rescue_from(host: &str, alt: &str) -> Option<(IpAddr, Vec<IpAddr>)> {
+    let stubs = parse_nameservers(host);
+    if stubs.is_empty() || !stubs.iter().all(IpAddr::is_loopback) {
+        return None;
+    }
+    let routable: Vec<IpAddr> = parse_nameservers(alt)
+        .into_iter()
+        .filter(|ip| !ip.is_loopback())
+        .collect();
+    if routable.is_empty() {
+        return None;
+    }
+    Some((stubs[0], routable))
+}
+
+/// The DNS rescue plan for this host, from `/etc/resolv.conf` and the
+/// systemd-resolved file beside it. `None` needs no rescue.
+fn dns_rescue() -> Option<(IpAddr, Vec<IpAddr>)> {
+    let host = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let alt = std::fs::read_to_string("/run/systemd/resolve/resolv.conf").ok()?;
+    rescue_from(&host, &alt)
 }
 
 /// The envelope part: pasta with the host's network configuration, the port
@@ -86,6 +129,19 @@ fn part(ip: &str, ports: &[u16], fenced: Option<FencedExec>) -> Part {
         if let Some(dir) = fenced.cgroup {
             wrapper.push("--cgroup".to_string());
             wrapper.push(dir.to_string_lossy().into_owned());
+        }
+        if let Some((stub, upstreams)) = fenced.dns {
+            wrapper.push("--dns-rescue".to_string());
+            wrapper.push(stub.to_string());
+            wrapper.push("--dns-upstream".to_string());
+            // One argv word with a comma list: the same compactness keeps the
+            // wrapper short, and clap splits it on the commas.
+            let list = upstreams
+                .iter()
+                .map(IpAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            wrapper.push(list);
         }
         wrapper.push("--".to_string());
     }
@@ -118,10 +174,24 @@ pub fn enable(envelope: &mut Envelope, ports: &[u16], cgroup: Option<&Path>) -> 
     }
     let fenced = envelope.fence.take().is_some();
     let exec = if fenced {
+        let dns = dns_rescue();
+        if let Some((stub, upstreams)) = &dns {
+            if std::env::var_os("KLON_DEBUG").is_some_and(|v| !v.is_empty() && v != "0") {
+                let list = upstreams
+                    .iter()
+                    .map(IpAddr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "klon: netns: the host resolver is a loopback stub, relaying {stub} to {list}"
+                );
+            }
+        }
         Some(FencedExec {
             exe: std::env::current_exe().map_err(Error::io("find the klon binary"))?,
             klon: envelope.klon.clone(),
             cgroup: cgroup.map(Path::to_path_buf),
+            dns,
         })
     } else {
         None
@@ -180,6 +250,7 @@ mod tests {
             exe: PathBuf::from("/opt/gh-klon"),
             klon: PathBuf::from("/repo/.klon-work/feature"),
             cgroup: Some(PathBuf::from("/sys/fs/cgroup/klon-1")),
+            dns: None,
         };
         let part = part("127.0.0.2", &[3000], Some(fenced));
         assert_eq!(
@@ -198,5 +269,69 @@ mod tests {
                 "--".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_parser_reads_the_nameservers_of_a_resolv_conf() {
+        assert_eq!(
+            parse_nameservers(
+                "options edns0 trust-ad\nnameserver 127.0.0.53\n# a comment\nnameserver ::1\nsearch lan\n"
+            ),
+            vec![
+                "127.0.0.53".parse::<IpAddr>().unwrap(),
+                "::1".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_nameservers("search lan\n").is_empty());
+    }
+
+    #[test]
+    fn the_rescue_needs_a_stub_host_and_a_routable_alternate() {
+        let stub_host = "nameserver 127.0.0.53\n";
+        let direct_host = "nameserver 10.206.0.2\n";
+        let alt = "nameserver 10.206.0.2\nnameserver 127.0.0.53\n";
+        // A loopback-only host resolver with routable upstreams: the rescue.
+        assert_eq!(
+            rescue_from(stub_host, alt),
+            Some((
+                "127.0.0.53".parse().unwrap(),
+                vec!["10.206.0.2".parse().unwrap()]
+            ))
+        );
+        // A direct host resolver needs no rescue.
+        assert_eq!(rescue_from(direct_host, alt), None);
+        // Loopback-only upstreams cannot serve a namespace.
+        assert_eq!(rescue_from(stub_host, "nameserver 127.0.0.53\n"), None);
+        // No nameserver at all: nothing to bind.
+        assert_eq!(rescue_from("search lan\n", alt), None);
+    }
+
+    #[test]
+    fn the_wrapper_carries_the_dns_rescue_plan() {
+        let fenced = FencedExec {
+            exe: PathBuf::from("/opt/gh-klon"),
+            klon: PathBuf::from("/repo/.klon-work/feature"),
+            cgroup: None,
+            dns: Some((
+                "127.0.0.53".parse().unwrap(),
+                vec!["10.206.0.2".parse().unwrap(), "10.206.0.3".parse().unwrap()],
+            )),
+        };
+        let part = part("127.0.0.2", &[3000], Some(fenced));
+        let words = part.wrapper;
+        let start = words
+            .iter()
+            .position(|word| word == "--dns-rescue")
+            .unwrap();
+        assert_eq!(
+            &words[start..start + 4],
+            &[
+                "--dns-rescue".to_string(),
+                "127.0.0.53".to_string(),
+                "--dns-upstream".to_string(),
+                "10.206.0.2,10.206.0.3".to_string(),
+            ]
+        );
+        assert!(words.iter().all(|word| !word.contains(' ')));
     }
 }

@@ -143,6 +143,10 @@ enum Command {
     /// starts this inside the pasta namespace (C23); a person never types it.
     #[command(name = "__fence-exec", hide = true)]
     FenceExec(cli::fence_exec::Args),
+    /// Relay namespace DNS queries to a routable resolver. `__fence-exec`
+    /// starts this inside the pasta namespace (C23); a person never types it.
+    #[command(name = "__dns-forward", hide = true)]
+    DnsForward(cli::dns_forward::Args),
     /// Build the hot spare of a repository. `add`, `up`, and `rm` start this
     /// detached; a user never needs it.
     #[command(hide = true)]
@@ -170,12 +174,13 @@ fn main() -> ExitCode {
                 | Command::SpareBuild(_)
                 | Command::Warm(_)
                 | Command::FenceExec(_)
+                | Command::DnsForward(_)
         )
     {
         eprintln!(
             "{}",
             Error::klon(
-                "--json is not available for prune, pr, run, shell, spare-build, warm, and __fence-exec",
+                "--json is not available for prune, pr, run, shell, spare-build, warm, __fence-exec, and __dns-forward",
             )
         );
         return ExitCode::from(1);
@@ -200,6 +205,7 @@ fn main() -> ExitCode {
         Command::Stop(args) => cli::stop::run(args, json),
         Command::Bench(args) => cli::bench::run(args, json),
         Command::FenceExec(args) => cli::fence_exec::run(args),
+        Command::DnsForward(args) => cli::dns_forward::run(args),
         Command::SpareBuild(args) => cli::spare_build::run(args),
         Command::Warm(args) => cli::warm::run(args),
     };
