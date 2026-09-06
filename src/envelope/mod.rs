@@ -1,5 +1,5 @@
-//! The envelope (handoff §5): everything `run`, `shell`, and `add -- cmd` put
-//! around a command inside a klon.
+//! The envelope (handoff §5): everything `run`, `shell`, `add -- cmd`, and
+//! from C22 `up` puts around a command inside a tree.
 //!
 //! C16 builds the two parts that every host has: the environment contract in
 //! `<klon>/.klon/env` and a new session for the whole command tree. The four
@@ -31,7 +31,8 @@ pub struct Fence;
 use crate::{Error, Result};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 /// One optional part of the envelope. A part exports variables, wraps the
 /// command in another program, or both.
@@ -42,6 +43,20 @@ pub struct Part {
     /// Words placed in front of the command, for example
     /// `systemd-run --user --scope --`.
     pub wrapper: Vec<String>,
+}
+
+/// What a caller asks of the envelope beyond the parts every command gets.
+/// C22 moved it here from `run`, because `up` and the later `merge` gate run
+/// commands through the same spawn.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Skip the write fence. `KLON_NO_FENCE=1` in the environment does the
+    /// same, for a harness that already runs klon inside a sandbox.
+    pub no_fence: bool,
+    /// Where the command's stdout goes. `None` inherits, which is what `run`
+    /// and `shell` want. `up` points a warm step at stderr under `--json`,
+    /// because klon owns stdout for its document there.
+    pub stdout: Option<Stdio>,
 }
 
 /// The envelope of one klon.
@@ -86,6 +101,24 @@ impl Envelope {
         })
     }
 
+    /// The envelope of the main worktree, which has no env file. C22 needs it:
+    /// `up` runs the approved `[warm] steps` in golden under the jobserver and
+    /// the scope, and golden is the write target, so the caller turns the
+    /// fence off through `Options`. The name stays empty, so the command
+    /// carries no `KLON_` tag and `stop` never sees it. The variables hold
+    /// only what `command` adds, which is `gc.auto=0`.
+    pub fn for_golden(golden: &Path) -> Envelope {
+        Envelope {
+            klon: golden.to_path_buf(),
+            name: String::new(),
+            vars: Vec::new(),
+            jobserver: None,
+            fence: None,
+            scope: None,
+            netns: None,
+        }
+    }
+
     /// The value of one variable of the env file. C17 reads `KLON_JOBSERVER`
     /// and C18 reads `TMPDIR` through it.
     pub fn var(&self, key: &str) -> Option<&str> {
@@ -103,8 +136,13 @@ impl Envelope {
     /// repositories can hold one branch name, and each also hands out
     /// `127.0.0.2`, so the branch and the address together still match the
     /// wrong tree. Only the directory makes `stop` exact. No build tool
-    /// rewrites a `KLON_` variable, so neither tag is ever lost.
+    /// rewrites a `KLON_` variable, so neither tag is ever lost. A golden
+    /// envelope (see `for_golden`) holds no name and gets no tag: a warm step
+    /// of `up` is nobody's klon.
     pub fn tags(&self) -> Vec<(String, String)> {
+        if self.name.is_empty() {
+            return Vec::new();
+        }
         vec![
             ("KLON_ID".to_string(), self.name.clone()),
             (
@@ -181,5 +219,143 @@ impl Envelope {
             .split_first()
             .ok_or_else(|| Error::klon("name a command after --"))?;
         Ok((program.clone(), rest.to_vec()))
+    }
+
+    /// Compose the whole envelope around `argv`, spawn the command, and wait
+    /// for it to end. The answer is the command's exit status; the caller
+    /// decides what a failure means. C22 moved the composition here from
+    /// `run`, because `up` needs the same spawn for its warm steps, and C25
+    /// (`merge`) will need it for its gate.
+    ///
+    /// `root` is a klon when it holds `<root>/.klon/env` and golden
+    /// otherwise, so `up` hands it golden and gets no fence, no klon tags,
+    /// and no envelope variables on top of the jobserver and the scope.
+    pub fn spawn_and_wait(root: &Path, argv: &[String], options: Options) -> Result<ExitStatus> {
+        let mut envelope = match env::file(root).exists() {
+            true => Envelope::load(root)?,
+            false => Envelope::for_golden(root),
+        };
+        // C20: the resource scope is the outermost wrapper, so it holds the
+        // whole command tree. The guard removes a cgroup that klon made once
+        // the command has left it.
+        let guard = scope::apply(&mut envelope);
+        // C17: the shared build-slot store. `attach` repairs a store that a
+        // killed client left short, then hands the command the two
+        // descriptors of the pipe-style handshake. klon opens the fifo here,
+        // in the parent, so the command inherits the descriptors and never
+        // opens the fifo under the fence below. It never fails: a host that
+        // cannot hold a store gets the handshake variables as empty strings
+        // instead.
+        envelope.jobserver = jobserver::attach(&envelope);
+        // C18: the fence is the innermost step; the child applies it right
+        // before the exec, so the scope wrapper runs inside it too. A cgroup
+        // the scope made is joined from inside the child, so the fence opens
+        // its `cgroup.procs`.
+        envelope.fence = fence(root, &envelope, options.no_fence, guard.cgroup())?;
+        // The child leads a new session, so the terminal never signals it:
+        // Ctrl-C and a `kill` of the wrapper reach only this process. klon
+        // relays each of them to the child's process group, so the whole tree
+        // ends with the wrapper instead of outliving it.
+        relay_signals();
+        let mut command = envelope.command(argv)?;
+        if let Some(stdout) = options.stdout {
+            command.stdout(stdout);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|err| spawn_error(err, argv, envelope.fence.is_some()))?;
+        CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
+        let status = child
+            .wait()
+            .map_err(Error::io(format!("wait for {}", argv.join(" "))))?;
+        CHILD.store(0, Ordering::SeqCst);
+        Ok(status)
+    }
+}
+
+/// The fence of this run, or None when the caller or the environment turns
+/// it off. A host without Landlock gives None too, with one line on stderr.
+/// macOS has no fence until C19.
+fn fence(
+    root: &Path,
+    envelope: &Envelope,
+    no_fence: bool,
+    cgroup: Option<&Path>,
+) -> Result<Option<Fence>> {
+    let skipped =
+        std::env::var_os("KLON_NO_FENCE").is_some_and(|value| !value.is_empty() && value != "0");
+    if no_fence || skipped {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::envelope::fence_linux::build(root, envelope.var("TMPDIR"), cgroup)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, envelope, cgroup);
+        Ok(None)
+    }
+}
+
+/// The error of a failed spawn. Only an errno crosses the fork boundary, so
+/// a failed fence step arrives as a bare code; the caller names the fence
+/// when the code is one that `execve` never gives, and says how to run
+/// without it.
+fn spawn_error(err: std::io::Error, argv: &[String], fenced: bool) -> Error {
+    let context = format!("run {}", argv.join(" "));
+    #[cfg(target_os = "linux")]
+    if fenced && crate::envelope::fence_linux::is_fence_errno(&err) {
+        return Error::klon(format!(
+            "{context}: the write fence did not apply ({err}); \
+             pass --no-fence or set KLON_NO_FENCE=1 to run without it"
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = fenced;
+    Error::io(context)(err)
+}
+
+/// The process group of the running child, or 0 when none runs. The child
+/// calls `setsid`, so its process group id equals its process id.
+static CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// The signals a person or a supervisor sends to end a command.
+const RELAYED: &[libc::c_int] = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+/// Send `signal` on to the child's process group.
+extern "C" fn relay(signal: libc::c_int) {
+    let group = CHILD.load(Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: `killpg` is async-signal-safe, so it is legal in a handler.
+        // A group that already left gives ESRCH, which the handler ignores.
+        unsafe { libc::killpg(group, signal) };
+    }
+}
+
+/// Install the relay for every signal in `RELAYED`. A signal that arrives
+/// before the spawn finds no child and does nothing; the window is the few
+/// microseconds between the fork and the store above.
+fn relay_signals() {
+    for signal in RELAYED {
+        // The cast goes through a pointer: a direct cast of a function item to
+        // an integer is a clippy error. SAFETY: `relay` is a plain function
+        // with the C signature the call expects, and it touches only an atomic
+        // and `killpg`.
+        let handler = relay as *const () as libc::sighandler_t;
+        unsafe { libc::signal(*signal, handler) };
+    }
+}
+
+/// The exit code of a finished command. A command that a signal ended reports
+/// `128 + signal`, the same as every shell.
+pub fn exit_code(status: &ExitStatus) -> u8 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        return u8::try_from(code).unwrap_or(1);
+    }
+    match status.signal() {
+        Some(signal) => u8::try_from(128 + signal).unwrap_or(1),
+        None => 1,
     }
 }
