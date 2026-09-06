@@ -322,8 +322,12 @@ pub fn run(klon: &Path, golden: &Path) -> Result<()> {
         }
     }
     if alive(klon) && state.pending.is_empty() {
-        rewarm_untracked_cache(klon);
+        // The marker goes first, so the last write this process makes to the
+        // klon happens before the cache warm and cannot invalidate it. The
+        // marker lives in `.klon/`, which `info/exclude` hides, so git holds no
+        // cache node for it today; the order keeps that from being load-bearing.
         let _ = fs::remove_file(marker_path(klon));
+        rewarm_untracked_cache(klon);
     }
     Ok(())
 }

@@ -20,7 +20,9 @@ pub fn git(cwd: &Path, args: &[&str]) -> Output {
     git_env(cwd, args, &[])
 }
 
-fn git_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+/// Run `git -C <cwd> <args>` with extra environment variables on top of the
+/// isolated identity. `GIT_TRACE2_PERF` needs it.
+pub fn git_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut command = Command::new("git");
     command
         .arg("-C")
