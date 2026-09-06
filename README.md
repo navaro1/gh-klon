@@ -59,8 +59,10 @@ filesystem                  ext4
 backend                     copy: reflink unsupported
 btrfs-progs                 absent: btrfs is not on PATH
 cgroup.controllers          present: memory pids
+fence.residual              present: refs/heads/main stays writable under the fence: git needs <common>/refs; hooks and config stay read-only
 inotify.max_user_instances  present: 128
 inotify.max_user_watches    present: 65536
+landlock                    present: ABI 3
 loopback                    present: 127.0.0.2 accepts a bind
 make                        present: GNU Make 4.3
 ninja                       absent: ninja is not on PATH
