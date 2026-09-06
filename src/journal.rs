@@ -39,7 +39,9 @@ pub enum State {
     Registered,
     /// The backend filled the working directory and rewrote the `.git` file.
     Cloned,
-    /// `git checkout --force` and `git clean -fdq` ran.
+    /// `git checkout --force` and `git clean -fdq` ran, and `add` wrote the
+    /// envelope in `<klon>/.klon` (C16). Only the unlock is left, so the repair
+    /// finishes the transaction instead of rolling it back.
     CheckedOut,
     /// `git worktree unlock` ran. The klon is complete.
     Ready,

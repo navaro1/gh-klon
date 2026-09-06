@@ -11,33 +11,6 @@ pub fn dirty(dir: &Path) -> Result<bool> {
     Ok(!git::run(dir, &["status", "--porcelain"])?.trim().is_empty())
 }
 
-/// A process id whose current directory is `dir` or inside it, or None.
-/// Our own process is skipped, so `rm` works from inside its own klon.
-pub fn live_process(dir: &Path) -> Option<u32> {
-    live_process_os(dir)
-}
-
-/// Linux: read the `/proc/<pid>/cwd` symlink of every process. Unreadable
-/// entries belong to other users or to processes that just left; skip them.
-#[cfg(target_os = "linux")]
-fn live_process_os(dir: &Path) -> Option<u32> {
-    let me = std::process::id();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
-            Some(pid) => pid,
-            None => continue, // /proc also holds non-numeric entries.
-        };
-        if pid == me {
-            continue;
-        }
-        match std::fs::read_link(entry.path().join("cwd")) {
-            Ok(cwd) if cwd.starts_with(dir) => return Some(pid),
-            _ => continue,
-        }
-    }
-    None
-}
-
 /// macOS: `lsof -Fpn -d cwd` prints a `p<pid>` record and an `n<path>` record
 /// per process. Not testable on the Linux development host; any failure
 /// degrades to "no live process found" with one line on stderr.
@@ -122,62 +95,167 @@ fn tool_on_path(name: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
-/// Every process that carries all of `tags` in its environment, sorted by pid.
-/// `stop` uses it to find the tree of one klon (R22). Our own process is
-/// skipped, so `stop` works from inside the klon it stops.
+/// Every process of one klon, sorted by pid. `stop` ends this list (R22).
+/// Our own process is skipped, so `stop` works from inside the klon it stops.
 ///
-/// A tag is one `KEY=value` pair and the match is exact on a whole entry of the
+/// A process belongs to the klon when it carries all of `tags` in its
+/// environment, or when it shares a session with a process that does. A tag is
+/// one `KEY=value` pair and the match is exact on a whole entry of the
 /// environment, so the klon `x` never matches the klon `xy`.
-pub fn tagged_processes(tags: &[(String, String)]) -> Vec<u32> {
+///
+/// The session part catches a descendant that lost the tags. `env -i cc` keeps
+/// no variable of its parent, and `run` gives the whole command tree one
+/// session, so the session still names it. A command that clears its own
+/// environment in its very first `exec` leaves no tagged process at all and
+/// stays invisible; the C20 cgroup closes that last gap.
+pub fn klon_processes(tags: &[(String, String)]) -> Vec<u32> {
     if tags.is_empty() {
         return Vec::new();
     }
-    tagged_processes_os(tags)
+    klon_processes_os(tags)
+}
+
+/// A process id whose current directory is `dir` or inside it, or None.
+/// Our own process is skipped, so `rm` works from inside its own klon.
+///
+/// The check is the current directory only. Reading `/proc/<pid>/environ` for
+/// every process would also find a `run` command that changed directory, and
+/// it measured 165 ms on this host, well past the 100 ms that R8 gives `rm`.
+/// C20 puts the tree in a cgroup and answers the same question with one read.
+pub fn live_process(dir: &Path) -> Option<u32> {
+    live_process_os(dir)
 }
 
 /// Linux: read `/proc/<pid>/environ`, which holds the environment the process
 /// started with, NUL between entries. An unreadable file belongs to another
-/// user or to a process that just left; skip it.
+/// user or to a process that just left; skip it. The session comes from
+/// `getsid`, one syscall per process.
 #[cfg(target_os = "linux")]
-fn tagged_processes_os(tags: &[(String, String)]) -> Vec<u32> {
+fn klon_processes_os(tags: &[(String, String)]) -> Vec<u32> {
+    use std::collections::BTreeSet;
+
     let me = std::process::id();
-    let needles: Vec<Vec<u8>> = tags
-        .iter()
-        .map(|(key, value)| format!("{key}={value}").into_bytes())
-        .collect();
-    let mut pids = Vec::new();
+    let needles = needles(tags);
     let Ok(entries) = std::fs::read_dir("/proc") else {
         eprintln!("klon: cannot read /proc; the process scan found nothing");
-        return pids;
+        return Vec::new();
     };
+    // Pass one: the processes that carry the tags, and the sessions they sit in.
+    let mut pids: Vec<u32> = Vec::new();
+    let mut sessions: BTreeSet<i32> = BTreeSet::new();
     for entry in entries.flatten() {
-        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
-            Some(pid) => pid,
-            None => continue, // /proc also holds non-numeric entries.
-        };
+        let Some(pid) = pid_of(&entry) else { continue };
         if pid == me {
             continue;
         }
-        let Ok(bytes) = std::fs::read(entry.path().join("environ")) else {
+        if !has_tags(&entry.path(), &needles) {
             continue;
-        };
-        let items: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
-        if needles
-            .iter()
-            .all(|needle| items.contains(&needle.as_slice()))
-        {
+        }
+        pids.push(pid);
+        if let Some(session) = session_of(pid) {
+            sessions.insert(session);
+        }
+    }
+    // klon's own session belongs to the caller's terminal. A tagged process
+    // there means `stop` runs inside the very tree it stops, and the sweep
+    // would take the terminal with it. The tagged processes still go.
+    // SAFETY: `getsid(0)` names the calling process and reads one integer.
+    let mine = unsafe { libc::getsid(0) };
+    sessions.remove(&mine);
+    if sessions.is_empty() {
+        pids.sort_unstable();
+        return pids;
+    }
+    // Pass two: every other member of those sessions, tagged or not. It runs
+    // only when pass one found something, so an idle klon pays one pass.
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        pids.sort_unstable();
+        return pids;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = pid_of(&entry) else { continue };
+        if pid == me {
+            continue;
+        }
+        if session_of(pid).is_some_and(|s| sessions.contains(&s)) {
             pids.push(pid);
         }
     }
     pids.sort_unstable();
+    pids.dedup();
     pids
+}
+
+/// Linux: read the `/proc/<pid>/cwd` symlink of every process. Unreadable
+/// entries belong to other users or to processes that just left; skip them.
+#[cfg(target_os = "linux")]
+fn live_process_os(dir: &Path) -> Option<u32> {
+    let me = std::process::id();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = pid_of(&entry) else { continue };
+        if pid == me {
+            continue;
+        }
+        if std::fs::read_link(entry.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(dir)) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// The `KEY=value` byte strings that a member of the klon must carry.
+#[cfg(target_os = "linux")]
+fn needles(tags: &[(String, String)]) -> Vec<Vec<u8>> {
+    tags.iter()
+        .map(|(key, value)| format!("{key}={value}").into_bytes())
+        .collect()
+}
+
+/// The process id of a `/proc` entry, or None for a non-numeric name.
+#[cfg(target_os = "linux")]
+fn pid_of(entry: &std::fs::DirEntry) -> Option<u32> {
+    entry
+        .file_name()
+        .to_str()
+        .and_then(|name| name.parse().ok())
+}
+
+/// True when the process at `proc_dir` carries every needle.
+#[cfg(target_os = "linux")]
+fn has_tags(proc_dir: &Path, needles: &[Vec<u8>]) -> bool {
+    if needles.is_empty() {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(proc_dir.join("environ")) else {
+        return false;
+    };
+    let items: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+    needles
+        .iter()
+        .all(|needle| items.contains(&needle.as_slice()))
+}
+
+/// The session id of `pid`, or None when the process already left. `getsid` is
+/// one syscall. Reading `/proc/<pid>/stat` gives the same number and costs a
+/// file open, a read, and a parse for every process; a whole pass over 700
+/// processes measured 81 ms that way and about 1 ms this way, and `stop` makes
+/// one pass every 100 ms while it waits.
+///
+/// Linux never refuses `getsid` for a process of another session, so the
+/// answer is missing only for a pid that is gone.
+#[cfg(target_os = "linux")]
+fn session_of(pid: u32) -> Option<i32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: `getsid` reads one integer and touches no memory of ours.
+    let session = unsafe { libc::getsid(pid) };
+    (session >= 0).then_some(session)
 }
 
 /// Every other system: the scan needs `/proc`. macOS reads the process group
 /// with `proc_listpgrppids` instead; that lands with the macOS envelope in C21.
 /// Until then `stop` reports one line and ends nothing.
 #[cfg(not(target_os = "linux"))]
-fn tagged_processes_os(_tags: &[(String, String)]) -> Vec<u32> {
+fn klon_processes_os(_tags: &[(String, String)]) -> Vec<u32> {
     eprintln!(
         "klon: the process scan needs /proc; stop cannot find the klon's processes on this system"
     );

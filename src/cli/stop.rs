@@ -54,7 +54,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let envelope = Envelope::load(&klon)?;
     let tags = envelope.tags();
 
-    let found = process::tagged_processes(&tags);
+    let found = process::klon_processes(&tags);
     for pid in &found {
         process::signal(*pid, libc::SIGTERM);
     }
@@ -122,7 +122,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
 fn wait_for_exit(tags: &[(String, String)], limit: Duration) -> Vec<u32> {
     let start = Instant::now();
     loop {
-        let left = process::tagged_processes(tags);
+        let left = process::klon_processes(tags);
         if left.is_empty() || start.elapsed() >= limit {
             return left;
         }

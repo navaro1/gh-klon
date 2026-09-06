@@ -120,10 +120,14 @@ pub fn release(common: &Path, path: &Path) -> Result<Option<u8>> {
     Ok(freed)
 }
 
-/// The number of addresses in use. `doctor` prints it. The read takes no lock,
-/// because every write lands with one `rename`.
+/// The number of addresses a live klon holds. `doctor` prints it. The read
+/// takes no lock, because every write lands with one `rename`. A slot whose
+/// directory is gone does not count: the next `allocate` drops it, so counting
+/// it would report an address that no klon uses.
 pub fn in_use(common: &Path) -> Result<usize> {
-    Ok(load(common)?.slots.len())
+    let mut table = load(common)?;
+    prune(&mut table);
+    Ok(table.slots.len())
 }
 
 /// Drop every slot whose klon directory is gone. A crash between the
@@ -272,6 +276,26 @@ mod tests {
         assert_eq!(allocate(&common, "a", &a).unwrap(), "127.0.0.2");
         fs::remove_dir_all(&a).unwrap();
         assert_eq!(allocate(&common, "b", &b).unwrap(), "127.0.0.2");
+    }
+
+    #[test]
+    fn the_count_skips_a_slot_whose_directory_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let common = tmp.path().join("common");
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        allocate(&common, "a", &a).unwrap();
+        allocate(&common, "b", &b).unwrap();
+        assert_eq!(in_use(&common).unwrap(), 2);
+        // A crash after the rename and before the release leaves this entry.
+        fs::remove_dir_all(&a).unwrap();
+        assert_eq!(
+            in_use(&common).unwrap(),
+            1,
+            "doctor must not report an address that no klon uses"
+        );
     }
 
     #[test]

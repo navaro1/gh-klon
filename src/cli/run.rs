@@ -9,6 +9,7 @@ use crate::envelope::Envelope;
 use crate::{git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -65,13 +66,51 @@ pub fn resolve(branch: Option<&str>, path: Option<&Path>) -> Result<PathBuf> {
 /// already reported its own failure on its own stderr.
 pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
     let envelope = Envelope::load(klon)?;
-    let status = envelope
+    // The child leads a new session, so the terminal never signals it: Ctrl-C
+    // and a `kill` of `gh klon run` reach only this process. klon relays each
+    // of them to the child's process group, so the whole tree ends with the
+    // wrapper instead of outliving it.
+    relay_signals();
+    let mut child = envelope
         .command(argv)?
-        .status()
+        .spawn()
         .map_err(Error::io(format!("run {}", argv.join(" "))))?;
+    CHILD.store(i32::try_from(child.id()).unwrap_or(0), Ordering::SeqCst);
+    let status = child
+        .wait()
+        .map_err(Error::io(format!("wait for {}", argv.join(" "))))?;
+    CHILD.store(0, Ordering::SeqCst);
     match exit_code(&status) {
         0 => Ok(()),
         code => Err(Error::Exit(code)),
+    }
+}
+
+/// The process group of the running child, or 0 when none runs. The child
+/// calls `setsid`, so its process group id equals its process id.
+static CHILD: AtomicI32 = AtomicI32::new(0);
+
+/// The signals a person or a supervisor sends to end a command.
+const RELAYED: &[libc::c_int] = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+/// Send `signal` on to the child's process group.
+extern "C" fn relay(signal: libc::c_int) {
+    let group = CHILD.load(Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: `killpg` is async-signal-safe, so it is legal in a handler.
+        // A group that already left gives ESRCH, which the handler ignores.
+        unsafe { libc::killpg(group, signal) };
+    }
+}
+
+/// Install the relay for every signal in `RELAYED`. A signal that arrives
+/// before the spawn finds no child and does nothing; the window is the few
+/// microseconds between the fork and the store above.
+fn relay_signals() {
+    for signal in RELAYED {
+        // SAFETY: `relay` is a plain function pointer with the C signature the
+        // call expects, and it touches only an atomic and `killpg`.
+        unsafe { libc::signal(*signal, relay as libc::sighandler_t) };
     }
 }
 

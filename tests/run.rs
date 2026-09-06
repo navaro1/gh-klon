@@ -437,6 +437,89 @@ fn shell_runs_the_shell_inside_the_klon() {
     );
 }
 
+#[test]
+fn add_with_a_command_refuses_json() {
+    let fx = fixture();
+    // The command owns stdout, so a report and the output would share one
+    // stream. The refusal comes before any repository change.
+    let out = klon(&fx.golden, &["--json", "add", "feature", "--", "true"]);
+    assert!(!out.status.success(), "add --json -- cmd must fail");
+    assert!(
+        stderr(&out).contains("--json is not available"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        !fx.klon_path("feature").exists(),
+        "the refusal must change nothing"
+    );
+}
+
+/// A crash between the checkout and the envelope must not leave a klon that
+/// the repair calls complete. `add` reaches `checked-out` only after the env
+/// file exists, so the repair rolls this one back instead of unlocking it.
+#[test]
+fn a_klon_killed_before_the_envelope_is_rolled_back() {
+    let fx = fixture();
+    let klon_path = fx.klon_path("feature");
+    let mut child = Command::new(BIN)
+        .args(["add", "feature"])
+        .current_dir(&fx.golden)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KLON_TEST_PAUSE_AT", "cloned")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn add");
+    let journal = fx.golden.join(".git").join("klon").join("journal");
+    // Wait for the state itself, not for any file: the kill must land after
+    // the clone and before the envelope.
+    let paused = poll(|| journal_holds(&journal, "\"state\": \"cloned\""), 300);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(paused, "add never reached the cloned state");
+
+    let out = klon(&fx.golden, &["doctor", "--repair"]);
+    assert!(out.status.success(), "repair failed: {}", stderr(&out));
+    assert!(
+        !klon_path.join(".klon").join("env").exists(),
+        "a klon with no envelope must not survive the repair"
+    );
+    // A second `add` now works, which proves the rollback was complete.
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(
+        out.status.success(),
+        "add after the repair failed: {}",
+        stderr(&out)
+    );
+    assert!(klon_path.join(".klon").join("env").is_file());
+}
+
+/// Poll `cond` every 100 ms until it holds or `tries` polls pass. The `stop`
+/// tests need `Duration`, which is Linux only here, so this counter serves the
+/// tests that run everywhere.
+fn poll(mut cond: impl FnMut() -> bool, tries: u32) -> bool {
+    for _ in 0..tries {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    cond()
+}
+
+/// True when a journal entry under `dir` holds `needle`.
+fn journal_holds(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|item| fs::read_to_string(item.path()).is_ok_and(|text| text.contains(needle)))
+}
+
 // --- stop --------------------------------------------------------------------
 
 #[test]
@@ -453,6 +536,136 @@ fn stop_reports_when_no_process_runs() {
     assert_eq!(document["schema"], "klon.stop/1");
     assert_eq!(document["found"], 0);
     assert_eq!(document["killed"], 0);
+}
+
+/// A command that clears its own environment loses the tags. It keeps the
+/// session that `run` gave it, and a tagged sibling names that session, so
+/// `stop` still ends it.
+#[cfg(target_os = "linux")]
+#[test]
+fn stop_ends_a_descendant_that_cleared_its_environment() {
+    let fx = fixture();
+    let name = unique("bare");
+    branch(&fx, &name);
+    add(&fx, &name);
+    // The shell keeps the tags. The background `env -i` child drops every one
+    // of them, so only the session still joins it to the klon.
+    let child = Command::new(BIN)
+        .args([
+            "run",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            "env -i sleep 1000 & sleep 1000",
+        ])
+        .current_dir(&fx.golden)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run");
+    let reaper = Reaper(child);
+    assert!(
+        wait_until(
+            || processes_with_klon_id(&name).len() >= 2,
+            Duration::from_secs(10)
+        ),
+        "the run tree never started"
+    );
+    // The bare child carries no tag at all.
+    let bare = processes_in_session_of(&processes_with_klon_id(&name));
+    assert!(
+        bare.len() > processes_with_klon_id(&name).len(),
+        "the env -i child must be in the session and carry no tag"
+    );
+
+    let out = klon(&fx.golden, &["stop", &name]);
+    assert!(out.status.success(), "stop failed: {}", stderr(&out));
+    assert!(
+        processes_in_session_of(&bare).is_empty(),
+        "stop must end the untagged descendant too"
+    );
+    drop(reaper);
+}
+
+/// Every process that shares a session with one of `pids`, `pids` included.
+#[cfg(target_os = "linux")]
+fn processes_in_session_of(pids: &[u32]) -> Vec<u32> {
+    let wanted: Vec<i32> = pids.iter().filter_map(|pid| session_of(*pid)).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if session_of(pid).is_some_and(|s| wanted.contains(&s)) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// The session id of `pid` from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn session_of(pid: u32) -> Option<i32> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = text.get(text.rfind(')')? + 1..)?;
+    tail.split_whitespace().nth(3)?.parse().ok()
+}
+
+/// A caller that ends `gh klon run` must not leave the command behind. The
+/// child leads its own session, so the terminal never signals it; `run` relays
+/// the signal itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_signal_to_run_ends_the_command_too() {
+    let fx = fixture();
+    let name = unique("relay");
+    branch(&fx, &name);
+    add(&fx, &name);
+    let mut child = Command::new(BIN)
+        .args(["run", &name, "--", "sleep", "1000"])
+        .current_dir(&fx.golden)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn run");
+    assert!(
+        wait_until(
+            || !processes_with_klon_id(&name).is_empty(),
+            Duration::from_secs(10)
+        ),
+        "the command never started"
+    );
+
+    // SIGTERM to the wrapper only. Without the relay the sleep would survive.
+    let wrapper = i32::try_from(child.id()).expect("a pid fits in i32");
+    // SAFETY: `kill` takes two integers; the pid names the live wrapper.
+    assert_eq!(unsafe { libc::kill(wrapper, libc::SIGTERM) }, 0);
+    let _ = child.wait();
+    assert!(
+        wait_until(
+            || processes_with_klon_id(&name).is_empty(),
+            Duration::from_secs(5)
+        ),
+        "the command survived the signal to the wrapper: {:?}",
+        processes_with_klon_id(&name)
+    );
 }
 
 /// Two repositories can hold one branch name, and each hands out `127.0.0.2`
