@@ -52,6 +52,16 @@
 //!
 //! The marker is a plain file, not the fifo itself: `flock` on a fifo works on
 //! Linux and fails with `ENOTSUP` on macOS (measured in CI).
+//!
+//! ## One descriptor does all the work
+//!
+//! Linux gives every open of a fifo the one shared buffer, so klon could read
+//! the count on one descriptor and write the tokens on another. macOS does
+//! not: a second open does not see what the first one wrote (measured in CI).
+//! klon therefore counts, fills, and drains through the single descriptor it
+//! hands to the command. `O_NONBLOCK` goes on only for that work and comes off
+//! before the copies are made, because a client reads the store with a
+//! blocking `read` and an `EAGAIN` there ends its build.
 
 use crate::envelope::{Envelope, Part};
 use crate::{Error, Result};
@@ -274,20 +284,37 @@ fn open_store(path: &Path) -> Result<File> {
         .map_err(Error::io(format!("open {}", path.display())))
 }
 
-/// `open_store` with `O_NONBLOCK`. klon reads and writes the store through it,
-/// so a store that a client emptied first never makes klon wait. It is a
-/// second open file description on the same buffer, and no copy of it ever
-/// leaves the process, so the flag never reaches a client.
-fn open_store_now(path: &Path) -> Result<File> {
-    let file = open_store(path)?;
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is open and owned by `file`.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        // SAFETY: the same descriptor, with one flag added.
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+/// `O_NONBLOCK` on one descriptor, until the guard drops.
+///
+/// klon reads and writes the store through the same descriptor the command
+/// will inherit, because a second open of a fifo sees no shared buffer on
+/// macOS. That descriptor must block for the command, so the flag lives only
+/// while klon works, and the guard puts the old flags back. A store that a
+/// client emptied first then never makes klon wait.
+struct NonBlocking<'a> {
+    file: &'a File,
+    flags: libc::c_int,
+}
+
+impl<'a> NonBlocking<'a> {
+    fn set(file: &'a File) -> NonBlocking<'a> {
+        // SAFETY: the descriptor is open and owned by `file`.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags >= 0 {
+            // SAFETY: the same descriptor, with one flag added.
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
+        NonBlocking { file, flags }
     }
-    Ok(file)
+}
+
+impl Drop for NonBlocking<'_> {
+    fn drop(&mut self) {
+        if self.flags >= 0 {
+            // SAFETY: the descriptor is open and owned by `self.file`.
+            unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.flags) };
+        }
+    }
 }
 
 /// Duplicate `fd` to the lowest free descriptor at 3 or above. `F_DUPFD`
@@ -451,18 +478,20 @@ fn top_up_at(anchor: &File, path: &Path, target: usize, job: Job) -> Result<Repo
         hold(dir)?;
         return Ok(report);
     }
-    // A second open file description on the same buffer. `O_NONBLOCK` on it
-    // never reaches a client, because no copy of it leaves this process.
-    let mut scratch = open_store_now(path)?;
     report.live = probe(dir);
     if report.live == Holders::Idle {
         // No klon holds the store, and none can start: a new `run` must first
         // take the lock this call holds. Nothing can take or give a token now,
         // so the count is read again and no stale number reaches the write.
-        report.available = available(&scratch)?;
+        //
+        // The work goes through `anchor`, the one descriptor that carries the
+        // tokens. The flag comes off before the caller duplicates it.
+        let relaxed = NonBlocking::set(anchor);
+        report.available = available(anchor)?;
         if report.available < target {
             let missing = target - report.available;
-            scratch
+            let mut handle: &File = anchor;
+            handle
                 .write_all(&vec![TOKEN; missing])
                 .map_err(Error::io(format!(
                     "write back the tokens of {}",
@@ -470,10 +499,10 @@ fn top_up_at(anchor: &File, path: &Path, target: usize, job: Job) -> Result<Repo
                 )))?;
             report.restored = missing;
         } else if report.available > target {
-            report.dropped = take(&mut scratch, report.available - target)?;
+            report.dropped = take(anchor, report.available - target)?;
         }
+        drop(relaxed);
     }
-    drop(scratch);
     if job == Job::Keep {
         hold(dir)?;
     }
@@ -548,13 +577,14 @@ fn hold(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Take `count` tokens out of the store. The descriptor is non-blocking, so a
-/// store that a client emptied first ends the loop instead of waiting.
-fn take(file: &mut File, count: usize) -> Result<usize> {
+/// Take `count` tokens out of the store. The caller sets `O_NONBLOCK` first,
+/// so a store that a client emptied ends the loop instead of waiting.
+fn take(file: &File, count: usize) -> Result<usize> {
+    let mut handle: &File = file;
     let mut buffer = vec![0u8; count];
     let mut taken = 0;
     while taken < count {
-        match file.read(&mut buffer[taken..]) {
+        match handle.read(&mut buffer[taken..]) {
             Ok(0) => break,
             Ok(n) => taken += n,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -668,6 +698,13 @@ mod tests {
         fn count(&self) -> usize {
             available(&self.anchor).expect("count")
         }
+
+        /// Take `count` tokens, as a client does: through the descriptor that
+        /// carries the store, not through a second open of the fifo.
+        fn take_tokens(&self, count: usize) -> usize {
+            let _relaxed = NonBlocking::set(&self.anchor);
+            take(&self.anchor, count).expect("take")
+        }
     }
 
     #[test]
@@ -696,9 +733,7 @@ mod tests {
         // `Job::Keep` fills the store and takes the shared lock, as `run` does.
         top_up_at(&store.anchor, &store.path, 2, Job::Keep).expect("fill");
         // A client took both tokens and holds them.
-        let mut scratch = open_store_now(&store.path).expect("open");
-        assert_eq!(take(&mut scratch, 2).unwrap(), 2);
-        drop(scratch);
+        assert_eq!(store.take_tokens(2), 2);
 
         let report = top_up_at(&store.anchor, &store.path, 2, Job::Look).expect("report");
         assert_eq!(report.live, Holders::Busy, "the marker must be seen");
@@ -742,9 +777,7 @@ mod tests {
         top_up_at(&store.anchor, &store.path, 4, Job::Look).expect("fill");
 
         // A client took two tokens and died with them.
-        let mut scratch = open_store_now(&store.path).expect("open");
-        assert_eq!(take(&mut scratch, 2).unwrap(), 2);
-        drop(scratch);
+        assert_eq!(store.take_tokens(2), 2);
         assert_eq!(store.count(), 2);
 
         let report = top_up_at(&store.anchor, &store.path, 4, Job::Look).expect("top up");
