@@ -42,11 +42,19 @@ impl Run {
     }
 
     /// Run `bench` with the smoke profiles and three samples per record.
+    ///
+    /// Every variable that changes a run is named here, so a developer who has
+    /// one of them set gets the same result as the CI. `extra` comes last and
+    /// wins.
     fn bench(&self, extra: &[(&str, &OsStr)], args: &[&str]) -> std::process::Output {
         let mut envs: Vec<(&str, &OsStr)> = vec![
             ("KLON_BENCH_SMOKE", OsStr::new("1")),
             ("KLON_BENCH_RUNS", OsStr::new("3")),
             ("KLON_BENCH_DIR", self.bench_dir.as_os_str()),
+            ("KLON_FIXTURE", OsStr::new("")),
+            ("KLON_BENCH_DROP_CACHES", OsStr::new("")),
+            ("KLON_BENCH_INJECT_MISMATCH", OsStr::new("")),
+            ("KLON_BENCH_ORDER_SEED", OsStr::new("")),
         ];
         envs.extend_from_slice(extra);
         klon_env(&self.cwd, &envs, args)

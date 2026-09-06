@@ -187,8 +187,11 @@ impl Environment {
             klon_commit: env!("KLON_COMMIT"),
             fixture_hash,
             order_seed,
+            // An empty value is no command, exactly as the runner reads it.
             drop_caches: std::env::var("KLON_BENCH_DROP_CACHES")
-                .unwrap_or_else(|_| "none".to_string()),
+                .ok()
+                .filter(|command| !command.trim().is_empty())
+                .unwrap_or_else(|| "none".to_string()),
         }
     }
 }
