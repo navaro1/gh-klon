@@ -14,13 +14,22 @@
 
 use crate::{Error, Result};
 use std::io;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
 /// How long one upstream may take to answer a UDP query. glibc retries, so a
 /// lost query costs latency, not correctness.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One upstream word: a socket address, or a bare address on port 53. The
+/// bare form must go through `IpAddr`, so an IPv6 literal becomes
+/// `[::1]:53` and not the unparseable `::1:53`.
+fn parse_upstream(text: &str) -> Result<SocketAddr> {
+    text.parse::<SocketAddr>()
+        .or_else(|_| text.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+        .map_err(|_| Error::klon(format!("{text} is not a literal address")))
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -41,11 +50,8 @@ pub fn run(args: Args) -> Result<()> {
     let upstreams: Vec<SocketAddr> = args
         .upstreams
         .iter()
-        .map(|up| {
-            up.parse::<SocketAddr>()
-                .or_else(|_| format!("{up}:53").parse::<SocketAddr>())
-                .map_err(|_| Error::klon(format!("{up} is not a literal address")))
-        })
+        .map(String::as_str)
+        .map(parse_upstream)
         .collect::<Result<_>>()?;
     let udp = match UdpSocket::bind(args.bind) {
         Ok(udp) => udp,
@@ -98,8 +104,15 @@ pub fn run(args: Args) -> Result<()> {
             let ups = upstreams.clone();
             thread::spawn(move || relay_tcp(client, &ups));
         }
+        Ok(())
+    } else {
+        // No TCP side, but the UDP side still works. The process must stay
+        // alive: its end comes from the parent's exit (PR_SET_PDEATHSIG),
+        // not from this function returning.
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
-    Ok(())
 }
 
 /// Answer one UDP query from the first upstream that replies. The reply
@@ -166,6 +179,18 @@ fn relay_tcp(mut client: TcpStream, upstreams: &[SocketAddr]) {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn an_upstream_word_takes_a_bare_address_or_a_socket_address() {
+        let bare = parse_upstream("1.1.1.1").unwrap();
+        assert_eq!(bare, "1.1.1.1:53".parse().unwrap());
+        // The IPv6 form must keep its brackets parseable.
+        let v6 = parse_upstream("::1").unwrap();
+        assert_eq!(v6, "[::1]:53".parse().unwrap());
+        let with_port = parse_upstream("10.0.0.1:5353").unwrap();
+        assert_eq!(with_port, "10.0.0.1:5353".parse().unwrap());
+        assert!(parse_upstream("example.com").is_err());
+    }
 
     #[test]
     fn udp_queries_reach_the_upstream_and_the_reply_returns() {

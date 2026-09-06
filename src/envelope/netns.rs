@@ -20,11 +20,14 @@
 //! itself. The fence therefore moves inside the namespace: when the fence is
 //! on, the command after pasta's `--` is `gh-klon __fence-exec`, which
 //! applies the same ruleset and then execs the command. pasta runs unfenced;
-//! the command runs under the same fence as without `--netns`.
+//! the command runs under the same fence as without `--netns`. The DNS
+//! rescue of a loopback-stub host rides on that carrier: without the fence
+//! (`KLON_NO_FENCE=1`) the wrapper carries no `__fence-exec`, so it carries
+//! no rescue listener either.
 
 use crate::envelope::{env, Envelope, Part};
 use crate::{probe, Error, Result};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 /// The ports pasta maps when neither `--netns-ports` nor `.klon.toml` names
@@ -133,8 +136,9 @@ fn part(ip: &str, ports: &[u16], fenced: Option<FencedExec>) -> Part {
         if let Some((stub, upstreams)) = fenced.dns {
             wrapper.push("--dns-rescue".to_string());
             // The stub rides with its port: `--dns-rescue` takes a socket
-            // address, and a resolv.conf nameserver is a bare address.
-            wrapper.push(format!("{stub}:53"));
+            // address, and a resolv.conf nameserver is a bare address. The
+            // socket address display brackets IPv6, so `::1` keeps parsing.
+            wrapper.push(SocketAddr::new(stub, 53).to_string());
             wrapper.push("--dns-upstream".to_string());
             // One argv word with a comma list: the same compactness keeps the
             // wrapper short, and clap splits it on the commas.
@@ -335,5 +339,17 @@ mod tests {
             ]
         );
         assert!(words.iter().all(|word| !word.contains(' ')));
+    }
+
+    #[test]
+    fn an_ipv6_stub_rides_with_brackets() {
+        let fenced = FencedExec {
+            exe: PathBuf::from("/opt/gh-klon"),
+            klon: PathBuf::from("/repo/.klon-work/feature"),
+            cgroup: None,
+            dns: Some(("::1".parse().unwrap(), vec!["::1".parse().unwrap()])),
+        };
+        let words = part("127.0.0.2", &[3000], Some(fenced)).wrapper;
+        assert!(words.contains(&"[::1]:53".to_string()));
     }
 }
