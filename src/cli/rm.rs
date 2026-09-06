@@ -1,7 +1,9 @@
-//! `gh klon rm (<branch> | --path <p>) [--force]`: the safe removal from handoff §7.
-//! The klon is renamed into `.trash` and deleted in the background, so the
-//! command returns at once. The branch is never deleted.
+//! `gh klon rm (<branch> | --path <p>) [--merged] [--force]`: the safe removal
+//! from handoff §7. The klon is renamed into `.trash` and deleted in the
+//! background, so the command returns at once. The branch is deleted only
+//! with `--merged`, and only after klon proved it is merged.
 
+use crate::branch;
 use crate::journal::{self, State};
 use crate::paths;
 use crate::process;
@@ -31,6 +33,10 @@ pub struct Args {
     /// The klon path. It must match a registered worktree.
     #[arg(long, conflicts_with = "branch")]
     pub path: Option<PathBuf>,
+    /// Prove the branch is merged (an ancestor of `base`, or a merged pull
+    /// request), then delete it after the removal.
+    #[arg(long)]
+    pub merged: bool,
     /// Remove a dirty klon or one with live processes.
     #[arg(long)]
     pub force: bool,
@@ -61,6 +67,21 @@ pub fn run(args: Args, json: bool) -> Result<()> {
 
     // Step 1: refuse protected places before anything else.
     refuse_reserved(&target, &golden)?;
+    // The `--merged` gate is about the branch, not the tree: prove the merge
+    // before anything is removed, then delete the branch after the removal.
+    let merged_branch = if args.merged {
+        let name = args
+            .branch
+            .clone()
+            .or_else(|| branch.clone())
+            .ok_or_else(|| {
+                Error::klon("--merged needs a branch; the target has none checked out")
+            })?;
+        let evidence = branch::merged_evidence(&golden, &name)?;
+        Some((name, evidence))
+    } else {
+        None
+    };
     // A lock protects a klon from removal on purpose; even --force honours it.
     if worktrees
         .iter()
@@ -95,6 +116,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     record.reach(State::Removing)?;
     let trash = remove_worktree(&golden, &target)?;
     record.close()?;
+
+    if let Some((name, evidence)) = merged_branch {
+        branch::delete_branch(&golden, &name, &evidence)?;
+    }
 
     if json {
         let report = Report {

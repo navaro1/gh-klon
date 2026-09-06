@@ -1,8 +1,10 @@
 //! `gh-klon`: a `git worktree` replacement that spawns a warm copy of a project.
 
 mod backend;
+mod branch;
 mod cli;
 mod config;
+mod gh;
 mod git;
 mod journal;
 mod paths;
@@ -90,17 +92,19 @@ enum Command {
     Doctor(cli::doctor::Args),
     /// Bring a klon up to date. C24 ships the `--check` dry run only.
     Sync(cli::sync::Args),
+    /// Open a pull request for a klon's branch with `gh pr create`.
+    Pr(cli::pr::Args),
 }
 
 fn main() -> ExitCode {
     let Cli { yes, json, command } = Cli::parse();
-    // `--json` is global, like `--yes`. `up` and `prune` print no document, so
-    // the flag would promise one that never arrives. A later chunk that gives a
-    // command a document deletes its name from this list.
-    if json && matches!(command, Command::Up | Command::Prune) {
+    // `--json` is global, like `--yes`. `up`, `prune`, and `pr` print no klon
+    // document, so the flag would promise one that never arrives. A later
+    // chunk that gives a command a document deletes its name from this list.
+    if json && matches!(command, Command::Up | Command::Prune | Command::Pr(_)) {
         eprintln!(
             "{}",
-            Error::klon("--json is not available for up and prune")
+            Error::klon("--json is not available for up, prune, and pr")
         );
         return ExitCode::from(1);
     }
@@ -112,6 +116,7 @@ fn main() -> ExitCode {
         Command::List => cli::list::run(json),
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Sync(args) => cli::sync::run(args),
+        Command::Pr(args) => cli::pr::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
