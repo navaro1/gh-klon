@@ -223,25 +223,45 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// The `?? <path>` entries of a `git status --porcelain=v1 -z` document: the
-/// untracked paths, with a fully untracked directory as one name with a
-/// trailing slash. A rename entry carries a second path after its own NUL,
-/// which the parser skips.
-pub fn paths_from_porcelain(status: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut fields = status.split('\0');
+/// What one `git status --porcelain=v1 -z --untracked-files=normal` document
+/// says that `add` needs (G1).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Scan {
+    /// The `?? <path>` entries: the untracked, non-ignored paths, with a
+    /// fully untracked directory as one name with a trailing slash. Bytes,
+    /// because a name on Unix is not always UTF-8.
+    pub untracked: Vec<Vec<u8>>,
+    /// True when a `.gitignore` is modified, added, deleted, or staged: the
+    /// ignore rules of that tree differ from its commit, so a list of its
+    /// untracked paths says nothing about another commit's rules.
+    pub rules_dirty: bool,
+}
+
+/// Read a `-z` porcelain document. A rename or copy entry carries a second
+/// path after its own NUL, which the parser skips.
+pub fn scan_porcelain(status: &[u8]) -> Scan {
+    let mut scan = Scan::default();
+    let mut fields = status.split(|b| *b == 0);
     while let Some(entry) = fields.next() {
-        let Some((code, path)) = entry.split_at_checked(3) else {
+        if entry.len() < 3 {
             continue;
-        };
-        if code.starts_with(['R', 'C']) || code[1..].starts_with(['R', 'C']) {
+        }
+        let (code, path) = entry.split_at(3);
+        if matches!(code[0], b'R' | b'C') || matches!(code[1], b'R' | b'C') {
             fields.next();
         }
-        if code == "?? " {
-            out.push(path.to_string());
+        if code == b"?? " {
+            scan.untracked.push(path.to_vec());
+        } else if path.ends_with(b"/.gitignore") || path == b".gitignore" {
+            scan.rules_dirty = true;
         }
     }
-    out
+    scan
+}
+
+/// True when `path` names a `.gitignore` at any depth.
+pub fn is_ignore_file(path: &[u8]) -> bool {
+    path == b".gitignore" || path.ends_with(b"/.gitignore")
 }
 
 #[cfg(test)]
@@ -323,9 +343,22 @@ mod tests {
 
     #[test]
     fn the_porcelain_parser_keeps_the_untracked_entries_and_skips_rename_sources() {
-        let status = "?? new.txt\0 M edited.txt\0R  moved.txt\0old.txt\0?? dir/\0A  added.txt\0";
-        assert_eq!(paths_from_porcelain(status), vec!["new.txt", "dir/"]);
-        assert!(paths_from_porcelain("").is_empty());
+        let status = b"?? new.txt\0 M edited.txt\0R  moved.txt\0old.txt\0?? dir/\0A  added.txt\0";
+        let scan = scan_porcelain(status);
+        assert_eq!(scan.untracked, vec![b"new.txt".to_vec(), b"dir/".to_vec()]);
+        assert!(!scan.rules_dirty);
+        assert_eq!(scan_porcelain(b""), Scan::default());
+        // A non-UTF-8 name survives as bytes.
+        assert_eq!(
+            scan_porcelain(b"?? a\xffb\0").untracked,
+            vec![b"a\xffb".to_vec()]
+        );
+        // A changed ignore file marks the rules dirty; an untracked one does
+        // not, because the untracked list already reflects it.
+        assert!(scan_porcelain(b" M sub/.gitignore\0").rules_dirty);
+        assert!(scan_porcelain(b"D  .gitignore\0").rules_dirty);
+        assert!(!scan_porcelain(b"?? .gitignore\0").rules_dirty);
+        assert!(is_ignore_file(b"a/b/.gitignore") && !is_ignore_file(b"a/.gitignore.bak"));
     }
 
     #[test]

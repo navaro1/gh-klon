@@ -120,6 +120,14 @@ pub struct Meta {
     /// builder; `add` then walks.
     #[serde(default)]
     pub untracked: Option<Vec<String>>,
+    /// Every top-level ignored entry of the spare, as `git ls-files --others
+    /// --ignored --directory` prints them after the clone: a directory with a
+    /// trailing slash, a file or a symlink without (G1). The path fixup starts
+    /// from this list instead of asking git in the klon, which is one more
+    /// walk of the whole tree. None in a record from an older builder; `add`
+    /// then asks git.
+    #[serde(default)]
+    pub ignored_entries: Option<Vec<String>>,
 }
 
 /// What the builder did.
@@ -140,7 +148,7 @@ pub enum Claim {
     /// index of the moment the spare was made. The record names the backend
     /// that made the spare, which the `add` report carries, and the ignored
     /// directories the spare holds, which the path fixup walks.
-    Used(Meta),
+    Used(Box<Meta>),
     /// No usable spare. `add` clones directly.
     Direct,
 }
@@ -415,22 +423,24 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
     let head = git::run(golden, &["rev-parse", "HEAD"])?.trim().to_string();
     let status = git::run(golden, &["status", "--porcelain"])?;
     let status_hash = config::hex(&Sha256::digest(status.as_bytes()));
-    let before = top_mtimes(golden, &exclude)?;
+    let (before, _) = ignored_listing(golden, &exclude)?;
 
     let choice = backend::select(golden, &common, Some(&layout.tmp), None)?;
     fs::create_dir(&layout.tmp).map_err(Error::io(format!("create {}", layout.tmp.display())))?;
     let filled = fill_tmp(golden, &common, layout, choice.backend.as_ref(), &exclude).and_then(
         |untracked| {
+            let (after, entries) = ignored_listing(golden, &exclude)?;
             let meta = Meta {
                 version: VERSION,
                 head,
                 status_hash,
                 top_mtimes_before: before,
-                top_mtimes_after: top_mtimes(golden, &exclude)?,
+                top_mtimes_after: after,
                 exclusions_hash: exclusions_hash(golden),
                 backend: choice.backend.name().to_string(),
                 created: time::now_rfc3339(),
                 untracked,
+                ignored_entries: Some(entries),
             };
             let text = serde_json::to_string_pretty(&meta)
                 .map_err(|err| Error::klon(format!("serialize spare.json: {err}")))?;
@@ -502,6 +512,10 @@ fn fill_tmp(
 /// path (`take_index`). A failure here costs the klon one full scan in its
 /// first status and one `git clean` walk, so it is one stderr line, never a
 /// failed spare.
+///
+/// The list is None, and `add` walks, when a name is not UTF-8 (the record
+/// is JSON) or when a `.gitignore` in golden was dirty: the list then follows
+/// rules that no commit holds, and `add` compares rules between commits.
 fn warm_untracked_cache(
     golden: &Path,
     common: &Path,
@@ -511,9 +525,9 @@ fn warm_untracked_cache(
     let prepared = crate::cli::add::ensure_config(golden)
         .and_then(|()| crate::cli::add::exclude_klon_dir(common));
     let warmed = prepared.and_then(|()| {
-        git::run_env(
+        git::run_bytes_env(
             tmp,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"].map(OsStr::new),
             &[
                 ("GIT_DIR", common.as_os_str()),
                 ("GIT_WORK_TREE", tmp.as_os_str()),
@@ -522,20 +536,32 @@ fn warm_untracked_cache(
             ],
         )
     });
-    match warmed {
-        Ok(status) => Some(crate::untracked::paths_from_porcelain(&status)),
+    let status = match warmed {
+        Ok(status) => status,
         Err(err) => {
             eprintln!("klon: the spare has no untracked cache: {err}");
-            None
+            return None;
         }
+    };
+    let scan = crate::untracked::scan_porcelain(&status);
+    if scan.rules_dirty {
+        debug("a .gitignore is dirty in golden; the untracked list is not recorded");
+        return None;
     }
+    scan.untracked
+        .into_iter()
+        .map(|path| String::from_utf8(path).ok())
+        .collect()
 }
 
-/// The mtime of every ignored directory that the clone includes, keyed by the
-/// path that `git ls-files --others --ignored --directory` prints. A directory
-/// mtime changes when a direct child appears or goes, which is what a build
-/// that starts or ends in golden does.
-fn top_mtimes(golden: &Path, exclude: &Exclusions) -> Result<BTreeMap<String, String>> {
+/// The top-level ignored entries of golden that the clone includes, as `git
+/// ls-files --others --ignored --directory` prints them, and the mtime of
+/// every directory among them. A directory mtime changes when a direct child
+/// appears or goes, which is what a build that starts or ends in golden does.
+fn ignored_listing(
+    golden: &Path,
+    exclude: &Exclusions,
+) -> Result<(BTreeMap<String, String>, Vec<String>)> {
     let out = git::run(
         golden,
         &[
@@ -548,19 +574,25 @@ fn top_mtimes(golden: &Path, exclude: &Exclusions) -> Result<BTreeMap<String, St
         ],
     )?;
     let mut map = BTreeMap::new();
-    for entry in out.split('\0').filter(|e| e.ends_with('/')) {
-        let dir = golden.join(entry.trim_end_matches('/'));
-        if exclude.excludes(&dir, true) {
+    let mut entries = Vec::new();
+    for entry in out.split('\0').filter(|e| !e.is_empty()) {
+        let is_dir = entry.ends_with('/');
+        let full = golden.join(entry.trim_end_matches('/'));
+        if exclude.excludes(&full, is_dir) {
             continue;
         }
-        if let Ok(meta) = fs::symlink_metadata(&dir) {
+        let Ok(meta) = fs::symlink_metadata(&full) else {
+            continue;
+        };
+        entries.push(entry.to_string());
+        if is_dir {
             map.insert(
                 entry.to_string(),
                 format!("{}.{:09}", meta.mtime(), meta.mtime_nsec()),
             );
         }
     }
-    Ok(map)
+    Ok((map, entries))
 }
 
 /// macOS: put this process in the background band, which throttles its cpu
@@ -666,7 +698,7 @@ pub fn claim(golden: &Path, path: &Path, admin_dir: &Path, wanted: Option<&str>)
     if let Err(err) = fs::remove_dir_all(&stub) {
         eprintln!("klon: cannot remove {}: {err}", stub.display());
     }
-    Ok(Claim::Used(meta))
+    Ok(Claim::Used(Box::new(meta)))
 }
 
 /// Move the spare's index files into the admin entry: `.klon/index` and any
@@ -951,6 +983,7 @@ mod tests {
             backend: "copy".to_string(),
             created: time::now_rfc3339(),
             untracked: Some(vec!["junk.txt".to_string()]),
+            ignored_entries: Some(vec!["build/".to_string(), "CMakeCache.txt".to_string()]),
         };
         let text = serde_json::to_string(&meta).unwrap();
         let read: Meta = serde_json::from_str(&text).unwrap();
@@ -960,9 +993,13 @@ mod tests {
             read.untracked.as_deref(),
             Some(&["junk.txt".to_string()][..])
         );
-        // A record from an older builder has no list, and `add` must walk.
-        let old: Meta =
-            serde_json::from_str(&text.replace(",\"untracked\":[\"junk.txt\"]", "")).unwrap();
+        assert_eq!(read.ignored_entries.as_ref().map(Vec::len), Some(2));
+        // A record from an older builder has neither list, and `add` must walk.
+        let old = text
+            .replace(",\"untracked\":[\"junk.txt\"]", "")
+            .replace(",\"ignored_entries\":[\"build/\",\"CMakeCache.txt\"]", "");
+        let old: Meta = serde_json::from_str(&old).unwrap();
         assert_eq!(old.untracked, None);
+        assert_eq!(old.ignored_entries, None);
     }
 }
