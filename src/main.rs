@@ -115,6 +115,8 @@ enum Command {
     Init(cli::init::Args),
     /// Bring a klon up to date: fetch, then fast-forward, rebase, or merge.
     Sync(cli::sync::Args),
+    /// Land a klon's branch in base, then remove the klon. Never pushes.
+    Merge(cli::merge::Args),
     /// Open a pull request for a klon's branch with `gh pr create`.
     Pr(cli::pr::Args),
     /// Run a command inside a klon under the envelope.
@@ -168,6 +170,7 @@ fn main() -> ExitCode {
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Init(args) => cli::init::run(args, yes, json),
         Command::Sync(args) => cli::sync::run(args, yes, json),
+        Command::Merge(args) => cli::merge::run(args, yes, json),
         Command::Pr(args) => cli::pr::run(args),
         Command::Run(args) => cli::run::run(args),
         Command::Shell(args) => cli::shell::run(args),

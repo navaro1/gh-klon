@@ -67,18 +67,12 @@ pub fn form(cwd: &Path) -> Form {
 /// Read `git version 2.34.1` and pick the form. A line klon cannot read counts as
 /// the legacy form, which every git supports.
 fn from_version(text: &str) -> Form {
-    let number = match text.split_whitespace().nth(2) {
-        Some(number) => number,
-        None => return Form::Legacy,
-    };
-    let mut parts = number.split('.');
-    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
-    if (major, minor) < WRITE_TREE_SINCE {
+    let version = git::parse_version(text);
+    if version < WRITE_TREE_SINCE {
         Form::Legacy
     } else {
         Form::WriteTree {
-            batch: (major, minor) >= STDIN_SINCE,
+            batch: version >= STDIN_SINCE,
         }
     }
 }

@@ -97,6 +97,22 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
             // `rm` stopped before the rename, so the klon is untouched.
             _ => actions.push("rm changed nothing; the klon stays".to_string()),
         },
+        // C25. The entry only marks the window in which `merge` moved golden's
+        // history, so the repair reports it and changes nothing.
+        //
+        // git owns both ends of that window. A kill before the merge leaves
+        // golden untouched. A kill inside the merge leaves `MERGE_HEAD` in
+        // golden, and only the user knows whether that merge must continue or
+        // abort; a guess here would drop work. A kill after the merge leaves
+        // the klon in place, which the next `merge` or `rm` removes.
+        //
+        // The removal in step 6 writes its own `rm` entry over this one, so a
+        // kill during the removal repairs through the `rm` tail above.
+        Op::Merge => actions.push(
+            "merge changed no klon; read golden with git status and finish or abort any merge \
+             it holds"
+                .to_string(),
+        ),
         Op::Init => {
             // C15: `init --volume` moves golden onto a loop volume, so its
             // tail names an image and a mount point that no path beside golden

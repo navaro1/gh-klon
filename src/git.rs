@@ -4,6 +4,7 @@ use crate::{Error, Result};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 /// Run `git -C <cwd> <args>` and return its stdout. A non-zero exit becomes `Error::Git`.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -62,6 +63,44 @@ pub fn run_input(cwd: &Path, args: &[&str], input: &[u8], ok: &[i32]) -> Result<
 /// Run `git` and ignore the result. Used on the cleanup path only.
 pub fn run_quiet(cwd: &Path, args: &[&str]) {
     let _ = run(cwd, args);
+}
+
+/// Set `key` to `value` in the shared repository config, unless it already
+/// holds that value. `merge` (C25) writes its four keys this way.
+///
+/// The read comes first for two reasons. A key that already agrees needs no
+/// `git config` process, and a repeated command then takes no `config.lock`,
+/// so two klon commands at once never fight over it.
+pub fn ensure_config(cwd: &Path, key: &str, value: &str) -> Result<()> {
+    match run(cwd, &["config", "--get", key]) {
+        Ok(current) if current.trim_end_matches('\n') == value => return Ok(()),
+        // Exit 1 means that the key is unset. Every other failure is real.
+        Ok(_) | Err(Error::Git { code: 1, .. }) => {}
+        Err(err) => return Err(err),
+    }
+    run(cwd, &["config", key, value]).map(|_| ())
+}
+
+/// The `(major, minor)` version of the installed git, or `(0, 0)` when klon
+/// cannot read the line. One `git --version` runs per process.
+pub fn version(cwd: &Path) -> (u32, u32) {
+    static VERSION: OnceLock<(u32, u32)> = OnceLock::new();
+    *VERSION.get_or_init(|| match run(cwd, &["--version"]) {
+        Ok(text) => parse_version(&text),
+        Err(_) => (0, 0),
+    })
+}
+
+/// Read `git version 2.34.1` as `(2, 34)`. A line klon cannot read gives
+/// `(0, 0)`, which every feature test then treats as "too old".
+pub fn parse_version(text: &str) -> (u32, u32) {
+    let Some(number) = text.split_whitespace().nth(2) else {
+        return (0, 0);
+    };
+    let mut parts = number.split('.');
+    let major = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor)
 }
 
 /// One block of `git worktree list --porcelain`.

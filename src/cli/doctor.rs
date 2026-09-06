@@ -272,6 +272,7 @@ fn op_key(op: Op) -> &'static str {
         Op::Add => "add",
         Op::Rm => "rm",
         Op::Init => "init",
+        Op::Merge => "merge",
     }
 }
 

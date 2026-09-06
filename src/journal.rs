@@ -26,6 +26,10 @@ pub enum Op {
     Rm,
     /// `gh klon init`, added in C7 and C15.
     Init,
+    /// `gh klon merge`, added in C25. The entry marks the window in which
+    /// golden's history moves. git owns the recovery of an interrupted merge,
+    /// so the repair only reports the entry (see `repair::entry`).
+    Merge,
 }
 
 /// The step of the transaction that completed last. The order is the order of
