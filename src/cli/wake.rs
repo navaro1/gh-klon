@@ -68,8 +68,9 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         &record.path,
         Some(&record.branch),
     )?;
-    // Step 1: the whole `add` transaction at the recorded path.
-    crate::cli::add::add_at(&record.branch, &record.path, yes)?;
+    // Step 1: the whole `add` transaction at the recorded path. `json` reaches
+    // it too, so a `wake --json` leaves both streams clean for its reader.
+    crate::cli::add::add_at(&record.branch, &record.path, yes, json)?;
     // Step 2: the saved files go back over the fresh tree.
     hibernate::restore(&record.path, &record)?;
     entry.reach(State::Restored)?;

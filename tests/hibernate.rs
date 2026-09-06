@@ -37,6 +37,23 @@ fn wait_until(mut cond: impl FnMut() -> bool, timeout: std::time::Duration) -> b
     cond()
 }
 
+/// Set the modification time of one file.
+fn set_mtime(file: &Path, when: std::time::SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap_or_else(|err| panic!("open {}: {err}", file.display()))
+        .set_modified(when)
+        .unwrap_or_else(|err| panic!("set the mtime of {}: {err}", file.display()));
+}
+
+/// The index of a klon: `<common>/worktrees/<name>/index`, from its `.git` file.
+fn index_of(klon_path: &Path) -> PathBuf {
+    let text = fs::read_to_string(klon_path.join(".git")).unwrap();
+    let dir = text.trim_end().strip_prefix("gitdir: ").unwrap();
+    PathBuf::from(dir).join("index")
+}
+
 /// `<common>/klon/journal`: an entry here after a command means the command
 /// left a transaction open.
 fn journal_entries(golden: &Path) -> Vec<String> {
@@ -437,12 +454,17 @@ fn an_edit_that_the_stat_cache_hides_still_survives() {
     assert_ne!(changed, before, "the edit must change the bytes");
     let stamp = fs::metadata(&file).unwrap().modified().unwrap();
     fs::write(&file, &changed).unwrap();
-    fs::File::options()
-        .write(true)
-        .open(&file)
-        .unwrap()
-        .set_modified(stamp)
-        .unwrap();
+    set_mtime(&file, stamp);
+
+    // git calls an index entry "racily clean" when its modification time is not
+    // older than the index's own, and rehashes it whatever `core.checkStat`
+    // says. On a fast host the fixture and the klon are made inside one second,
+    // which lands the whole tree in that window. The index is therefore pushed
+    // forward, so the stat cache decides, which is the point of the test.
+    set_mtime(
+        &index_of(&klon_path),
+        stamp + std::time::Duration::from_secs(60),
+    );
 
     // git itself now reports the klon clean, which is the whole point.
     assert_eq!(

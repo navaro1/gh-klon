@@ -422,7 +422,7 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
 /// and the same loopback address as any other klon. `spawn` prints nothing, so
 /// `wake` owns the report. The `Args` are built here, beside the struct, so a
 /// new field cannot be forgotten.
-pub fn add_at(branch: &str, path: &Path, yes: bool) -> Result<Spawned> {
+pub fn add_at(branch: &str, path: &Path, yes: bool, json: bool) -> Result<Spawned> {
     spawn(
         Args {
             branch: Some(branch.to_string()),
@@ -431,7 +431,7 @@ pub fn add_at(branch: &str, path: &Path, yes: bool) -> Result<Spawned> {
             ..Args::default()
         },
         yes,
-        false,
+        json,
     )
 }
 
