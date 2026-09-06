@@ -17,6 +17,12 @@
 //! `FICLONE` sets the destination mtime to the current time, so every clone
 //! restores the source mtime (**V**, handoff §4). Four workers is the measured
 //! optimum: 116k files took 3.3 s with 4 threads and 9 s with 10.
+//!
+//! `registry` holds this backend on Linux only, because C6 owns the APFS clone.
+//! The walk below therefore has no caller on macOS, while `capability` still
+//! answers the `doctor` row on every platform. One allow keeps the file
+//! readable instead of a `cfg` on each item.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use super::{set_symlink_times, set_times, Backend, Exclusions, Timing};
 use crate::{paths, probe, Error, Result};
