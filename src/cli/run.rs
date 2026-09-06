@@ -6,7 +6,7 @@
 //! and `KLON_DIR`, so `stop` finds the whole tree. The exit code passes back
 //! unchanged, and a signal to `run` passes on to the command.
 
-use crate::envelope::Envelope;
+use crate::envelope::{scope, Envelope};
 use crate::{git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -66,7 +66,11 @@ pub fn resolve(branch: Option<&str>, path: Option<&Path>) -> Result<PathBuf> {
 /// A command that fails gives `Error::Exit`, which prints nothing: the command
 /// already reported its own failure on its own stderr.
 pub fn exec(klon: &Path, argv: &[String]) -> Result<()> {
-    let envelope = Envelope::load(klon)?;
+    let mut envelope = Envelope::load(klon)?;
+    // C20: the resource scope is the outermost wrapper, so it holds the whole
+    // command tree. The guard removes a cgroup that klon made once the command
+    // has left it.
+    let _scope = scope::apply(&mut envelope);
     // The child leads a new session, so the terminal never signals it: Ctrl-C
     // and a `kill` of `gh klon run` reach only this process. klon relays each
     // of them to the child's process group, so the whole tree ends with the

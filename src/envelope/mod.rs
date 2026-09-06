@@ -14,6 +14,7 @@
 //! | `netns` | C23 | a `pasta --config-net` wrapper |
 
 pub mod env;
+pub mod scope;
 pub mod slots;
 
 use crate::{Error, Result};

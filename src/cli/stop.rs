@@ -6,7 +6,7 @@
 //! well inside the five seconds R22 allows.
 
 use crate::cli::run as runner;
-use crate::envelope::Envelope;
+use crate::envelope::{scope, Envelope};
 use crate::{process, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -47,6 +47,9 @@ struct Report<'a> {
     killed: usize,
     /// The process ids that survived both signals.
     survivors: Vec<u32>,
+    /// The cgroup `stop` killed with one write, or null when the host gave the
+    /// klon none (C20).
+    cgroup: Option<PathBuf>,
 }
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -55,6 +58,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let tags = envelope.tags();
 
     let found = process::klon_processes(&tags);
+    // The cgroup of the klon, read from a live process before the signals move
+    // anything. It ends a process that left the session and cleared its own
+    // environment, which no scan of `/proc` can name (C20).
+    let cgroup = scope::klon_cgroup(&found, &envelope.name);
     for pid in &found {
         process::signal(*pid, libc::SIGTERM);
     }
@@ -66,6 +73,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         wait_for_exit(&tags, GRACE)
     };
     let killed = after_term.len();
+    // One write ends every member of the cgroup, the untagged ones included.
+    // An empty cgroup takes the write and nothing happens, so `stop` needs no
+    // second scan to decide whether the write is worth it.
+    let cgroup = cgroup.filter(|dir| !found.is_empty() && scope::kill(dir));
     for pid in &after_term {
         process::signal(*pid, libc::SIGKILL);
     }
@@ -86,6 +97,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         terminated,
         killed,
         survivors,
+        cgroup,
     };
     if json {
         println!(
@@ -100,6 +112,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             "{}: {} processes, {} ended after SIGTERM, {} after SIGKILL",
             report.name, report.found, report.terminated, report.killed
         );
+        if let Some(dir) = &report.cgroup {
+            println!("{}: the cgroup {} is empty", report.name, dir.display());
+        }
     }
     if report.survivors.is_empty() {
         return Ok(());

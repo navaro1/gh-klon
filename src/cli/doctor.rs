@@ -2,7 +2,7 @@
 //! (handoff §7, spec R31). Every host feature is one row from one probe. A later
 //! chunk adds a row to `FEATURES` and a function below it; nothing else changes.
 
-use crate::envelope::slots;
+use crate::envelope::{scope, slots};
 use crate::journal::{self, Entry, Op, State};
 use crate::{backend, git, probe, radar, repair, time, Error, Result};
 use serde::Serialize;
@@ -36,6 +36,7 @@ type Probe = fn(&Host) -> probe::Status;
 /// has its own two fields, because it carries a name and a reason.
 const FEATURES: &[(&str, Probe)] = &[
     ("btrfs-progs", btrfs_progs),
+    ("cgroup.controllers", cgroup_controllers),
     ("inotify.max_user_instances", inotify_instances),
     ("inotify.max_user_watches", inotify_watches),
     ("loopback", loopback),
@@ -44,7 +45,9 @@ const FEATURES: &[(&str, Probe)] = &[
     ("pasta", pasta_version),
     ("radar", radar_form),
     ("reflink", reflink_support),
+    ("scope", scope_mechanism),
     ("slots", slots_in_use),
+    ("systemd-run", systemd_run),
 ];
 
 pub fn run(args: Args, json: bool) -> Result<()> {
@@ -340,6 +343,24 @@ fn loopback(_host: &Host) -> probe::Status {
              sudo ifconfig lo0 alias {address} up"
         )),
     }
+}
+
+/// The `systemd-run` version. A user scope caps memory and tasks with no
+/// password on every systemd from 249 (handoff §11).
+fn systemd_run(_host: &Host) -> probe::Status {
+    scope::systemd_status()
+}
+
+/// The controllers systemd delegated to this user. Only a delegated controller
+/// can cap a klon without a privilege, and the laptop delegates `memory pids`.
+fn cgroup_controllers(_host: &Host) -> probe::Status {
+    scope::controllers_status()
+}
+
+/// The mechanism the next `run` would take and the caps it would apply (C20).
+/// The row is `absent` when the host gives klon no memory cap at all.
+fn scope_mechanism(host: &Host) -> probe::Status {
+    scope::scope_status(host.common)
 }
 
 fn make_version(_host: &Host) -> probe::Status {
