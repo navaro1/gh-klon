@@ -2,10 +2,13 @@
 # Claude Code `WorktreeCreate` hook (spec §2, consumer contract 2).
 #
 # Claude Code sends one JSON object on stdin with at least `cwd` and `name`.
-# The hook creates a klon at `<cwd>/.claude/worktrees/<name>` with the branch
-# `worktree-<name>` and prints that path on stdout. Claude Code replaces its
-# own `git worktree add` with this hook, so any non-zero exit aborts the
-# worktree creation and the error must reach stderr.
+# The hook creates a klon at `<repo>/.claude/worktrees/<name>` with the branch
+# `worktree-<name>` and prints that path on stdout. `<repo>` is the main
+# worktree of the repository that `cwd` names: a session started in a
+# subdirectory or in a linked worktree still lands on the one place where
+# klon accepts a klon inside a repository. Claude Code replaces its own
+# `git worktree add` with this hook, so any non-zero exit aborts the worktree
+# creation and the error must reach stderr.
 #
 # The hook appends one line to the file named by $KLON_HOOK_LOG when that
 # variable is set. The S3 spike reads the log to learn whether the hook ran.
@@ -28,8 +31,9 @@ fail() {
 
 # Print the string value of field $1 from the JSON object on stdin.
 # jq is the exact parser. The fallback sed reads a `"field":"value"` pair on
-# one line and keeps JSON escapes as they are; worktree names and klon paths
-# never need escapes.
+# one line and cannot decode JSON escapes. It only stays safe because every
+# value it reads must survive a `git` or `cd` check below: a mangled
+# extraction fails the hook, it never builds a wrong path.
 json_field() {
     field=$1
     if [ -z "${KLON_HOOK_NO_JQ:-}" ] && command -v jq >/dev/null 2>&1; then
@@ -53,10 +57,18 @@ case $name in
     .* | */* | *\\*) fail "refuses the worktree name '$name'" ;;
 esac
 
-dest="$cwd/.claude/worktrees/$name"
+# The main worktree owns `.claude/worktrees`. The common directory names it,
+# so a `cwd` in a subdirectory or in a linked worktree lands here too.
+# A `cwd` that no repository contains fails here, which also catches a
+# mangled sed extraction.
+common=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+    fail "cannot find the git repository at $cwd"
+repo=$(dirname "$common")
+
+dest="$repo/.claude/worktrees/$name"
 
 # The hook inherits stderr, so a failed `add` reports its own error there.
-json=$(cd "$cwd" && gh klon add "worktree-$name" --path "$dest" --json)
+json=$(cd "$repo" && gh klon add "worktree-$name" --path "$dest" --json)
 status=$?
 [ "$status" -eq 0 ] || fail "gh klon add failed for worktree-$name (exit $status)"
 
