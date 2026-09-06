@@ -17,6 +17,9 @@ pub struct Args {
     /// The klon path. It must match a registered worktree.
     #[arg(long, conflicts_with = "branch")]
     pub path: Option<PathBuf>,
+    /// Start the shell without the write fence.
+    #[arg(long)]
+    pub no_fence: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -25,5 +28,11 @@ pub fn run(args: Args) -> Result<()> {
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_SHELL.to_string());
-    runner::exec(&klon, &[shell])
+    runner::exec_with(
+        &klon,
+        &[shell],
+        runner::Options {
+            no_fence: args.no_fence,
+        },
+    )
 }
