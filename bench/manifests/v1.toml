@@ -26,6 +26,9 @@ release_cold = 10
 # The `git status` calls after the first one, per M4 sample. They feed the
 # `steady_samples_ms` series.
 steady_calls = 3
+# The builds alone behind `t_solo_ms` of an M12 cell. Their median is the ideal
+# that the concurrent run is measured against.
+solo = 3
 
 # --- Fixture profiles ---------------------------------------------------------
 #
@@ -64,6 +67,17 @@ added_files = 2
 # number is the latency that a user waits for. The rest of a sample is outside
 # the timer: the fixture build, the tree that a sample needs before the
 # measured command, the teardown, and the correctness check.
+#
+# `fixture` names the repository that a cell measures: `synthetic` (the default,
+# the generated file tree above), `rust` (a cargo workspace of `crates` member
+# crates with `functions` generated functions each), or `pnpm` (one package that
+# depends on a tarball inside the fixture). An ecosystem cell reads `crates` and
+# `functions` instead of the profile shape; those two are outside `fixture_hash`
+# on purpose, so a C8 result and a C31 result of one profile still compare, and
+# every record prints its own `fixture_shape`.
+#
+# A cell whose tool is absent is skipped with a reason. `cargo` is a rust cell's
+# tool; `pnpm`, `node`, and `tar` are a pnpm cell's.
 
 [[cells]]
 name = "m1-add-10k"
@@ -105,3 +119,107 @@ timer = "process: gh klon rm --path, or git worktree remove --force, from spawn 
 # background.
 pass_p50_ms = 100
 requires_fixture = "100k"
+
+# --- The v2 cells (C31) -------------------------------------------------------
+
+# M2: the time to a usable warm tree, not the time until the command returned.
+# The timer starts before klon spawns `add` and stops when the tree's ignored
+# state first equals golden's. The measurement therefore holds whether the copy
+# runs inside `add` or behind it in the background.
+#
+# The handoff sets no number for M2 in v0. The budget below is the ceiling of a
+# whole-directory copy of the profile's ignored state on the development laptop;
+# a reflink or a snapshot host lands two orders of magnitude below it.
+[[cells]]
+name = "m2-warm-10k"
+metric = "M2"
+profile = "p10k"
+action = "warm"
+timer = "poll: from the start of gh klon add until the ignored state of the new tree equals golden's"
+pass_p50_ms = 15000
+
+[[cells]]
+name = "m2-warm-100k"
+metric = "M2"
+profile = "p100k"
+action = "warm"
+timer = "poll: from the start of gh klon add until the ignored state of the new tree equals golden's"
+pass_p50_ms = 60000
+requires_fixture = "100k"
+
+# M3: what the first build in a fresh klon of a warm golden compiles. R10 asks
+# for zero. The build runs directly in the tree, not under `gh klon run`: the
+# envelope changes neither the unit count nor the answer.
+#
+# The time budget is a guard, not the metric: a klon that compiled the whole
+# workspace again would blow it. `pass_units_compiled` is the rule.
+[[cells]]
+name = "m3-zero-compile-rust"
+metric = "M3"
+profile = "p10k"
+action = "build"
+fixture = "rust"
+crates = 4
+functions = 50
+timer = "process: cargo build --offline in the new tree, from spawn to exit"
+pass_p50_ms = 60000
+pass_units_compiled = 0
+
+# The pnpm store sits beside golden, so golden, a klon, and a baseline worktree
+# all reach it. The klon must still install nothing: its `node_modules` came
+# with the ignored state and the fixup pass rewrote the absolute paths inside
+# `.modules.yaml` (handoff §9). The baseline has no `node_modules`, so it links
+# the package again; that difference is the metric.
+[[cells]]
+name = "m3-zero-compile-pnpm"
+metric = "M3"
+profile = "p10k"
+action = "build"
+fixture = "pnpm"
+timer = "process: pnpm install --frozen-lockfile --offline in the new tree, from spawn to exit"
+pass_p50_ms = 60000
+pass_units_compiled = 0
+
+# M5: the bytes that one idle tree alone holds. On btrfs `btrfs fi du -s --raw`
+# reports the exclusive extents and the record says `btrfs-fi-du`; every other
+# host gets the apparent size of the tree and the record says `upper-bound`.
+# There is no v0 budget for the figure itself; the time budget guards the walk.
+[[cells]]
+name = "m5-disk-100k"
+metric = "M5"
+profile = "p100k"
+action = "disk"
+timer = "process: the unique-byte measurement over an idle tree, from start to finish"
+pass_p50_ms = 60000
+requires_fixture = "100k"
+
+# M12: `ratio = (builders × t_solo) / t_wall`. One means that six builders
+# together cost exactly six times one builder alone; 0.80 allows a quarter of
+# the time to contention.
+#
+# `crates` is well above the token count on purpose. A solo build must already
+# fill the pool, or the six-way run would beat it for free and the ratio would
+# say nothing about contention. A count near the pool size is not enough: 24
+# crates over 18 tokens take two rounds where the ideal is 1.33, and that
+# rounding alone lifts the ratio by half. Many small crates keep the rounding
+# below a tenth of a round.
+#
+# The golden of this cell is cold: every builder compiles the whole workspace.
+# Each klon build runs under `gh klon run`, so the jobserver, the resource
+# scope, and the write fence are inside the timer; the baseline builds bare.
+[[cells]]
+name = "m12-throughput-n6"
+metric = "M12"
+profile = "p10k"
+action = "throughput"
+fixture = "rust"
+crates = 48
+functions = 150
+builders = 6
+timer = "wall: from the first build start to the last build finish of the concurrent builders"
+# `samples_ms` holds the solo builds, so `p50_ms` is `t_solo_ms`. The time
+# budget of a throughput cell guards `t_wall6_ms`, the series that the timer
+# above names; a budget on the solo median would let a concurrent run of any
+# length through. `pass_ratio` is the rule the metric exists for.
+pass_p50_ms = 300000
+pass_ratio = 0.80

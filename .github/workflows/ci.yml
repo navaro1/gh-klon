@@ -120,6 +120,16 @@ jobs:
           KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
           SUDO_ASKPASS: /bin/false
         run: cargo test --locked --test btrfs -- --nocapture
+      # C31: the exact half of M5. `btrfs fi du -s --raw` reports the exclusive
+      # extents of an idle klon, so this job is the only proof that the cell
+      # answers `btrfs-fi-du` instead of the `upper-bound` that every other
+      # filesystem gets. `KLON_TEST_BTRFS_DIR` moves the bench fixture onto the
+      # btrfs mount, so the measured trees sit there too.
+      - name: The M5 unique-byte cell on btrfs
+        env:
+          KLON_TEST_BTRFS_DIR: /mnt/klon-btrfs/work
+          SUDO_ASKPASS: /bin/false
+        run: cargo test --locked --test bench_v2 -- --nocapture the_disk_cell
       # The 100k reflink budget of 10 s. It needs a big fixture, so it runs on
       # the schedule and on demand only, like the other 100k cell.
       - name: The 100k reflink walk on xfs
