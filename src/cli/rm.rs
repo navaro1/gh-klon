@@ -217,7 +217,7 @@ pub fn remove_target(
     record.close()?;
     // Step 8: the next spare (R40). The start costs a stat, a lock probe, and
     // one spawn, well inside the 100 ms budget of R8.
-    spare::start_after(golden, spare::configured_depth(golden), no_spare);
+    spare::start_after(golden, spare::configured_depth(golden), no_spare, None);
     Ok(trash)
 }
 

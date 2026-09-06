@@ -643,3 +643,31 @@ fn assert_untracked_cache_is_used(klon_path: &Path, trace: &Path) {
          GIT_FORCE_UNTRACKED_CACHE=1. Counters: {counters:?}"
     );
 }
+
+/// G1 review: an untracked file in golden whose name is not UTF-8. The status
+/// that names the paths for `git clean` is read as bytes, so the `add` still
+/// succeeds and the klon does not hold the file.
+#[test]
+fn add_cleans_an_untracked_file_whose_name_is_not_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let fx = Fixture::generate(SEED, 200, 10, 20, 20);
+    let name = OsStr::from_bytes(b"junk-\xff.txt");
+    // APFS and HFS+ refuse a file name that is not valid UTF-8 and return
+    // EILSEQ. The case this test covers cannot arise on such a filesystem,
+    // so the test skips instead of failing (spec section 5).
+    if let Err(err) = fs::write(fx.golden.join(name), "untracked in golden\n") {
+        println!("skip: this filesystem refuses a file name that is not UTF-8: {err}");
+        return;
+    }
+
+    let out = klon(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon_path = fx.default_klon_path();
+    assert_clean(&klon_path);
+    assert!(
+        !klon_path.join(name).exists(),
+        "git clean removes the untracked file with the odd name"
+    );
+    assert!(fx.golden.join(name).exists(), "golden keeps its file");
+}

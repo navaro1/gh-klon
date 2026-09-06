@@ -24,6 +24,7 @@ mod repair;
 mod space;
 mod spare;
 mod time;
+mod untracked;
 mod volume;
 mod warm;
 
