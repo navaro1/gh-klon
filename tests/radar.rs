@@ -74,11 +74,13 @@ fn line_for(text: &str, branch: &str) -> String {
 /// The three radar columns of a `list` or `sync --check` line, as
 /// `(vs-base, vs-siblings, behind)`.
 fn columns(line: &str) -> (String, String, String) {
-    let mut parts = line.split(" | ");
-    let _head = parts.next().unwrap_or_default();
-    let vs_base = parts.next().unwrap_or_default().to_string();
-    let vs_siblings = parts.next().unwrap_or_default().to_string();
-    let behind = parts.next().unwrap_or_default().to_string();
+    // C30 puts five extras columns before the radar on a `list` line, and a
+    // `sync --check` line has none of them, so klon reads from the end, where
+    // the radar columns sit in both formats.
+    let mut parts: Vec<&str> = line.split(" | ").collect();
+    let behind = parts.pop().unwrap_or_default().to_string();
+    let vs_siblings = parts.pop().unwrap_or_default().to_string();
+    let vs_base = parts.pop().unwrap_or_default().to_string();
     (vs_base, vs_siblings, behind)
 }
 

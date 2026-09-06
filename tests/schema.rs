@@ -51,6 +51,15 @@ const LIST_ROW: Fields = &[
     ("locked", Ty::Bool),
     // The C16 loopback address. It is null for a klon with no `.klon/env`.
     ("ip", Ty::StrOrNull),
+    // The C30 extras. `disk_bytes` only bounds the delta when `disk_exact` is
+    // false, and `pr` and `checks` are null without a pull request or when
+    // `gh` did not answer.
+    ("disk_bytes", Ty::Num),
+    ("disk_exact", Ty::Bool),
+    ("procs", Ty::Num),
+    ("rss_bytes", Ty::Num),
+    ("pr", Ty::NumOrNull),
+    ("checks", Ty::StrOrNull),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -263,7 +272,7 @@ fn every_command_matches_its_documented_schema() {
     assert!(out.status.success(), "list failed: {}", stderr(&out));
     let list = parse(&stdout(&out));
     check_ok(&list, LIST);
-    assert_eq!(list["schema"], "klon.list/1");
+    assert_eq!(list["schema"], "klon.list/2");
     assert_eq!(list["klons"].as_array().expect("an array").len(), 1);
     check_rows(&list, "klons", LIST_ROW);
 
@@ -427,6 +436,12 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "disk_bytes": 630,
+        "disk_exact": false,
+        "procs": 0,
+        "rss_bytes": 0,
+        "pr": 7,
+        "checks": "pass",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,
@@ -442,6 +457,12 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "disk_bytes": 630,
+        "disk_exact": false,
+        "procs": 0,
+        "rss_bytes": 0,
+        "pr": Value::Null,
+        "checks": Value::Null,
         "vs_base": "-",
         "vs_siblings": "-",
         "behind": Value::Null,
@@ -455,12 +476,39 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "disk_bytes": 630,
+        "disk_exact": false,
+        "procs": 0,
+        "rss_bytes": 0,
+        "pr": 7,
+        "checks": "pass",
         "vs_base": Value::Null,
         "vs_siblings": "clean",
         "behind": 0,
     });
     let why = check(&bad_behind, LIST_ROW).expect_err("a null vs_base must fail");
     assert!(why.contains("vs_base"), "unexpected reason: {why}");
+
+    // A checks verdict is a string, never a number or null-by-typo.
+    let bad_checks = json!({
+        "path": "/tmp/x",
+        "branch": "feature",
+        "head": "0f0f",
+        "dirty": false,
+        "locked": false,
+        "ip": "127.0.0.2",
+        "disk_bytes": 630,
+        "disk_exact": false,
+        "procs": 0,
+        "rss_bytes": 0,
+        "pr": 7,
+        "checks": 1,
+        "vs_base": "clean",
+        "vs_siblings": "clean",
+        "behind": 0,
+    });
+    let why = check(&bad_checks, LIST_ROW).expect_err("a number checks must fail");
+    assert!(why.contains("checks"), "unexpected reason: {why}");
 
     let bad = json!({
         "path": Value::Null,
@@ -469,6 +517,12 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "disk_bytes": 630,
+        "disk_exact": false,
+        "procs": 0,
+        "rss_bytes": 0,
+        "pr": 7,
+        "checks": "pass",
         "vs_base": "clean",
         "vs_siblings": "clean",
         "behind": 0,

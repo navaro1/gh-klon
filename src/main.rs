@@ -6,6 +6,7 @@ mod branch;
 mod cli;
 mod config;
 mod envelope;
+mod extras;
 mod fixup;
 mod gh;
 mod git;
@@ -102,8 +103,9 @@ enum Command {
     Rm(cli::rm::Args),
     /// Drop stale worktree admin entries and drain the .trash directory.
     Prune,
-    /// List every klon with its branch, HEAD, a dirty flag, and the radar columns.
-    List,
+    /// List every klon with its branch, HEAD, a dirty flag, the cost and PR
+    /// columns, and the radar columns.
+    List(cli::list::Args),
     /// Report the host features and the open journal entries.
     Doctor(cli::doctor::Args),
     /// Convert golden into a btrfs subvolume, or move it onto a btrfs loop volume.
@@ -155,7 +157,7 @@ fn main() -> ExitCode {
         Command::Up => cli::up::run(yes),
         Command::Rm(args) => cli::rm::run(args, json),
         Command::Prune => cli::prune::run(),
-        Command::List => cli::list::run(json),
+        Command::List(args) => cli::list::run(args, json),
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Init(args) => cli::init::run(args, yes, json),
         Command::Sync(args) => cli::sync::run(args),

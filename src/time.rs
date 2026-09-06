@@ -1,5 +1,6 @@
 //! RFC 3339 timestamps in UTC. The journal, `doctor`, and the later receipt and
-//! bench chunks all record a time, so the conversion lives in one place.
+//! bench chunks all record a time, so the conversion lives in one place. The C30
+//! gh cache parses its own stamps back, so the conversion goes both ways.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +47,51 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
+/// Parse the exact form `rfc3339` writes, `YYYY-MM-DDTHH:MM:SSZ`, back into
+/// Unix seconds. klon only reads stamps of its own, so another RFC 3339 shape
+/// (an offset, a fraction, lowercase) counts as unreadable.
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let digits = |from: usize, to: usize| text.get(from..to)?.parse::<i64>().ok();
+    let year = digits(0, 4)?;
+    let month = digits(5, 7)?;
+    let day = digits(8, 10)?;
+    let hour = digits(11, 13)?;
+    let minute = digits(14, 16)?;
+    let second = digits(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// The inverse of `civil_from_days`: Howard Hinnant's `days_from_civil`, which
+/// puts the leap day at the end of a 400-year era again.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100;
+    era * 146_097 + day_of_era + day_of_year - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +128,48 @@ mod tests {
             rfc3339(UNIX_EPOCH - Duration::from_secs(1)),
             "1969-12-31T23:59:59Z"
         );
+    }
+
+    #[test]
+    fn every_written_stamp_parses_back() {
+        for secs in [
+            0u64,
+            1,
+            951_782_400,
+            1_700_000_000,
+            1_767_225_599,
+            4_107_542_400,
+        ] {
+            let text = at(secs);
+            assert_eq!(parse_rfc3339(&text), Some(secs as i64), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_stamp_klon_did_not_write_is_refused() {
+        assert_eq!(parse_rfc3339(""), None);
+        assert_eq!(parse_rfc3339("2026-09-06 10:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-09-06T10:00:00"), None);
+        assert_eq!(parse_rfc3339("2026-09-06T10:00:00+00:00"), None);
+        assert_eq!(parse_rfc3339("2026-9-06T10:00:00Z"), None);
+        assert_eq!(parse_rfc3339("not a stamp"), None);
+    }
+
+    #[test]
+    fn an_impossible_date_is_refused() {
+        assert_eq!(parse_rfc3339("2026-13-06T10:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-00-06T10:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-09-32T10:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-09-06T24:00:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-09-06T10:60:00Z"), None);
+        assert_eq!(parse_rfc3339("2026-09-06T10:00:60Z"), None);
+    }
+
+    #[test]
+    fn days_and_dates_are_inverse() {
+        for days in [-719_468i64, -1, 0, 1, 19_000, 25_000] {
+            let (year, month, day) = civil_from_days(days);
+            assert_eq!(days_from_civil(year, month, day), days, "{days}");
+        }
     }
 }
