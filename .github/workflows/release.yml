@@ -1,0 +1,140 @@
+# Release for gh-klon (spec section 7, C32, requirement R37).
+#
+# A push of a tag `v*` builds four binaries and attaches them to a release
+# under the names that `gh extension install` matches against the runner
+# platform:
+#
+#     gh-klon_v<version>_linux-amd64    x86_64-unknown-linux-gnu
+#     gh-klon_v<version>_linux-arm64    aarch64-unknown-linux-gnu
+#     gh-klon_v<version>_darwin-amd64   x86_64-apple-darwin
+#     gh-klon_v<version>_darwin-arm64   aarch64-apple-darwin
+#
+# The `build` matrix produces the four binaries. The `release` job renames
+# them to the asset names and hands them to `cli/gh-extension-precompile@v2`:
+# the action runs `script/dist.sh` as the `build_script_override`, which only
+# copies the prepared files into `dist/`, then attaches them to the release.
+# A tag with a prerelease suffix, for example `v0.1.0-rc1`, arrives with a
+# hyphen, so the action marks the release as a prerelease. The orchestrator
+# pushes `v0.1.0-rc1` after this workflow merges, and `v0.1.0` waits for the
+# release decision.
+#
+# The `install-test` job then installs the fresh release on a clean runner of
+# each operating system and runs `gh klon --version` and `gh klon doctor`.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest runner image GitHub still offers. Its glibc is the
+          # floor of the Linux binaries; older hosts build from source.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # The arm64 Linux build links with the cross toolchain instead of the
+      # host linker. The crate has no C code, so a cross gcc is enough and
+      # `cross` would only add a Docker round trip.
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install the arm64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/gh-klon
+          if-no-files-found: error
+
+  release:
+    name: attach the four binaries to the release
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: staging
+      - name: Lay the binaries out under the release asset names
+        run: |
+          set -eux
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p prepared
+          cp staging/bin-x86_64-unknown-linux-gnu/gh-klon  "prepared/gh-klon_v${version}_linux-amd64"
+          cp staging/bin-aarch64-unknown-linux-gnu/gh-klon "prepared/gh-klon_v${version}_linux-arm64"
+          cp staging/bin-x86_64-apple-darwin/gh-klon       "prepared/gh-klon_v${version}_darwin-amd64"
+          cp staging/bin-aarch64-apple-darwin/gh-klon      "prepared/gh-klon_v${version}_darwin-arm64"
+          chmod +x prepared/*
+          ls -l prepared
+      - uses: cli/gh-extension-precompile@v2
+        with:
+          build_script_override: script/dist.sh
+
+  install-test:
+    name: install from the release (${{ matrix.os }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install the extension from the fresh release
+        run: |
+          set -eux
+          # The API answers /releases/latest with the newest stable release
+          # only, so a tag with a prerelease suffix pins the install to its
+          # own tag. A stable tag takes the default path.
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            gh extension install navaro1/gh-klon@"$GITHUB_REF_NAME"
+          else
+            gh extension install navaro1/gh-klon
+          fi
+          gh klon --version
+      - name: gh klon doctor exits 0
+        run: |
+          set -eux
+          mkdir -p "$HOME/doctor-check"
+          cd "$HOME/doctor-check"
+          git init -q
+          git -c user.email=ci@example.com -c user.name=ci commit -q --allow-empty -m init
+          gh klon doctor
