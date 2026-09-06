@@ -12,7 +12,9 @@
 use crate::{Error, Result};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -40,6 +42,7 @@ pub struct Args {
 /// kills it when the parent exits, and the parent's pid survives the exec of
 /// the command, so the listener stops exactly when the command stops. The
 /// listener runs unfenced, like pasta: it is plumbing, not the command.
+#[cfg(target_os = "linux")]
 fn spawn_dns_rescue(exe: &Path, bind: &std::net::SocketAddr, upstreams: &[String]) {
     if upstreams.is_empty() {
         return;
@@ -66,6 +69,10 @@ fn spawn_dns_rescue(exe: &Path, bind: &std::net::SocketAddr, upstreams: &[String
         eprintln!("klon: cannot start the DNS rescue listener: {err}");
     }
 }
+
+/// No namespaces on this platform, so no rescue listener either.
+#[cfg(not(target_os = "linux"))]
+fn spawn_dns_rescue(_exe: &Path, _bind: &std::net::SocketAddr, _upstreams: &[String]) {}
 
 pub fn run(args: Args) -> Result<()> {
     if let (Some(bind), true) = (args.dns_rescue, !args.dns_upstream.is_empty()) {
