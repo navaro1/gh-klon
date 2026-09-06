@@ -145,8 +145,11 @@ fn the_probe_answer_is_cached_and_refreshed() {
         second["backend_reason"]
     );
 
-    // The refresh flag probes again and overwrites the forged reason.
+    // The refresh flag probes again and overwrites the forged reason. The
+    // answer must equal the first one: a reason that changes between two probes
+    // of one host would make the cache disagree with itself.
     let third = doctor(&fx.golden, &[("KLON_PROBE_REFRESH", OsStr::new("1"))]);
+    assert_eq!(third["backend"], first["backend"]);
     assert_eq!(third["backend_reason"], first["backend_reason"]);
 
     // `--repair` also refreshes.
@@ -154,6 +157,7 @@ fn the_probe_answer_is_cached_and_refreshed() {
     let out = klon(&fx.golden, &["doctor", "--json", "--repair"]);
     assert!(out.status.success(), "doctor failed: {}", stderr(&out));
     let fourth = parse(&stdout(&out));
+    assert_eq!(fourth["backend"], first["backend"]);
     assert_eq!(fourth["backend_reason"], first["backend_reason"]);
 }
 

@@ -25,9 +25,13 @@ use std::time::Duration;
 /// The format version of `probe.json`. An unknown version fails closed.
 pub const PROBE_VERSION: u32 = 1;
 
-/// What one clone cost. C8 (`bench`) reads it and `probe` prints it.
+/// What one clone cost.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
+    /// How long the clone took. C8 (`bench`) reads it for the M1 cell. The
+    /// probe must not print it: its detail becomes the cached selection reason,
+    /// which has to stay the same for one host.
+    #[allow(dead_code)]
     pub duration: Duration,
     /// Every entry the clone created: files, directories, and symlinks.
     pub entries: u64,
@@ -468,6 +472,22 @@ mod tests {
         let golden = golden_in(&tmp);
         let status = copy::Copy.probe(&golden);
         assert!(status.present(), "copy must pass the probe: {status:?}");
+    }
+
+    /// The detail of a passing probe becomes the cached selection reason when
+    /// klon rejected no backend above it. Two probes of one host must therefore
+    /// give the same text: no timing, no counter that moves.
+    #[test]
+    fn a_passing_probe_gives_the_same_detail_every_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = golden_in(&tmp);
+        let first = copy::Copy.probe(&golden);
+        let second = copy::Copy.probe(&golden);
+        assert_eq!(
+            first.detail(),
+            second.detail(),
+            "the probe detail must not carry a measurement"
+        );
     }
 
     /// R5 plus the C5 acceptance line: a backend that drops a file is never

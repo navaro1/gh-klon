@@ -65,10 +65,11 @@ fn attempt(backend: &dyn Backend, dir: &Path) -> Result<probe::Status> {
             "probe failed: the clone shares an inode with the source: {why}"
         )));
     }
+    // The detail becomes the cached selection reason, so it must not carry a
+    // measurement: two probes of one host would then disagree for no reason.
     Ok(probe::Status::Present(format!(
-        "the fixture clone matched: {} entries in {} ms",
-        timing.entries,
-        timing.duration.as_millis()
+        "the fixture clone matched: {} entries",
+        timing.entries
     )))
 }
 
