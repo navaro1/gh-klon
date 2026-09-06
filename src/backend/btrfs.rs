@@ -78,7 +78,13 @@ impl Backend for BtrfsSnapshot {
         // The snapshot copied every path, golden's `.git` directory included.
         // `add` writes a `.git` file at that path next, and R3 keeps `.git` out
         // of a klon, so the excluded paths are removed from the copy.
-        let entries = prune(dst, src, dst, excludes)?;
+        let mut walk = Walk {
+            src_root: src,
+            dst_root: dst,
+            device: device_of(src)?,
+            excludes,
+        };
+        let entries = walk.prune(dst)?;
         Ok(Timing {
             duration: started.elapsed(),
             entries,
@@ -307,46 +313,98 @@ fn clear_destination(dst: &Path) -> Result<()> {
     fs::remove_dir(dst).map_err(Error::io(format!("delete {}", dst.display())))
 }
 
-/// Remove every excluded path from the finished snapshot and count what stays.
-///
-/// A snapshot copies the whole subvolume, so the exclusions apply as deletions.
-/// The walk maps each path in the snapshot back to its source path, because
-/// `Exclusions` answers for golden's paths. A directory that loses a child gets
-/// its source mtime back, so the manifest of the klon still equals golden's.
-fn prune(dir: &Path, src_root: &Path, dst_root: &Path, excludes: &Exclusions) -> Result<u64> {
-    let mut kept = 0u64;
-    let mut removed_here = false;
-    let entries = fs::read_dir(dir).map_err(Error::io(format!("read {}", dir.display())))?;
-    for entry in entries {
-        let entry = entry.map_err(Error::io(format!("read {}", dir.display())))?;
-        let path = entry.path();
-        let meta =
-            fs::symlink_metadata(&path).map_err(Error::io(format!("stat {}", path.display())))?;
-        let is_dir = meta.is_dir();
-        let source = match path.strip_prefix(dst_root) {
-            Ok(rel) => src_root.join(rel),
-            Err(_) => return Err(Error::klon("the prune walk left the snapshot")),
-        };
-        if excludes.excludes(&source, is_dir) {
-            remove(&path, is_dir)?;
-            removed_here = true;
-            continue;
+/// The state of the walk that finishes a snapshot.
+struct Walk<'a> {
+    src_root: &'a Path,
+    dst_root: &'a Path,
+    /// The device number of the source subvolume. A child with another one is
+    /// a nested subvolume, which a snapshot does not copy.
+    device: u64,
+    excludes: &'a Exclusions,
+}
+
+impl Walk<'_> {
+    /// Remove every excluded path from the finished snapshot and count what
+    /// stays.
+    ///
+    /// A snapshot copies the whole subvolume, so the exclusions apply as
+    /// deletions. The walk maps each path in the snapshot back to its source
+    /// path, because `Exclusions` answers for golden's paths. A directory that
+    /// loses a child gets its source mtime back, so the manifest of the klon
+    /// still equals golden's.
+    fn prune(&mut self, dir: &Path) -> Result<u64> {
+        let mut kept = 0u64;
+        let mut removed_here = false;
+        let entries = fs::read_dir(dir).map_err(Error::io(format!("read {}", dir.display())))?;
+        for entry in entries {
+            let entry = entry.map_err(Error::io(format!("read {}", dir.display())))?;
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path)
+                .map_err(Error::io(format!("stat {}", path.display())))?;
+            let is_dir = meta.is_dir();
+            let source = self.source_of(&path)?;
+            if self.excludes.excludes(&source, is_dir) {
+                remove(&path, is_dir)?;
+                removed_here = true;
+                continue;
+            }
+            if is_dir {
+                self.refuse_nested_subvolume(&source)?;
+            }
+            kept += 1;
+            if is_dir {
+                kept += self.prune(&path)?;
+            }
         }
-        kept += 1;
-        if is_dir {
-            kept += prune(&path, src_root, dst_root, excludes)?;
+        if removed_here {
+            let source = self.source_of(dir)?;
+            if let Ok(meta) = fs::symlink_metadata(&source) {
+                super::set_times(dir, &meta)?;
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The source path of one path in the snapshot.
+    fn source_of(&self, path: &Path) -> Result<PathBuf> {
+        match path.strip_prefix(self.dst_root) {
+            Ok(rel) => Ok(self.src_root.join(rel)),
+            Err(_) => Err(Error::klon("the prune walk left the snapshot")),
         }
     }
-    if removed_here {
-        let source = match dir.strip_prefix(dst_root) {
-            Ok(rel) => src_root.join(rel),
-            Err(_) => return Err(Error::klon("the prune walk left the snapshot")),
+
+    /// Refuse a source directory that is a subvolume of its own.
+    ///
+    /// A snapshot of a subvolume does not descend into a nested subvolume: it
+    /// leaves an empty directory in its place. The klon would then silently
+    /// lose everything under that path, which R3 forbids. klon cannot list the
+    /// nested subvolumes in advance, because `btrfs subvolume list` needs root
+    /// (S1 §7), so the walk answers with the device number it already reads.
+    fn refuse_nested_subvolume(&self, source: &Path) -> Result<()> {
+        let found = match device_of(source) {
+            Ok(device) => device,
+            // The source moved on while the walk read the snapshot. The
+            // snapshot still holds what the source had, so there is nothing to
+            // refuse.
+            Err(_) => return Ok(()),
         };
-        if let Ok(meta) = fs::symlink_metadata(&source) {
-            super::set_times(dir, &meta)?;
+        if found == self.device {
+            return Ok(());
         }
+        Err(Error::klon(format!(
+            "{} is a nested btrfs subvolume, and a snapshot leaves it empty. \
+             Exclude it in .klonignore, or pass --backend reflink-walk.",
+            source.display()
+        )))
     }
-    Ok(kept)
+}
+
+/// The device number of `path`.
+fn device_of(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .map(|meta| meta.dev())
+        .map_err(Error::io(format!("stat {}", path.display())))
 }
 
 /// Delete one pruned path. A nested subvolume cannot be removed with `rmdir`

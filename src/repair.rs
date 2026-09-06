@@ -99,7 +99,11 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
         },
         // C15 adds the `--volume` tail on top of this one.
         Op::Init => {
-            init(&entry.path, entry.state, &mut actions)?;
+            if let Some(why) = init(&entry.path, entry.state, &mut actions)? {
+                // The report still prints, and the entry waits for another
+                // attempt. Every other operation ends the same way.
+                return Ok(Outcome::open(actions, why));
+            }
             // `init` keeps its journal inside golden, and the repair may have
             // just renamed golden back under the caller's feet. The entry is
             // therefore removed from the common directory the caller resolved
@@ -139,21 +143,23 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
 ///
 /// Every delete is the detached background delete, so a repair returns at once
 /// and a second run finds nothing left to do.
-fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
+fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<Option<Error>> {
     let old = cli_init::sibling(golden, cli_init::OLD_SUFFIX)?;
     if !golden.exists() {
         if state != State::Swapped || !old.exists() {
-            return Err(Error::klon(format!(
+            return Ok(Some(Error::klon(format!(
                 "init left no directory at {} and none at {}; klon cannot repair that",
                 golden.display(),
                 old.display()
-            )));
+            ))));
         }
-        fs::rename(&old, golden).map_err(Error::io(format!(
-            "rename {} back to {}",
-            old.display(),
-            golden.display()
-        )))?;
+        if let Err(err) = fs::rename(&old, golden) {
+            return Ok(Some(Error::io(format!(
+                "rename {} back to {}",
+                old.display(),
+                golden.display()
+            ))(err)));
+        }
         actions.push(format!(
             "renamed {} back to {}",
             old.display(),
@@ -167,17 +173,25 @@ fn init(golden: &Path, state: State, actions: &mut Vec<String>) -> Result<()> {
         process::spawn_background_delete(&path)?;
         actions.push(format!("started the delete of {}", path.display()));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Every `init` leftover beside golden that still exists.
 ///
 /// The staging copies carry an exact name. The replaced golden carries
 /// `<golden>.klon-old`, or `<golden>.klon-old.<pid>.<n>` once `init` renamed it
-/// out of the way for the background delete, so that family matches by prefix.
+/// out of the way for the background delete.
+///
+/// The match is exact on all four shapes. A prefix test would also select a
+/// directory that a person made, for example `<golden>.klon-old-backup`, and
+/// `--repair` deletes what it selects.
 fn init_leftovers(golden: &Path) -> Result<Vec<PathBuf>> {
     let mut found = Vec::new();
-    for suffix in [cli_init::STAGING_SUFFIX, cli_init::PLAIN_SUFFIX] {
+    for suffix in [
+        cli_init::STAGING_SUFFIX,
+        cli_init::PLAIN_SUFFIX,
+        cli_init::OLD_SUFFIX,
+    ] {
         let path = cli_init::sibling(golden, suffix)?;
         if path.exists() {
             found.push(path);
@@ -186,7 +200,7 @@ fn init_leftovers(golden: &Path) -> Result<Vec<PathBuf>> {
     let (Some(parent), Some(name)) = (golden.parent(), golden.file_name()) else {
         return Ok(found);
     };
-    let prefix = format!("{}{}", name.to_string_lossy(), cli_init::OLD_SUFFIX);
+    let prefix = format!("{}{}.", name.to_string_lossy(), cli_init::OLD_SUFFIX);
     let read = match fs::read_dir(parent) {
         Ok(read) => read,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(found),
@@ -194,12 +208,30 @@ fn init_leftovers(golden: &Path) -> Result<Vec<PathBuf>> {
     };
     for item in read {
         let item = item.map_err(Error::io(format!("read {}", parent.display())))?;
-        if item.file_name().to_string_lossy().starts_with(&prefix) {
+        if is_discarded_golden(&item.file_name().to_string_lossy(), &prefix) {
             found.push(item.path());
         }
     }
     found.sort();
     Ok(found)
+}
+
+/// True for `<prefix><pid>.<n>`, the name `init` gives the replaced golden
+/// before the background delete. Both tails must be plain digits, so a
+/// directory that a person named cannot match.
+fn is_discarded_golden(name: &str, prefix: &str) -> bool {
+    let Some(tail) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    match tail.split_once('.') {
+        Some((pid, n)) => {
+            !pid.is_empty()
+                && !n.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && n.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
 }
 
 /// Unlock and remove a registered worktree, then prune. `git worktree remove`
@@ -277,4 +309,59 @@ fn is_file(path: &Path) -> bool {
 /// A git error on one line, for an action string.
 fn one_line(err: &Error) -> String {
     err.to_string().trim().replace('\n', "; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--repair` deletes what `init_leftovers` selects, so the match must
+    /// cover exactly the names `init` generates and nothing a person made.
+    #[test]
+    fn only_a_generated_name_counts_as_a_discarded_golden() {
+        let prefix = "repo.klon-old.";
+        assert!(is_discarded_golden("repo.klon-old.1234.0", prefix));
+        assert!(is_discarded_golden("repo.klon-old.7.63", prefix));
+        for other in [
+            "repo.klon-old-backup",
+            "repo.klon-old.backup",
+            "repo.klon-old.1234",
+            "repo.klon-old.1234.",
+            "repo.klon-old..0",
+            "repo.klon-old.1234.0a",
+            "repo.klon-oldish.1.2",
+            "repo.klon-old",
+        ] {
+            assert!(
+                !is_discarded_golden(other, prefix),
+                "{other} must not match"
+            );
+        }
+    }
+
+    /// The exact `<golden>.klon-old` name is still a leftover: `init` writes it
+    /// with the first rename and a kill can leave it there.
+    #[test]
+    fn the_plain_old_name_is_a_leftover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = tmp.path().join("repo");
+        fs::create_dir(&golden).unwrap();
+        for name in [
+            "repo.klon-old",
+            "repo.klon-sub",
+            "repo.klon-old.99.0",
+            "repo.klon-old-backup",
+        ] {
+            fs::create_dir(tmp.path().join(name)).unwrap();
+        }
+        let found: Vec<String> = init_leftovers(&golden)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            found,
+            vec!["repo.klon-old", "repo.klon-old.99.0", "repo.klon-sub"]
+        );
+    }
 }

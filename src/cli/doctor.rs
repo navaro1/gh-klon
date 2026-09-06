@@ -62,14 +62,17 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     } else {
         (Vec::new(), None)
     };
-    // A repaired `init` renames golden back to its own path (C7), which leaves
-    // the two paths above pointing at a directory that no longer exists. The
-    // working directory of this process followed that rename, so reading it
-    // again names the repository as it stands now. A resolution that fails
-    // keeps the old answer: the report then says what it can.
-    let (golden, common) = match args.repair && !golden.is_dir() {
-        true => resolved_again().unwrap_or((golden, common)),
-        false => (golden, common),
+    // A repaired `init` leaves the caller standing beside the repository, not
+    // in it: the command runs from `<golden>.klon-old`, which the repair either
+    // renamed back to golden or handed to a background delete. The entry of
+    // that repair names golden, so the report below describes the repository
+    // that exists now instead of the copy the caller stands in (C7).
+    let (golden, common) = match repaired_golden(args.repair, &found) {
+        Some(path) => {
+            let common = git::common_dir_of_main(&path).unwrap_or(common);
+            (path, common)
+        }
+        None => (golden, common),
     };
     // The array always shows the state after the repair, and `repaired` shows
     // what changed. An entry that the repair could not close is still listed.
@@ -125,11 +128,17 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     }
 }
 
-/// Golden and the common directory, read from the working directory again.
-/// `run` calls it after a repair moved golden.
-fn resolved_again() -> Option<(PathBuf, PathBuf)> {
-    let cwd = std::env::current_dir().ok()?;
-    Some((git::main_worktree(&cwd).ok()?, git::common_dir(&cwd).ok()?))
+/// Golden's path from a repaired `init` entry, when that path holds a
+/// directory now. `entry.path` of an `init` entry is golden itself.
+fn repaired_golden(repaired: bool, entries: &[Entry]) -> Option<PathBuf> {
+    if !repaired {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|entry| entry.op == Op::Init)
+        .map(|entry| entry.path.clone())
+        .filter(|path| path.is_dir())
 }
 
 /// Repair every entry and collect one row per action. The answer holds the

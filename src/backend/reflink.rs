@@ -64,8 +64,25 @@ impl Backend for Reflink {
     }
 
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing> {
-        copy_tree(src, dst, &|path, is_dir| excludes.excludes(path, is_dir))
+        copy_tree(
+            src,
+            dst,
+            &|path, is_dir| excludes.excludes(path, is_dir),
+            OnSpecial::Skip,
+        )
     }
+}
+
+/// What the walk does with an entry that `FICLONE` cannot copy: a FIFO, a
+/// socket, or a device node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnSpecial {
+    /// Print one line and go on. A klon is a second copy, so a lost socket
+    /// costs nothing that the source does not still hold.
+    Skip,
+    /// Fail. `gh klon init` replaces golden with the copy and deletes the
+    /// original, so a path the copy left out would be the only one left.
+    Refuse,
 }
 
 /// Clone every child of `src` into the existing directory `dst`, with the modes
@@ -75,10 +92,15 @@ impl Backend for Reflink {
 /// `Backend::clone` passes the `Exclusions` of `add`. `gh klon init` (C7) passes
 /// its own rule, because it must copy golden's `.git` directory, which every
 /// klon leaves out (R3).
-pub fn copy_tree(src: &Path, dst: &Path, skip: &dyn Fn(&Path, bool) -> bool) -> Result<Timing> {
+pub fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    skip: &dyn Fn(&Path, bool) -> bool,
+    on_special: OnSpecial,
+) -> Result<Timing> {
     let started = Instant::now();
     let mut plan = Plan::default();
-    collect(src, dst, skip, &mut plan)?;
+    collect(src, dst, skip, on_special, &mut plan)?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(WORKERS)
         .build()
@@ -126,6 +148,7 @@ fn collect(
     src: &Path,
     dst: &Path,
     skip: &dyn Fn(&Path, bool) -> bool,
+    on_special: OnSpecial,
     plan: &mut Plan,
 ) -> Result<()> {
     let entries = match fs::read_dir(src) {
@@ -164,11 +187,17 @@ fn collect(
                 from: from.clone(),
                 to: to.clone(),
             });
-            collect(&from, &to, skip, plan)?;
+            collect(&from, &to, skip, on_special, plan)?;
         } else if kind.is_file() {
             plan.files.push(Pair { from, to });
-        } else {
+        } else if on_special == OnSpecial::Skip {
             eprintln!("klon: skip special file {}", from.display());
+        } else {
+            return Err(Error::klon(format!(
+                "{} is a FIFO, a socket, or a device node, which klon cannot copy. \
+                 Remove it, then run the command again.",
+                from.display()
+            )));
         }
     }
     Ok(())
@@ -400,5 +429,47 @@ mod tests {
         }
         let other = std::io::Error::from_raw_os_error(libc::ENOSPC);
         assert!(matches!(classify(&other), Trial::Failed(_)));
+    }
+
+    /// `OnSpecial::Refuse` must stop before the walk creates anything, because
+    /// `init` deletes the source after the copy. `Skip` keeps the old behaviour
+    /// for a klon, which is a second copy of a tree that stays.
+    #[test]
+    fn a_fifo_stops_a_strict_copy_and_not_a_klon_clone() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("plain.txt"), b"content\n").unwrap();
+        let fifo = CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and the mode is a plain constant.
+        let rc = unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) };
+        if rc != 0 {
+            println!("skipped: this host refused mkfifo");
+            return;
+        }
+        let keep_all = |_: &Path, _: bool| false;
+
+        let strict = tmp.path().join("strict");
+        fs::create_dir(&strict).unwrap();
+        let err = copy_tree(&src, &strict, &keep_all, OnSpecial::Refuse)
+            .expect_err("a strict copy must refuse a FIFO");
+        assert!(
+            err.to_string().contains("FIFO"),
+            "the error must name the shape: {err}"
+        );
+
+        let lenient = tmp.path().join("lenient");
+        fs::create_dir(&lenient).unwrap();
+        match copy_tree(&src, &lenient, &keep_all, OnSpecial::Skip) {
+            Ok(_) => assert!(!lenient.join("pipe").exists(), "the FIFO stays out"),
+            // ext4 answers no `FICLONE`, so the plain file cannot be cloned
+            // here. The walk still proved that it did not refuse the FIFO.
+            Err(err) => assert!(
+                err.to_string().contains("reflink"),
+                "only a clone failure is expected: {err}"
+            ),
+        }
     }
 }
