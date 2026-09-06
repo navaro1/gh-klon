@@ -3,6 +3,7 @@
 mod backend;
 mod bench;
 mod branch;
+mod budget;
 mod cli;
 mod config;
 mod envelope;
@@ -10,6 +11,7 @@ mod extras;
 mod fixup;
 mod gh;
 mod git;
+mod hibernate;
 mod hooks;
 mod journal;
 mod paths;
@@ -113,6 +115,10 @@ enum Command {
     Doctor(cli::doctor::Args),
     /// Convert golden into a btrfs subvolume, or move it onto a btrfs loop volume.
     Init(cli::init::Args),
+    /// Save a klon's work in the object store and give its directory back.
+    Hibernate(cli::hibernate::Args),
+    /// Put a hibernated klon back at its path with its work restored.
+    Wake(cli::wake::Args),
     /// Bring a klon up to date: fetch, then fast-forward, rebase, or merge.
     Sync(cli::sync::Args),
     /// Land a klon's branch in base, then remove the klon. Never pushes.
@@ -169,6 +175,8 @@ fn main() -> ExitCode {
         Command::List(args) => cli::list::run(args, json),
         Command::Doctor(args) => cli::doctor::run(args, json),
         Command::Init(args) => cli::init::run(args, yes, json),
+        Command::Hibernate(args) => cli::hibernate::run(args, json),
+        Command::Wake(args) => cli::wake::run(args, yes, json),
         Command::Sync(args) => cli::sync::run(args, yes, json),
         Command::Merge(args) => cli::merge::run(args, yes, json),
         Command::Pr(args) => cli::pr::run(args),

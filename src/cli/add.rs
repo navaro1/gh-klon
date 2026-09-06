@@ -6,7 +6,7 @@ use crate::backend::{self, copy, Backend, Exclusions};
 use crate::branch;
 use crate::envelope::{env, slots};
 use crate::journal::{self, State};
-use crate::{config, fixup, git, hooks, paths, repair, space, spare, warm, Error, Result};
+use crate::{budget, config, fixup, git, hooks, paths, repair, space, spare, warm, Error, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ impl Steps {
 /// The JSON schema name. A field removal or a type change bumps the suffix.
 pub const SCHEMA: &str = "klon.add/1";
 
-#[derive(clap::Args)]
+#[derive(clap::Args, Default)]
 pub struct Args {
     /// A local branch, an `origin/<name>` remote branch, or the name of a
     /// new branch that klon creates from `base`.
@@ -80,6 +80,16 @@ pub struct Args {
     /// Skip the hot spare for this call: clone directly and start no builder.
     #[arg(long)]
     pub no_spare: bool,
+    /// Hibernate the least recently used klon when `disk_budget` would refuse
+    /// this one (C29). Without it `add` names the candidate and stops.
+    #[arg(long)]
+    pub evict: bool,
+    /// Skip the `disk_budget` gate (C29). It is off the command line and set
+    /// by the two commands that rebuild a klon the budget already counted:
+    /// `gh klon wake` and `sync --fresh`. A gate there could also cascade, so
+    /// that a `wake` of A hibernates B and a `wake` of B hibernates A.
+    #[arg(skip)]
+    pub no_budget: bool,
     /// A command to run in the new klon, after `--`. `add` runs it through
     /// `run` and exits with its exit code.
     #[arg(last = true, num_args = 1.., allow_hyphen_values = true)]
@@ -189,7 +199,33 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
         .first()
         .map(|w| paths::absolute(&w.path))
         .ok_or_else(|| Error::klon("not inside a git repository"))??;
-    // The branch form is resolved first: it names the default klon path and
+    // One load: the path template, the `[fixup] skip` globs, and the disk
+    // budget come from the same file, and a second load would repeat its
+    // warning lines.
+    let config = config::load(&golden)?;
+    // The `disk_budget` gate (R28). It is the first step of the transaction,
+    // ahead of the branch form below, which creates a branch for a new name: a
+    // refusal must change nothing at all, and a created branch is a change.
+    // The free-space check of R41 sits later, because it needs the destination
+    // and the backend; this one needs neither. An eviction hibernates one klon
+    // and changes the register list, so the list is read again.
+    let worktrees = match args.no_budget {
+        true => worktrees,
+        false => {
+            match budget::check(
+                &golden,
+                &common,
+                &config,
+                &worktrees,
+                likely_branch(&args).as_deref(),
+                args.evict,
+            )? {
+                true => git::worktree_list(&cwd)?,
+                false => worktrees,
+            }
+        }
+    };
+    // The branch form is resolved next: it names the default klon path and
     // may create the branch (handoff §4, git DWIM). The claude mode renames
     // the branch first: the argument is the worktree name (research §19).
     let branch = match args.path_mode {
@@ -203,9 +239,14 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
         }
         _ => resolve_branch(&golden, &args)?,
     };
-    // One load: the path template and the `[fixup] skip` globs come from the
-    // same file, and a second load would repeat its warning lines.
-    let config = config::load(&golden)?;
+    // A hibernated branch owns a path and a saved commit (C29). A plain `add`
+    // of it would build a second klon over that path and hide the work, so it
+    // refuses and names the command that brings the klon back.
+    if !args.no_budget && crate::hibernate::read(&common, &branch)?.is_some() {
+        return Err(Error::klon(format!(
+            "branch {branch} is hibernated; run gh klon wake {branch} to bring its klon back"
+        )));
+    }
     let use_spare = spare::enabled(config.spare, args.no_spare);
     let path = match &args.path {
         Some(p) => paths::absolute(p)?,
@@ -371,6 +412,53 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
         branch,
         warming,
     })
+}
+
+/// The `add` that `gh klon wake` runs (C29): the whole transaction, at the
+/// path the hibernate record names, with the hot spare allowed.
+///
+/// `wake` goes through `spawn` instead of a private copy, so a hibernated klon
+/// comes back with the same journal entry, the same backend, the same envelope,
+/// and the same loopback address as any other klon. `spawn` prints nothing, so
+/// `wake` owns the report. The `Args` are built here, beside the struct, so a
+/// new field cannot be forgotten.
+pub fn add_at(branch: &str, path: &Path, yes: bool, json: bool) -> Result<Spawned> {
+    spawn(
+        Args {
+            branch: Some(branch.to_string()),
+            path: Some(path.to_path_buf()),
+            no_budget: true,
+            ..Args::default()
+        },
+        yes,
+        json,
+    )
+}
+
+/// The branch this `add` will claim, read from the arguments alone, before the
+/// branch form resolves and possibly creates one. None when the form gives no
+/// certain answer: `--issue` names a branch klon builds from the issue title,
+/// and that is always a new one.
+///
+/// The budget (C29) needs the name for two rules. It must not offer the klon of
+/// that branch as an eviction candidate, and it must not evict at all when that
+/// branch is already checked out, because the `add` then ends a few steps later
+/// and a klon hibernated in between would be a klon lost for nothing.
+///
+/// The answer is exact, never a guess, because the budget refuses on it. Every
+/// form here resolves to this name: `branch::resolve` takes a local branch
+/// under its own name, and an `origin/<name>` argument under `<name>`. A form
+/// this function does not know gives None, and `refuse_checked_out` after the
+/// branch form still catches it.
+fn likely_branch(args: &Args) -> Option<String> {
+    if let Some(n) = args.pr {
+        return Some(format!("pr/{n}"));
+    }
+    let raw = args.branch.as_deref()?;
+    match args.path_mode {
+        Some(config::PathMode::Claude) => Some(format!("worktree-{raw}")),
+        _ => Some(raw.strip_prefix("origin/").unwrap_or(raw).to_string()),
+    }
 }
 
 /// Close an open journal entry for this destination (R6, handoff §7). The

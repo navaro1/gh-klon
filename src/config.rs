@@ -48,8 +48,7 @@ impl PathMode {
     }
 }
 
-/// What `add` does when a klon would cross the disk budget. Read by the budget chunk.
-#[allow(dead_code)]
+/// What `add` does when a klon would cross the disk budget (C29).
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetAction {
@@ -139,11 +138,10 @@ pub struct Config {
     pub base: Option<String>,
     /// The path template for new klons.
     pub path: Option<String>,
-    /// Above this size `add` applies `disk_budget_action`. Read by the budget chunk.
-    #[allow(dead_code)]
+    /// Above this size `add` applies `disk_budget_action` (C29). A number with
+    /// an optional K, M, G, or T, for example "40G".
     pub disk_budget: Option<String>,
-    /// `refuse` or `hibernate`. Read by the budget chunk.
-    #[allow(dead_code)]
+    /// `refuse` or `hibernate` (C29).
     pub disk_budget_action: Option<BudgetAction>,
     /// Hot-spare pool depth (C9). `0` disables the spare; v0 knows one depth.
     pub spare: Option<u32>,

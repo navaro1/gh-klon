@@ -3,6 +3,7 @@
 pub mod add;
 pub mod bench;
 pub mod doctor;
+pub mod hibernate;
 pub mod init;
 pub mod init_volume;
 pub mod list;
@@ -16,4 +17,5 @@ pub mod spare_build;
 pub mod stop;
 pub mod sync;
 pub mod up;
+pub mod wake;
 pub mod warm;

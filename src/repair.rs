@@ -7,7 +7,7 @@
 
 use crate::cli::init as cli_init;
 use crate::journal::{self, Entry, Op, State};
-use crate::{git, paths, process, Error, Result};
+use crate::{git, hibernate, paths, process, Error, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -70,30 +70,21 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
             }
             // `add` wrote `ready` and stopped before it deleted the entry.
             State::Ready => actions.push("the klon is complete".to_string()),
-            // `add` writes none of these: `removing` belongs to `rm`, and
-            // `attached`, `copied`, and `swapped` belong to `init`.
-            State::Removing | State::Attached | State::Copied | State::Swapped => {
-                actions.push("add never reaches this state".to_string())
-            }
+            // `add` writes none of these: `removing` belongs to `rm` and to
+            // `hibernate`, `saved` and `restored` to `hibernate` and `wake`,
+            // and `attached`, `copied`, and `swapped` to `init`.
+            State::Removing
+            | State::Saved
+            | State::Restored
+            | State::Attached
+            | State::Copied
+            | State::Swapped => actions.push("add never reaches this state".to_string()),
         },
         Op::Rm => match entry.state {
             // Finish the `rm` tail. A trash copy that still holds a `.git` file
             // would keep the dead worktree alive for git, and a copy with no
             // background delete would sit in the trash until the next `prune`.
-            State::Removing => {
-                for copy in trash_copies(golden, &entry.path)? {
-                    let file = copy.join(".git");
-                    if is_file(&file) {
-                        fs::remove_file(&file)
-                            .map_err(Error::io(format!("delete {}", file.display())))?;
-                        actions.push(format!("deleted the .git file in {}", copy.display()));
-                    }
-                    process::spawn_background_delete(&copy)?;
-                    actions.push(format!("started the delete of {}", copy.display()));
-                }
-                git::run(golden, &["worktree", "prune"])?;
-                actions.push("pruned the worktree list".to_string());
-            }
+            State::Removing => finish_removal(golden, &entry.path, &mut actions)?,
             // `rm` stopped before the rename, so the klon is untouched.
             _ => actions.push("rm changed nothing; the klon stays".to_string()),
         },
@@ -113,6 +104,50 @@ pub fn entry(golden: &Path, common: &Path, entry: &Entry) -> Result<Outcome> {
              it holds"
                 .to_string(),
         ),
+        // C29. `hibernate` saves the work first and removes the tree after,
+        // through `rm`'s own removal, which writes its own entry beside this
+        // one and repairs its own tail through the `rm` arm above.
+        Op::Hibernate => match entry.state {
+            // The save never finished, so nothing on the ref is worth keeping.
+            State::Planned => {
+                discard_hibernation(golden, common, entry, &mut actions)?;
+                actions.push("the klon stays".to_string());
+            }
+            // The state spans the removal. A path that git still knows and that
+            // still holds a directory says the removal never started: the klon
+            // is whole, and the whole command rolls back. Anything else says it
+            // ran, and the klon stays hibernated.
+            State::Saved => {
+                if git::is_registered(golden, &entry.path) && entry.path.exists() {
+                    discard_hibernation(golden, common, entry, &mut actions)?;
+                    actions.push("the removal never started; the klon stays".to_string());
+                } else {
+                    actions.push("the klon stays hibernated".to_string());
+                }
+            }
+            _ => actions.push("hibernate never reaches this state".to_string()),
+        },
+        // C29. The `wake` entry covers the whole command, its own `add`
+        // included. It carries a file name of its own, so the entry of that
+        // `add` sits beside it instead of over it.
+        Op::Wake => match entry.state {
+            // The restore did not finish, or the `add` did not. The saved
+            // commit still holds every byte, so the safe answer is to remove
+            // the half-made klon and leave the branch hibernated. The next
+            // `gh klon wake` starts over from the record.
+            State::Planned => {
+                if let Some(why) = unregister(golden, &entry.path, &mut actions) {
+                    return Ok(Outcome::open(actions, why));
+                }
+                if let Err(err) = crate::envelope::slots::release(common, &entry.path) {
+                    eprintln!("klon: repair: {err}");
+                }
+                actions.push("the klon stays hibernated".to_string());
+            }
+            // The tree is whole. Only the record and the ref are left.
+            State::Restored => discard_hibernation(golden, common, entry, &mut actions)?,
+            _ => actions.push("wake never reaches this state".to_string()),
+        },
         Op::Init => {
             // C15: `init --volume` moves golden onto a loop volume, so its
             // tail names an image and a mount point that no path beside golden
@@ -414,6 +449,40 @@ fn is_discarded_golden(name: &str, prefix: &str) -> bool {
         }
         None => false,
     }
+}
+
+/// Drop the hibernate record and the ref of one entry's branch (C29). An entry
+/// with no branch names no record, so there is nothing to drop.
+fn discard_hibernation(
+    golden: &Path,
+    common: &Path,
+    entry: &Entry,
+    actions: &mut Vec<String>,
+) -> Result<()> {
+    let Some(branch) = &entry.branch else {
+        return Ok(());
+    };
+    hibernate::discard(golden, common, &hibernate::name_for(branch))?;
+    actions.push(format!("dropped the hibernate record and ref of {branch}"));
+    Ok(())
+}
+
+/// Finish the tail that `rm` and `hibernate` share. A trash copy that still
+/// holds a `.git` file would keep the dead worktree alive for git, and a copy
+/// with no background delete would sit in the trash until the next `prune`.
+fn finish_removal(golden: &Path, path: &Path, actions: &mut Vec<String>) -> Result<()> {
+    for copy in trash_copies(golden, path)? {
+        let file = copy.join(".git");
+        if is_file(&file) {
+            fs::remove_file(&file).map_err(Error::io(format!("delete {}", file.display())))?;
+            actions.push(format!("deleted the .git file in {}", copy.display()));
+        }
+        process::spawn_background_delete(&copy)?;
+        actions.push(format!("started the delete of {}", copy.display()));
+    }
+    git::run(golden, &["worktree", "prune"])?;
+    actions.push("pruned the worktree list".to_string());
+    Ok(())
 }
 
 /// Unlock and remove a registered worktree, then prune. `git worktree remove`

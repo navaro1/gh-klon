@@ -30,6 +30,10 @@ pub enum Op {
     /// golden's history moves. git owns the recovery of an interrupted merge,
     /// so the repair only reports the entry (see `repair::entry`).
     Merge,
+    /// `gh klon hibernate`, added in C29.
+    Hibernate,
+    /// `gh klon wake`, added in C29.
+    Wake,
 }
 
 /// The step of the transaction that completed last. The order is the order of
@@ -52,8 +56,16 @@ pub enum State {
     CheckedOut,
     /// `git worktree unlock` ran. The klon is complete.
     Ready,
-    /// `rm` is about to rename the klon into `.trash`.
+    /// `rm`, or the tail of `hibernate`, is about to rename the klon into
+    /// `.trash`. The state is written **before** the rename, so a repair can
+    /// finish the tail instead of guessing which half of it ran.
     Removing,
+    /// `hibernate` wrote the work commit, the hibernate ref, and the record.
+    /// The klon is still on disk, so a repair rolls the whole command back.
+    Saved,
+    /// `wake` restored the working tree of a hibernated klon. Only the
+    /// deletion of the record and the ref is left, so a repair finishes it.
+    Restored,
     /// `init` filled `<golden>.klon-sub` (or `<golden>.klon-plain` for
     /// `--undo`). Golden is untouched, so a repair only drops the staging copy.
     Copied,
@@ -74,6 +86,8 @@ impl State {
             State::CheckedOut => "checked-out",
             State::Ready => "ready",
             State::Removing => "removing",
+            State::Saved => "saved",
+            State::Restored => "restored",
             State::Copied => "copied",
             State::Swapped => "swapped",
         }
@@ -141,9 +155,24 @@ pub struct Record {
 impl Record {
     /// Write the first entry, in state `planned`, before the first change.
     pub fn start(common: &Path, op: Op, path: &Path, branch: Option<&str>) -> Result<Record> {
+        Record::start_as(common, &name_for(path), op, path, branch)
+    }
+
+    /// `start` with a file name of the caller's choosing (C29). `wake` runs a
+    /// whole `add` inside its own transaction, and both would key on the same
+    /// path, so `wake` takes a name of its own and the two entries stay apart.
+    pub fn start_as(
+        common: &Path,
+        name: &str,
+        op: Op,
+        path: &Path,
+        branch: Option<&str>,
+    ) -> Result<Record> {
+        let mut entry = Entry::new(op, path, branch);
+        entry.name = name.to_string();
         let record = Record {
             common: common.to_path_buf(),
-            entry: Entry::new(op, path, branch),
+            entry,
         };
         write(&record.common, &record.entry)?;
         Ok(record)
@@ -385,6 +414,8 @@ mod tests {
             State::CheckedOut,
             State::Ready,
             State::Removing,
+            State::Saved,
+            State::Restored,
             State::Copied,
             State::Swapped,
         ] {

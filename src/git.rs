@@ -1,6 +1,7 @@
 //! Subprocess wrapper around the installed `git`. klon never reimplements plumbing.
 
 use crate::{Error, Result};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +15,26 @@ pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .map_err(Error::io("run git"))?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
+    } else {
+        Err(Error::Git {
+            code: output.status.code().unwrap_or(1),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+/// Run `git -C <cwd> <args>` with extra environment variables and return its
+/// stdout. `hibernate` (C29) needs `GIT_INDEX_FILE`, which git reads from the
+/// environment only: no command line option names a second index.
+pub fn run_env(cwd: &Path, args: &[&str], envs: &[(&str, &OsStr)]) -> Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(Error::io("run git"))?;
     if output.status.success() {
         String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
     } else {

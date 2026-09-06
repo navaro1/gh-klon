@@ -67,6 +67,8 @@ const LIST_ROW: Fields = &[
     ("checks", Ty::StrOrNull),
     // The C12 warm list: the directories a detached warm process still owes.
     ("warming", Ty::Arr),
+    // C29: true for a klon that `hibernate` put away. Its directory is gone.
+    ("hibernated", Ty::Bool),
     // The C24 radar. `behind` is null when klon could not measure the klon.
     ("vs_base", Ty::Str),
     ("vs_siblings", Ty::Str),
@@ -92,6 +94,24 @@ const SYNC: Fields = &[
     ("head_before", Ty::StrOrNull),
     ("head_after", Ty::StrOrNull),
     ("message", Ty::Str),
+];
+
+/// C29. `work` names the commit that holds the saved tracked changes and the
+/// untracked files.
+const HIBERNATE: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("branch", Ty::Str),
+    ("head", Ty::Str),
+    ("work", Ty::Str),
+];
+
+/// C29.
+const WAKE: Fields = &[
+    ("schema", Ty::Str),
+    ("path", Ty::Str),
+    ("branch", Ty::Str),
+    ("head", Ty::Str),
 ];
 
 const RM: Fields = &[
@@ -386,6 +406,27 @@ fn every_command_matches_its_documented_schema() {
         assert_eq!(row["schema"], "klon.sync/1");
     }
 
+    // C29. The round trip leaves the klon where it was, so the rows below
+    // still find it.
+    let out = klon(&fx.golden, &["hibernate", "--json", "feature"]);
+    assert!(out.status.success(), "hibernate failed: {}", stderr(&out));
+    let hibernate = parse(&stdout(&out));
+    check_ok(&hibernate, HIBERNATE);
+    assert_eq!(hibernate["schema"], "klon.hibernate/1");
+    assert_eq!(hibernate["branch"], "feature");
+
+    let out = klon(&fx.golden, &["--json", "list"]);
+    let listed = parse(&stdout(&out));
+    check_rows(&listed, "klons", LIST_ROW);
+    assert_eq!(listed["klons"][0]["hibernated"], serde_json::json!(true));
+
+    let out = klon(&fx.golden, &["wake", "--json", "feature"]);
+    assert!(out.status.success(), "wake failed: {}", stderr(&out));
+    let wake = parse(&stdout(&out));
+    check_ok(&wake, WAKE);
+    assert_eq!(wake["schema"], "klon.wake/1");
+    assert_eq!(wake["branch"], "feature");
+
     let out = klon(&fx.golden, &["stop", "--json", "feature"]);
     assert!(out.status.success(), "stop failed: {}", stderr(&out));
     let stop = parse(&stdout(&out));
@@ -602,6 +643,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -624,6 +666,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -644,6 +687,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -666,6 +710,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
@@ -686,6 +731,7 @@ fn a_null_is_only_allowed_where_the_table_says_so() {
         "dirty": false,
         "locked": false,
         "ip": "127.0.0.2",
+        "hibernated": false,
         "disk_bytes": 630,
         "disk_exact": false,
         "procs": 0,
