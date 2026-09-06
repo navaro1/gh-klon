@@ -409,12 +409,25 @@ ignored files, so the disk cost is real.
 
 ### 5.6 The workaround
 
-`gh klon rm --path <path> --force` removes any leaked klon. `gh klon list` names them.
-Neither needs the plugin. The README paragraph of section 7 gives the user this text.
+`gh klon rm --path <path>` removes a leaked klon. `gh klon list` finds it. Neither
+needs the plugin.
+
+The user must pick the path with care, because `gh klon list` shows every klon of the
+repository, not only the leaked ones. A leaked subagent klon carries the name
+`agent-<id>`, which Claude Code assigns; a klon from `--worktree` or `EnterWorktree`
+carries the user's own name.
+
+`rm` must run **without** `--force`. Plain `rm` refuses a dirty klon and a klon with a
+live process, and it names the reason (`src/cli/rm.rs` lines 98 and 115). That refusal
+is the safety net. `--force` removes both checks, so it belongs only on a klon the user
+has looked at and decided to discard.
 
 The leaked klons are not locked, because Claude Code writes the `locked` file only for
 a worktree it makes with git. A plain `git worktree remove` also works. This is a small
 mercy: the user never needs `git worktree unlock` first.
+
+The spike itself used `--force`, because its klons were throwaway and it removed them
+in a script. The README must not teach that habit.
 
 ## 6. What this means for klon
 
