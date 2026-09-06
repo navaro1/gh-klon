@@ -576,6 +576,10 @@ fn throughput_cell(
         failure = failure.or_else(|| per_klon.iter().find_map(|b| b.failure.clone()));
 
         let mut record = blank_record(manifest, cell, check, false, drop, solo_runs);
+        // The solo builds of one tool run one after the other, so their order
+        // is their index. There is nothing to interleave: the concurrent run
+        // that follows them is the whole point of the cell.
+        record.order = (0..solo.len()).collect();
         record.samples_ms = solo;
         record.t_solo_ms = Some(report::percentile(&record.samples_ms, 0.50));
         record.t_wall6_ms = Some(t_wall_ms);

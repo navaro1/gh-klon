@@ -295,23 +295,31 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
     let filesystem = report["environment"]["filesystem"]
         .as_str()
         .expect("a filesystem");
+    let baseline = baseline_record(&report);
+    let base_bytes = baseline["unique_bytes"].as_u64().expect("unique_bytes");
+    println!("unique bytes by {method}: klon {bytes}, baseline {base_bytes}");
     if filesystem == "btrfs" {
-        assert_eq!(method, "btrfs-fi-du", "btrfs must give the exact figure");
+        assert_eq!(
+            method, "btrfs-fi-du",
+            "btrfs must give the exact figure; check that btrfs-progs is on PATH \
+             and that btrfs filesystem du runs without privileges here"
+        );
+        // On btrfs a klon shares its extents with golden, so its exclusive
+        // figure may sit far below the baseline's. Which way the two fall is
+        // the answer of the cell, not a rule the test may impose.
     } else {
         assert_eq!(
             method, "upper-bound",
             "{filesystem} has no exact figure, so the record marks the bound"
         );
+        // A plain copy shares nothing: the klon carries golden's ignored state
+        // and the baseline worktree carries none of it.
+        assert!(
+            bytes > base_bytes,
+            "the klon holds the warm state: {bytes} against {base_bytes}"
+        );
     }
-
-    // A klon carries golden's ignored state; a baseline worktree does not. The
-    // klon must therefore hold more bytes of its own.
-    let baseline = baseline_record(&report);
-    let base_bytes = baseline["unique_bytes"].as_u64().expect("unique_bytes");
-    assert!(
-        bytes > base_bytes,
-        "the klon holds the warm state: {bytes} against {base_bytes}"
-    );
+    assert_eq!(baseline["method"], klon["method"], "one method per cell");
 }
 
 // --- M12 ------------------------------------------------------------------------
@@ -338,6 +346,11 @@ fn the_throughput_cell_reports_the_ratio_and_every_build_time() {
     let per_klon = numbers(&klon["per_klon_ms"]);
     assert_eq!(per_klon.len(), 2, "one wall time per builder");
     assert!(per_klon.iter().all(|ms| *ms > 0.0), "found {per_klon:?}");
+    assert_eq!(
+        klon["order"].as_array().expect("an order").len(),
+        numbers(&klon["samples_ms"]).len(),
+        "one position per solo sample"
+    );
 
     let solo = klon["t_solo_ms"].as_f64().expect("t_solo_ms");
     let wall = klon["t_wall6_ms"].as_f64().expect("t_wall6_ms");
