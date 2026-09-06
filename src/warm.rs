@@ -390,11 +390,18 @@ fn land(
     fs::rename(&staging, &landed).map_err(Error::io(format!("land {} in {}", dir, klon.display())))
 }
 
-/// True when the klon's own branch ignores `dir`. `git check-ignore` answers 0
-/// for an ignored path and 1 for a path that is not ignored, so the query
-/// needs no working copy of the directory.
+/// True when the klon's own branch ignores the directory `dir`.
+///
+/// The query carries a trailing slash. `check-ignore` reads a bare name as a
+/// file name whatever sits on disk, and a directory-only pattern such as
+/// `/build/` never matches a file name; the slash is what makes git answer the
+/// question that was asked. The path itself need not exist, which is the
+/// point: the warm copy has not landed yet.
+///
+/// The exit code is the answer: 0 for an ignored path, 1 for one that is not.
 fn ignored_in(klon: &Path, dir: &str) -> Result<bool> {
-    let (code, _) = git::run_input(klon, &["check-ignore", "-q", "--", dir], b"", &[0, 1])?;
+    let query = format!("{dir}/");
+    let (code, _) = git::run_input(klon, &["check-ignore", "-q", "--", &query], b"", &[0, 1])?;
     Ok(code == 0)
 }
 

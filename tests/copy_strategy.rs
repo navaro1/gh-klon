@@ -695,3 +695,167 @@ fn the_forced_progress_line_reaches_the_announced_total() {
         "the progress line must end with a newline:\n{text:?}"
     );
 }
+
+#[test]
+fn a_directory_the_branch_does_not_ignore_never_lands() {
+    // Golden ignores `staging/`, `feature` does not. The plan is made from
+    // golden's rules, so the directory reaches the warm process; the klon must
+    // still refuse it, else `add` would hand back a dirty klon.
+    let fx = Fixture::generate(SEED + 11, 20, 2, 2, 2);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    fs::write(fx.golden.join(".gitignore"), "/build/\n/staging/\n").unwrap();
+    fs::write(
+        fx.golden.join(".klon.toml"),
+        "[copy]\ninline_limit = \"1K\"\n",
+    )
+    .unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(
+        &fx.golden,
+        &["commit", "-qm", "ignore staging on main only"],
+    );
+    let staging = fx.golden.join("staging");
+    fs::create_dir(&staging).unwrap();
+    for i in 0..40 {
+        fs::write(staging.join(format!("o{i}.bin")), vec![b'z'; 2048]).unwrap();
+    }
+
+    let out = klon_env(&fx.golden, &no_sudo(), &["--json", "add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(
+        warming_of(&stdout(&out)),
+        vec!["staging".to_string()],
+        "golden's rules put the directory in the plan"
+    );
+    let klon_path = fx.default_klon_path();
+    let log = klon_path.join(".klon").join("warm.log");
+    let started = Instant::now();
+    while started.elapsed() < LANDING {
+        if fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("not ignored")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let text = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        text.contains("staging is not ignored on this branch"),
+        "the warm process must refuse a directory this branch does not ignore:\n{text}"
+    );
+    assert!(
+        !klon_path.join("staging").exists(),
+        "the klon must stay clean of a directory its branch does not ignore"
+    );
+    assert!(!klon_path.join("staging.klon-warming").exists());
+    assert_eq!(
+        git_ok(&klon_path, &["status", "--porcelain"]),
+        "",
+        "the klon must be clean"
+    );
+    // The step failed, so it stays pending and `list` keeps saying so.
+    assert_eq!(warm_pending(&klon_path), vec!["staging".to_string()]);
+    let listed = klon(&fx.golden, &["list"]);
+    assert!(
+        stdout(&listed).contains("warming staging"),
+        "a step that failed must stay visible:\n{}",
+        stdout(&listed)
+    );
+}
+
+/// The `pending` list of `<klon>/.klon/warming.json`, or an empty list.
+fn warm_pending(klon_path: &Path) -> Vec<String> {
+    let text = match fs::read_to_string(klon_path.join(".klon").join("warming.json")) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).expect("the marker is JSON");
+    value["pending"]
+        .as_array()
+        .expect("pending is an array")
+        .iter()
+        .map(|item| item.as_str().expect("a name").to_string())
+        .collect()
+}
+
+#[test]
+fn no_fixup_reaches_the_warm_process() {
+    // The warm directory names golden. Without `--no-fixup` the pass rewrites
+    // that name; with it the klon keeps golden's path, and no log is written.
+    let fx = warm_fixture();
+    fs::write(
+        fx.golden.join("build").join("path.txt"),
+        format!("{}\n", fx.golden.display()),
+    )
+    .unwrap();
+    let out = klon_env(&fx.golden, &no_sudo(), &["add", "feature", "--no-fixup"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon_path = fx.default_klon_path();
+    wait_for_landing(&klon_path, &["build"]);
+
+    let text = fs::read_to_string(klon_path.join("build").join("path.txt")).expect("read");
+    assert_eq!(
+        text.trim(),
+        fx.golden.display().to_string(),
+        "--no-fixup must reach the warm process and leave golden's path alone"
+    );
+    assert!(
+        !klon_path.join(".klon").join("fixup.log").exists(),
+        "a skipped pass writes no log"
+    );
+}
+
+#[test]
+fn a_fast_backend_neither_surveys_nor_warms() {
+    // `--backend reflink-walk` shares blocks, so the estimate is zero and the
+    // guard has nothing to weigh. A free-space reading far below the tree must
+    // therefore let the klon through, and nothing may reach the warm process.
+    let fx = warm_fixture();
+    let mut env = no_sudo();
+    env.push(("KLON_TEST_FREE_BYTES", OsStr::new("1")));
+    let out = klon_env(
+        &fx.golden,
+        &env,
+        &["--json", "add", "feature", "--backend", "reflink-walk"],
+    );
+    if !out.status.success() {
+        // ext4 has no `FICLONE`, so the clone itself may refuse. The guard
+        // must not be the reason.
+        let text = stderr(&out);
+        assert!(
+            !text.contains("not enough space"),
+            "a block-sharing backend must not meet the free-space guard:\n{text}"
+        );
+        println!(
+            "skipped: a_fast_backend_neither_surveys_nor_warms: reflink-walk cannot clone here"
+        );
+        return;
+    }
+    assert!(
+        warming_of(&stdout(&out)).is_empty(),
+        "only the copy backend warms"
+    );
+    assert!(fx.default_klon_path().join("build").is_dir());
+}
+
+#[test]
+fn the_estimate_counts_disk_blocks_not_content_bytes() {
+    // 3000 one-byte ignored files hold 3 KB of content and need megabytes of
+    // blocks and inodes. A guard that weighed content would let this through.
+    let fx = Fixture::generate(SEED + 12, 10, 2, 0, 2);
+    let build = fx.golden.join("build");
+    for i in 0..3000 {
+        fs::write(build.join(format!("t{i}")), b"x").unwrap();
+    }
+    let mut env = no_sudo();
+    // Far above 1.2 times the content bytes, far below the blocks they need.
+    env.push(("KLON_TEST_FREE_BYTES", OsStr::new("200000")));
+    let out = klon_env(&fx.golden, &env, &["add", "feature"]);
+    let text = stderr(&out);
+    assert!(
+        !out.status.success() && text.contains("not enough space"),
+        "the guard must weigh the blocks a tiny-file tree needs:\n{text}"
+    );
+    assert!(!fx.default_klon_path().exists());
+}
