@@ -9,8 +9,14 @@
 //! so the klon process stays unfenced and the whole command tree inherits the
 //! domain: Landlock follows `fork` and `exec`, and a nested ruleset can only
 //! tighten it. `<common>` itself is never in the set, so `hooks/` and `config`
-//! stay read-only. git never needs `packed-refs.lock` under `run`, because the
-//! envelope sets `gc.auto=0`.
+//! stay read-only. A commit never needs `packed-refs.lock` under `run`,
+//! because the envelope sets `gc.auto=0`.
+//!
+//! One cost follows from the closed `<common>` root: git locks `packed-refs`
+//! for every ref deletion, and the lock lives there, so `git branch -d`,
+//! `git tag -d`, and a `fetch --prune` that drops a branch fail under the
+//! fence with `Permission denied`. `run --no-fence` or a command outside
+//! `run` covers them.
 
 use crate::{config, git, paths, probe, Error, Result};
 use landlock::{

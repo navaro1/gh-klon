@@ -302,6 +302,11 @@ fn git_commit_succeeds_under_run_and_golden_stays_read_only() {
     );
     assert_ok(&out, "git add and commit");
 
+    // A ref deletion is the documented cost of the closed `<common>` root:
+    // git locks `packed-refs` for every deletion, and the lock lives there.
+    assert_ok(&r.run(&[], "git branch tmp"), "git branch tmp");
+    assert_denied(&r.run(&[], "git branch -d tmp"), "git branch -d");
+
     // AC: `touch <golden>/src/x` still fails. The fixture has `d000` for `src`.
     let target = r.fx.golden.join("d000").join("x");
     assert_denied(&r.run(&[], &touch(&target)), "touch golden/d000/x");
