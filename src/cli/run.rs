@@ -8,7 +8,7 @@
 //! otherwise. The exit code passes back unchanged, and a signal to `run`
 //! passes on to the command.
 
-use crate::envelope::{scope, Envelope};
+use crate::envelope::{scope, Envelope, Fence};
 use crate::{git, paths, Error, Result};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -97,13 +97,9 @@ pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
     // command tree. The guard removes a cgroup that klon made once the command
     // has left it.
     let _scope = scope::apply(&mut envelope);
-    #[cfg(target_os = "linux")]
-    if fence_wanted(options) {
-        envelope.fence = crate::envelope::fence_linux::build(klon, envelope.var("TMPDIR"))?;
-    }
-    // C19 reads the options on macOS.
-    #[cfg(not(target_os = "linux"))]
-    let _ = options;
+    // C18: the fence is the innermost step; the child applies it right
+    // before the exec, so the scope wrapper runs inside it too.
+    envelope.fence = fence(klon, &envelope, options)?;
     // The child leads a new session, so the terminal never signals it: Ctrl-C
     // and a `kill` of `gh klon run` reach only this process. klon relays each
     // of them to the child's process group, so the whole tree ends with the
@@ -124,13 +120,24 @@ pub fn exec_with(klon: &Path, argv: &[String], options: Options) -> Result<()> {
     }
 }
 
-/// The fence is on unless the caller or the environment turns it off.
-#[cfg(target_os = "linux")]
-fn fence_wanted(options: Options) -> bool {
-    if options.no_fence {
-        return false;
+/// The fence of this run, or None when the caller or the environment turns
+/// it off. A host without Landlock gives None too, with one line on stderr.
+/// macOS has no fence until C19.
+fn fence(klon: &Path, envelope: &Envelope, options: Options) -> Result<Option<Fence>> {
+    let skipped =
+        std::env::var_os("KLON_NO_FENCE").is_some_and(|value| !value.is_empty() && value != "0");
+    if options.no_fence || skipped {
+        return Ok(None);
     }
-    !std::env::var_os("KLON_NO_FENCE").is_some_and(|value| !value.is_empty() && value != "0")
+    #[cfg(target_os = "linux")]
+    {
+        crate::envelope::fence_linux::build(klon, envelope.var("TMPDIR"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (klon, envelope);
+        Ok(None)
+    }
 }
 
 /// The error of a failed spawn. Only an errno crosses the fork boundary, so

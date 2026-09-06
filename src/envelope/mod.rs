@@ -55,7 +55,6 @@ pub struct Envelope {
     pub jobserver: Option<Part>,
     /// C18 fills this on Linux: a Landlock ruleset that the child applies in
     /// process, right before the exec. C19 fills it on macOS.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fence: Option<Fence>,
     /// C20 fills this.
     pub scope: Option<Part>,
