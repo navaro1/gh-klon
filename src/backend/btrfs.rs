@@ -41,6 +41,12 @@ impl Backend for BtrfsSnapshot {
         "btrfs-snapshot"
     }
 
+    /// A snapshot is O(1) and writes no file data, so the free-space guard has
+    /// nothing to weigh (R41).
+    fn estimate_bytes(&self, _golden: &Path, _excludes: &Exclusions) -> u64 {
+        0
+    }
+
     /// A snapshot shares extents, so both ends must sit on one btrfs
     /// filesystem. Two subvolumes carry two device numbers and still share, so
     /// `select` falls back to the real `FICLONE` test instead of the device

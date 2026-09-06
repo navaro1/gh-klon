@@ -1,14 +1,17 @@
 //! `gh klon list`: one line per klon with path, branch, short HEAD, a dirty flag,
-//! the five C30 extras columns (disk, RSS, live processes, PR, checks), and the
-//! three C24 radar columns: `<path> <branch> <head>[ *] | <disk> | <rss> |
-//! <procs> | <pr> | <checks> | <vs-base> | <vs-siblings> | behind <n>`. The main
-//! worktree is not a klon and never appears. `--json` prints the same rows with
-//! the full HEAD, and `--no-gh` skips the pull request fetch.
+//! the five C30 extras columns (disk, RSS, live processes, PR, checks), the C12
+//! warm column, and the three C24 radar columns: `<path> <branch> <head>[ *] |
+//! <disk> | <rss> | <procs> | <pr> | <checks> | <warm> | <vs-base> |
+//! <vs-siblings> | behind <n>`. The radar columns close the line, so a reader
+//! that cuts the last three fields keeps working. The main worktree is not a
+//! klon and never appears. `--json` prints the same rows with the full HEAD,
+//! and `--no-gh` skips the pull request fetch.
 
 use crate::envelope::env;
 use crate::extras;
 use crate::paths;
 use crate::radar;
+use crate::warm;
 use crate::{git, Error, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -61,6 +64,9 @@ struct Row {
     /// `pass`, `fail`, `pending`, or `none` when the pull request runs no
     /// check. Null when there is no pull request or the answer named no rollup.
     checks: Option<String>,
+    /// The ignored directories a detached warm process still owes the klon
+    /// (C12). It is empty once every directory landed.
+    warming: Vec<String>,
     #[serde(flatten)]
     radar: radar::Row,
 }
@@ -107,6 +113,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             rss_bytes: extra.rss_bytes,
             pr: number,
             checks,
+            warming: warm::pending(&path),
             branch,
             locked: worktree.locked,
             path,
@@ -139,9 +146,10 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// The five extras columns: disk, RSS, live processes, PR, checks. A dash
-/// means klon measured nothing: no ignored directory, no live process, no
-/// pull request, or a `gh` that did not answer.
+/// The five extras columns plus the warm one: disk, RSS, live processes, PR,
+/// checks, and the directories a warm process still owes. A dash means klon
+/// measured nothing: no ignored directory, no live process, no pull request, a
+/// `gh` that did not answer, or a klon with nothing left to warm.
 fn extra_columns(row: &Row) -> String {
     let disk = if row.disk_bytes == 0 {
         "-".to_string()
@@ -160,7 +168,14 @@ fn extra_columns(row: &Row) -> String {
         .map(|n| format!("#{n}"))
         .unwrap_or_else(|| "-".to_string());
     let checks = row.checks.as_deref().unwrap_or("-");
-    format!("| {disk} | {rss} | {} | {pr} | {checks}", row.procs)
+    let warm = match row.warming.is_empty() {
+        true => "-".to_string(),
+        false => format!("warming {}", row.warming.join(",")),
+    };
+    format!(
+        "| {disk} | {rss} | {} | {pr} | {checks} | {warm}",
+        row.procs
+    )
 }
 
 /// The HEAD of a klon: the full object name for JSON, the short one for a

@@ -65,6 +65,19 @@ pub trait Backend: Send + Sync {
     /// Copy the children of `src` into the existing directory `dst`.
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing>;
 
+    /// How many bytes `clone` will write into the klon (R41).
+    ///
+    /// `add` refuses before the first repository change when the free space of
+    /// the destination filesystem is below 1.2 times this number. The default
+    /// walks golden and answers the disk blocks its tree holds, which is what
+    /// a byte copy writes. It is not the apparent size: a tree of many tiny
+    /// files costs far more in blocks and inodes than in content. A backend
+    /// that shares blocks writes almost nothing and answers 0, so the guard
+    /// costs it neither a walk nor a refusal.
+    fn estimate_bytes(&self, golden: &Path, excludes: &Exclusions) -> u64 {
+        copy::survey(golden, excludes).total.disk
+    }
+
     /// True when the backend shares blocks and therefore needs the source and
     /// the destination on one filesystem. `select` drops such a backend when
     /// `--path` names another filesystem, so `add` falls back instead of
@@ -128,6 +141,12 @@ impl Exclusions {
             include: Includes::load(golden),
             golden: golden.to_path_buf(),
         }
+    }
+
+    /// Skip one more path. `add` adds the ignored directories that the warm
+    /// process takes, so the inline clone leaves them out (R36).
+    pub fn add_exact(&mut self, path: PathBuf) {
+        self.exact.insert(path);
     }
 
     /// True when the clone must skip `path`. A `.git` entry is skipped at every
