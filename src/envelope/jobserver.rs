@@ -13,9 +13,27 @@
 //! `--jobserver-auth=fifo:<path>`, is a **fatal error** on make 4.3, which
 //! Ubuntu 22.04 and 24.04 ship (handoff §11), so klon never emits it.
 //!
-//! A client that a signal ends never writes its token back. `top_up` repairs
-//! the store: it counts the tokens without taking them, and, when no process
-//! of a klon names this fifo, it writes the store back to the target.
+//! ## The store lives as long as the klons do
+//!
+//! A fifo keeps its bytes in a kernel buffer that exists only while some
+//! descriptor is open. The last close frees the buffer and every token in it,
+//! and two open descriptions of one fifo share that single buffer (measured on
+//! the development laptop). Three rules follow, and the whole module rests on
+//! them:
+//!
+//! 1. `run` opens the store **before** it fills it, and keeps a copy of that
+//!    descriptor open until the command ends. The tokens then belong to that
+//!    run and to every klon that opens the store while it runs.
+//! 2. A store that no klon holds open is empty. That is correct, not broken:
+//!    with no client there is nothing to count.
+//! 3. The lasting repair is therefore `run`'s work. `run` fills an idle store
+//!    to the target. `doctor` reports what it finds and never writes a token
+//!    that a live client holds, because that token comes back when the client
+//!    ends.
+//!
+//! A client that a signal ends never writes its token back, so a store stays
+//! short while its siblings keep it open. The next run of an idle store fills
+//! it again, which closes the leak.
 
 use crate::envelope::{Envelope, Part};
 use crate::{Error, Result};
@@ -35,7 +53,7 @@ pub const PATH_VAR: &str = "KLON_JOBSERVER";
 pub const OFF_VAR: &str = "KLON_NO_JOBSERVER";
 
 /// The variable that replaces the computed token target. Tests set it, and a
-/// user tunes the machine with it.
+/// person tunes the machine with it.
 pub const TOKENS_VAR: &str = "KLON_JOBSERVER_TOKENS";
 
 /// The variables that carry the handshake. klon writes all three, because the
@@ -59,10 +77,9 @@ const MAX_TOKENS: usize = 4096;
 // --- The store ---------------------------------------------------------------
 
 /// The fifo of this user. `XDG_RUNTIME_DIR` is a per-user tmpfs that the login
-/// session owns, so the store dies with the session and never survives a
-/// reboot with stale tokens. A host without that variable keeps the store
-/// under `~/.klon`, and a host without `HOME` puts it in the temporary
-/// directory, one path per user id.
+/// session owns, so nothing of the store outlives the session. A host without
+/// that variable keeps the fifo under `~/.klon`, and a host without `HOME`
+/// puts it in the temporary directory, one path per user id.
 pub fn path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(dir).join("klon").join("jobserver");
@@ -132,31 +149,39 @@ pub fn attach(envelope: &Envelope) -> Option<Part> {
 /// valid value that make and cargo both read as "no flags", and it replaces
 /// any value the caller's own environment held.
 fn off_part() -> Part {
+    let mut vars: Vec<(String, String)> = HANDSHAKE_VARS
+        .iter()
+        .map(|key| ((*key).to_string(), String::new()))
+        .collect();
+    // The env file still names a store. An empty value replaces it, so a
+    // top-up never counts a command that holds no token as a token holder.
+    vars.push((PATH_VAR.to_string(), String::new()));
     Part {
-        vars: HANDSHAKE_VARS
-            .iter()
-            .map(|key| ((*key).to_string(), String::new()))
-            .collect(),
+        vars,
         wrapper: Vec::new(),
     }
 }
 
-/// Open the store and build the handshake. The two descriptors stay open for
+/// Open the store, fill it when it is idle, and build the handshake.
+///
+/// The order matters. The open comes first, because a fill before it would
+/// vanish with the descriptor that carried it. The two copies stay open for
 /// the life of this process on purpose: the command inherits them across
-/// `exec`, and `run` exits as soon as the command does.
+/// `exec`, they hold the store's buffer alive while the command runs, and
+/// `run` exits as soon as the command does.
 fn connect(envelope: &Envelope) -> Result<Part> {
     let path = fifo_for(envelope);
     let target = target();
-    ensure(&path, target)?;
-    // A client that a signal ended never wrote its token back. The repair runs
-    // before the command starts, so this command sees a full store. It stays
-    // silent: `run` gives stderr to the command, not to klon.
-    top_up_at(&path, target, Look::WhenShort)?;
+    ensure(&path)?;
+    let anchor = open_store(&path)?;
+    // An idle store is empty, and a client that a signal ended never wrote its
+    // token back. Both end here. The repair stays silent: `run` gives stderr
+    // to the command, not to klon.
+    top_up_at(&anchor, &path, target, Look::WhenShort)?;
 
-    let file = open_store(&path)?;
-    let read = inherit_dup(file.as_raw_fd(), &path)?;
-    let write = inherit_dup(file.as_raw_fd(), &path)?;
-    drop(file);
+    let read = inherit_dup(anchor.as_raw_fd(), &path)?;
+    let write = inherit_dup(anchor.as_raw_fd(), &path)?;
+    drop(anchor);
 
     let auth = format!("-j --jobserver-auth={read},{write}");
     let mut vars: Vec<(String, String)> = HANDSHAKE_VARS
@@ -182,10 +207,11 @@ fn fifo_for(envelope: &Envelope) -> PathBuf {
 
 // --- The fifo ----------------------------------------------------------------
 
-/// Create the fifo and fill it with `target` tokens, once per host. `mkfifo`
-/// is atomic: of two concurrent calls exactly one creates the file, and only
-/// that one fills it, so the store never holds twice the tokens.
-fn ensure(path: &Path, target: usize) -> Result<()> {
+/// Create the fifo, once per host. `mkfifo` is atomic, so of two concurrent
+/// calls exactly one creates the file and the other reads `EEXIST`. The new
+/// fifo holds no token: a fill here would die with the descriptor that wrote
+/// it, so `connect` fills the store after it opens it.
+fn ensure(path: &Path) -> Result<()> {
     if let Ok(meta) = fs::symlink_metadata(path) {
         return if meta.file_type().is_fifo() {
             Ok(())
@@ -198,36 +224,42 @@ fn ensure(path: &Path, target: usize) -> Result<()> {
     }
     let dir = path.parent().unwrap_or(path);
     fs::create_dir_all(dir).map_err(Error::io(format!("create {}", dir.display())))?;
-    let lock = Lock::acquire(dir)?;
-    // Another klon may have created the fifo while this one waited.
-    if path.exists() {
-        return Ok(());
-    }
     let c_path = c_path(path)?;
     // SAFETY: `c_path` is NUL-terminated and lives past the call.
-    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(Error::io(format!("create the fifo {}", path.display()))(
-            err,
-        ));
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } == 0 {
+        return Ok(());
     }
-    let mut file = open_store(path)?;
-    let written = file.write_all(&vec![TOKEN; target]);
-    drop(file);
-    drop(lock);
-    written.map_err(Error::io(format!("fill {}", path.display())))
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::AlreadyExists {
+        return Ok(());
+    }
+    Err(Error::io(format!("create the fifo {}", path.display()))(
+        err,
+    ))
 }
 
 /// Open the fifo for reading and writing. `O_RDWR` on a fifo returns at once
 /// even with no other end open, so klon needs no `O_NONBLOCK` dance and no
-/// second process. `O_NONBLOCK` goes on afterwards, so a later read of an
-/// empty store returns instead of waiting for a client to release a token.
+/// second process to hold the far end open.
+///
+/// The descriptor blocks, and it must: `F_DUPFD` shares one open file
+/// description, so `O_NONBLOCK` on this descriptor would also reach the copies
+/// the command inherits. GNU make reads the store with a blocking `read`, and
+/// an `EAGAIN` there ends the build.
 fn open_store(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .map_err(Error::io(format!("open {}", path.display())))?;
+        .map_err(Error::io(format!("open {}", path.display())))
+}
+
+/// `open_store` with `O_NONBLOCK`. klon reads and writes the store through it,
+/// so a store that a client emptied first never makes klon wait. It is a
+/// second open file description on the same buffer, and no copy of it ever
+/// leaves the process, so the flag never reaches a client.
+fn open_store_now(path: &Path) -> Result<File> {
+    let file = open_store(path)?;
     let fd = file.as_raw_fd();
     // SAFETY: `fd` is open and owned by `file`.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -294,6 +326,19 @@ pub enum Look {
     Always,
 }
 
+/// The processes that hold the store open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holders {
+    /// klon did not look: the store was already full.
+    NotChecked,
+    /// The processes of a klon that name this store. Each may hold a token.
+    Count(usize),
+    /// This system has no process scan, so klon writes nothing. Only a host
+    /// without `/proc` builds it, so the Linux compiler never sees it used.
+    #[allow(dead_code)]
+    Unknown,
+}
+
 /// What klon found in the store and what it changed.
 #[derive(Debug)]
 pub struct Report {
@@ -303,9 +348,8 @@ pub struct Report {
     pub target: usize,
     /// The tokens the store held when klon looked.
     pub available: usize,
-    /// The processes of a klon that name this fifo. Each may hold a token.
-    /// None when klon did not look, or when the host has no process scan.
-    pub live: Option<usize>,
+    /// The processes that hold the store open.
+    pub live: Holders,
     /// The tokens klon wrote back.
     pub restored: usize,
     /// The tokens klon took out, because the target shrank.
@@ -331,12 +375,17 @@ impl Report {
             notes.push(format!("{} short", self.shortfall()));
         }
         match self.live {
-            Some(0) | None => {}
-            Some(1) => notes.push("1 klon process holds the store".to_string()),
-            Some(count) => notes.push(format!("{count} klon processes hold the store")),
-        }
-        if self.live.is_none() && self.shortfall() > 0 {
-            notes.push("this system has no process scan, so klon changed nothing".to_string());
+            Holders::NotChecked => {}
+            // The count is 0 because a fifo drops its buffer with the last
+            // descriptor, not because a token leaked. The note says so.
+            Holders::Count(0) => notes.push("no klon holds the store open".to_string()),
+            Holders::Count(1) => notes.push("1 klon process holds the store".to_string()),
+            Holders::Count(count) => {
+                notes.push(format!("{count} klon processes hold the store"));
+            }
+            Holders::Unknown => {
+                notes.push("this system has no process scan, so klon wrote nothing".to_string());
+            }
         }
         let head = format!(
             "{}: {} of {} tokens",
@@ -352,25 +401,33 @@ impl Report {
     }
 }
 
-/// Read the store and, when no klon holds a token, write it back to the
-/// target. `doctor` prints the answer; `run` repairs the store in silence
-/// before it starts a command.
+/// Read the store and, when no klon holds a token, fill it to the target.
+/// `doctor` calls this.
+///
+/// The tokens this call writes live until the command ends, because a fifo
+/// drops its buffer with its last descriptor. The lasting repair belongs to
+/// `run`, which fills the store through the very descriptors it hands to the
+/// command. `doctor` therefore reports a store that no klon holds open as
+/// empty, and that is what it is.
 pub fn top_up(look: Look) -> Result<Report> {
     let path = path();
     let target = target();
-    ensure(&path, target)?;
-    top_up_at(&path, target, look)
+    ensure(&path)?;
+    let anchor = open_store(&path)?;
+    top_up_at(&anchor, &path, target, look)
 }
 
-fn top_up_at(path: &Path, target: usize, look: Look) -> Result<Report> {
+/// The top-up on a store that `anchor` already holds open. Every caller must
+/// pass a live descriptor: without one the fifo has no buffer, and every token
+/// this call writes would be gone before the next call opens it.
+fn top_up_at(anchor: &File, path: &Path, target: usize, look: Look) -> Result<Report> {
     let dir = path.parent().unwrap_or(path);
     let lock = Lock::acquire(dir)?;
-    let mut file = open_store(path)?;
     let mut report = Report {
         path: path.to_path_buf(),
         target,
-        available: available(&file)?,
-        live: None,
+        available: available(anchor)?,
+        live: Holders::NotChecked,
         restored: 0,
         dropped: 0,
     };
@@ -382,27 +439,32 @@ fn top_up_at(path: &Path, target: usize, look: Look) -> Result<Report> {
     report.live = live_holders(path);
     // A token that a live client holds comes back when that client ends. Only
     // an idle store may be written, or the count would grow past the target.
-    if report.live != Some(0) {
+    if report.live != Holders::Count(0) {
         return Ok(report);
     }
+    // A second open file description on the same buffer. `O_NONBLOCK` on it
+    // never reaches a client, and it keeps klon from waiting on a store that a
+    // client emptied between the count above and the read below.
+    let mut scratch = open_store_now(path)?;
     if report.available < target {
         let missing = target - report.available;
-        file.write_all(&vec![TOKEN; missing])
+        scratch
+            .write_all(&vec![TOKEN; missing])
             .map_err(Error::io(format!(
                 "write back the tokens of {}",
                 path.display()
             )))?;
         report.restored = missing;
     } else if report.available > target {
-        report.dropped = take(&mut file, report.available - target)?;
+        report.dropped = take(&mut scratch, report.available - target)?;
     }
-    drop(file);
+    drop(scratch);
     drop(lock);
     Ok(report)
 }
 
 /// Take `count` tokens out of the store. The descriptor is non-blocking, so a
-/// store that another process emptied first ends the loop instead of waiting.
+/// store that a client emptied first ends the loop instead of waiting.
 fn take(file: &mut File, count: usize) -> Result<usize> {
     let mut buffer = vec![0u8; count];
     let mut taken = 0;
@@ -419,19 +481,19 @@ fn take(file: &mut File, count: usize) -> Result<usize> {
 }
 
 /// The processes of a klon that name this fifo, from the `KLON_JOBSERVER` tag
-/// that `run` puts in every command's environment. The answer is None on a
-/// host with no process scan; klon then changes nothing, because a token that
-/// a live client holds must never come back twice.
-fn live_holders(path: &Path) -> Option<usize> {
+/// that `run` puts in every command's environment. The answer is `Unknown` on
+/// a host with no process scan; klon then changes nothing, because a token
+/// that a live client holds must never come back twice.
+fn live_holders(path: &Path) -> Holders {
     #[cfg(target_os = "linux")]
     {
         let tags = vec![(PATH_VAR.to_string(), path.to_string_lossy().into_owned())];
-        Some(crate::process::klon_processes(&tags).len())
+        Holders::Count(crate::process::klon_processes(&tags).len())
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = path;
-        None
+        Holders::Unknown
     }
 }
 
@@ -463,10 +525,9 @@ pub fn make_needs_pipe_style(line: &str) -> bool {
 
 // --- The lock ----------------------------------------------------------------
 
-/// An exclusive `flock` on `<dir>/jobserver.lock`. It holds for the fifo
-/// creation and for one top-up, so two klons never fill the store twice. A
-/// client never takes it: a build tool must not wait on klon to acquire a
-/// token.
+/// An exclusive `flock` on `<dir>/jobserver.lock`. It holds for one top-up, so
+/// two klons that start together never both fill the store. A client never
+/// takes it: a build tool must not wait on klon to acquire a token.
 struct Lock {
     file: File,
 }
@@ -514,100 +575,111 @@ fn c_path(path: &Path) -> Result<CString> {
 mod tests {
     use super::*;
 
-    /// A guard that points the store at a private directory for one test.
-    /// The variables are process-wide, so the tests below run under one lock.
-    struct Runtime {
+    /// A fifo in a private directory, with one descriptor open. The descriptor
+    /// is the anchor: without it the fifo holds no buffer and no token.
+    struct Store {
         _tmp: tempfile::TempDir,
-        dir: PathBuf,
+        path: PathBuf,
+        anchor: File,
     }
 
-    impl Runtime {
-        fn new() -> Runtime {
+    impl Store {
+        fn new() -> Store {
             let tmp = tempfile::tempdir().expect("tempdir");
-            let dir = tmp.path().to_path_buf();
-            Runtime { _tmp: tmp, dir }
+            let path = tmp.path().join("jobserver");
+            ensure(&path).expect("create the fifo");
+            let anchor = open_store(&path).expect("open the fifo");
+            Store {
+                _tmp: tmp,
+                path,
+                anchor,
+            }
         }
 
-        fn fifo(&self) -> PathBuf {
-            self.dir.join("jobserver")
+        fn count(&self) -> usize {
+            available(&self.anchor).expect("count")
         }
     }
 
     #[test]
-    fn the_store_holds_the_target_and_a_second_call_leaves_it_alone() {
-        let runtime = Runtime::new();
-        let fifo = runtime.fifo();
-        ensure(&fifo, 3).expect("create the store");
-        let file = open_store(&fifo).expect("open");
-        assert_eq!(available(&file).unwrap(), 3);
-        drop(file);
-        // A second call must not add a second set of tokens.
-        ensure(&fifo, 3).expect("the second call");
-        let file = open_store(&fifo).expect("open");
-        assert_eq!(available(&file).unwrap(), 3);
+    fn a_new_store_is_empty_and_the_first_top_up_fills_it() {
+        let store = Store::new();
+        assert_eq!(store.count(), 0, "a fresh fifo holds no token");
+        let report = top_up_at(&store.anchor, &store.path, 3, Look::WhenShort).expect("top up");
+        assert_eq!(report.available, 0);
+        assert_eq!(report.restored, 3);
+        assert_eq!(store.count(), 3);
+        // A second call on a full store changes nothing and skips the scan.
+        let report = top_up_at(&store.anchor, &store.path, 3, Look::WhenShort).expect("top up");
+        assert_eq!(report.available, 3);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.live, Holders::NotChecked);
+        assert_eq!(store.count(), 3);
+    }
+
+    #[test]
+    fn the_tokens_die_with_the_last_descriptor() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("jobserver");
+        ensure(&path).expect("create the fifo");
+        {
+            let anchor = open_store(&path).expect("open");
+            top_up_at(&anchor, &path, 2, Look::WhenShort).expect("top up");
+            assert_eq!(available(&anchor).unwrap(), 2);
+        }
+        // The rule the whole module rests on: no descriptor, no buffer, no
+        // token. A store that no klon holds open is empty by construction.
+        let anchor = open_store(&path).expect("reopen");
+        assert_eq!(available(&anchor).unwrap(), 0);
     }
 
     #[test]
     fn a_path_that_is_not_a_fifo_is_an_error() {
-        let runtime = Runtime::new();
-        let fifo = runtime.fifo();
-        fs::write(&fifo, "not a fifo").unwrap();
-        let err = ensure(&fifo, 2).expect_err("a regular file must fail");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("jobserver");
+        fs::write(&path, "not a fifo").unwrap();
+        let err = ensure(&path).expect_err("a regular file must fail");
         assert!(err.to_string().contains("is not a fifo"), "{err}");
     }
 
     #[test]
     fn the_top_up_writes_back_a_lost_token_and_drops_an_extra_one() {
-        let runtime = Runtime::new();
-        let fifo = runtime.fifo();
-        ensure(&fifo, 4).expect("create the store");
+        let store = Store::new();
+        top_up_at(&store.anchor, &store.path, 4, Look::WhenShort).expect("fill");
 
         // A client took two tokens and died with them.
-        let mut file = open_store(&fifo).expect("open");
-        assert_eq!(take(&mut file, 2).unwrap(), 2);
-        drop(file);
+        let mut scratch = open_store_now(&store.path).expect("open");
+        assert_eq!(take(&mut scratch, 2).unwrap(), 2);
+        drop(scratch);
+        assert_eq!(store.count(), 2);
 
-        let report = top_up_at(&fifo, 4, Look::WhenShort).expect("top up");
+        let report = top_up_at(&store.anchor, &store.path, 4, Look::WhenShort).expect("top up");
         assert_eq!(report.available, 2);
         assert_eq!(report.shortfall(), 2);
         assert_eq!(report.restored, 2);
-        let file = open_store(&fifo).expect("open");
-        assert_eq!(available(&file).unwrap(), 4);
-        drop(file);
+        assert_eq!(store.count(), 4);
 
         // A smaller target takes the extra tokens out again.
-        let report = top_up_at(&fifo, 1, Look::Always).expect("top up");
+        let report = top_up_at(&store.anchor, &store.path, 1, Look::Always).expect("top up");
         assert_eq!(report.available, 4);
         assert_eq!(report.dropped, 3);
-        let file = open_store(&fifo).expect("open");
-        assert_eq!(available(&file).unwrap(), 1);
-    }
-
-    #[test]
-    fn a_full_store_needs_no_change() {
-        let runtime = Runtime::new();
-        let fifo = runtime.fifo();
-        ensure(&fifo, 2).expect("create the store");
-        let report = top_up_at(&fifo, 2, Look::WhenShort).expect("top up");
-        assert_eq!(report.available, 2);
-        assert_eq!(report.restored, 0);
-        assert_eq!(report.dropped, 0);
-        assert_eq!(report.shortfall(), 0);
-        // The fast path skips the process scan.
-        assert_eq!(report.live, None);
+        assert_eq!(store.count(), 1);
     }
 
     #[test]
     fn a_duplicated_descriptor_survives_exec_and_avoids_the_standard_streams() {
-        let runtime = Runtime::new();
-        let fifo = runtime.fifo();
-        ensure(&fifo, 1).expect("create the store");
-        let file = open_store(&fifo).expect("open");
-        let copy = inherit_dup(file.as_raw_fd(), &fifo).expect("duplicate");
+        let store = Store::new();
+        let copy = inherit_dup(store.anchor.as_raw_fd(), &store.path).expect("duplicate");
         assert!(copy >= 3, "the copy must not land on a standard stream");
         // SAFETY: `copy` is a live descriptor of this process.
         let flags = unsafe { libc::fcntl(copy, libc::F_GETFD) };
         assert_eq!(flags & libc::FD_CLOEXEC, 0, "the copy must survive exec");
+        // The copy shares the buffer, so it sees the tokens the anchor holds.
+        top_up_at(&store.anchor, &store.path, 2, Look::WhenShort).expect("fill");
+        let mut count: libc::c_int = 0;
+        // SAFETY: `copy` is open and `count` is a live, owned integer.
+        unsafe { libc::ioctl(copy, FIONREAD, &mut count) };
+        assert_eq!(count, 2);
         // SAFETY: the test owns `copy` and closes it once.
         unsafe { libc::close(copy) };
     }
@@ -618,7 +690,7 @@ mod tests {
             path: PathBuf::from("/run/user/1000/klon/jobserver"),
             target: 18,
             available: 18,
-            live: Some(0),
+            live: Holders::NotChecked,
             restored: 0,
             dropped: 0,
         };
@@ -626,20 +698,22 @@ mod tests {
             full.detail(),
             "/run/user/1000/klon/jobserver: 18 of 18 tokens"
         );
-        let repaired = Report {
-            available: 16,
-            restored: 2,
+        let idle = Report {
+            available: 0,
+            restored: 18,
+            live: Holders::Count(0),
             ..full
         };
         assert_eq!(
-            repaired.detail(),
-            "/run/user/1000/klon/jobserver: 16 of 18 tokens, 2 restored"
+            idle.detail(),
+            "/run/user/1000/klon/jobserver: 0 of 18 tokens, 18 restored, \
+             no klon holds the store open"
         );
         let busy = Report {
             path: PathBuf::from("/x/jobserver"),
             target: 18,
             available: 16,
-            live: Some(2),
+            live: Holders::Count(2),
             restored: 0,
             dropped: 0,
         };
