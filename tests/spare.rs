@@ -88,7 +88,8 @@ fn load_average_1m() -> Option<f64> {
 }
 
 /// A wall-clock budget means nothing while other builds share the host. The
-/// budget check runs only on a quiet host; CI runners are quiet.
+/// budget check runs only where the load average is readable and low. A host
+/// that reports no load average, macOS among them, skips the budget.
 fn host_is_quiet() -> bool {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let quiet = (cores / 2).max(1) as f64;
@@ -97,7 +98,13 @@ fn host_is_quiet() -> bool {
             eprintln!("skip the timing budget: the load average {load} is above {quiet}");
             false
         }
-        _ => true,
+        Some(_) => true,
+        None => {
+            // macOS has no /proc/loadavg. A wall-clock budget on a host whose
+            // load nothing can read is a coin toss, so it does not run.
+            eprintln!("skip the timing budget: this host reports no load average");
+            false
+        }
     }
 }
 

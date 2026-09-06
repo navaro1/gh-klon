@@ -653,7 +653,13 @@ fn add_cleans_an_untracked_file_whose_name_is_not_utf8() {
     use std::os::unix::ffi::OsStrExt;
     let fx = Fixture::generate(SEED, 200, 10, 20, 20);
     let name = OsStr::from_bytes(b"junk-\xff.txt");
-    fs::write(fx.golden.join(name), "untracked in golden\n").unwrap();
+    // APFS and HFS+ refuse a file name that is not valid UTF-8 and return
+    // EILSEQ. The case this test covers cannot arise on such a filesystem,
+    // so the test skips instead of failing (spec section 5).
+    if let Err(err) = fs::write(fx.golden.join(name), "untracked in golden\n") {
+        println!("skip: this filesystem refuses a file name that is not UTF-8: {err}");
+        return;
+    }
 
     let out = klon(&fx.golden, &["add", "feature"]);
     assert!(out.status.success(), "add failed: {}", stderr(&out));
