@@ -52,6 +52,11 @@ impl Backend for Reflink {
         }
     }
 
+    /// `FICLONE` shares blocks, so both files must live on one filesystem.
+    fn same_filesystem_only(&self) -> bool {
+        true
+    }
+
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing> {
         let started = Instant::now();
         let mut plan = Plan::default();
@@ -155,7 +160,28 @@ pub fn capability(golden: &Path) -> probe::Status {
         Ok(dir) => dir,
         Err(why) => return probe::Status::Broken(why),
     };
-    match trial_in(dir.path()) {
+    let source = dir.path().to_path_buf();
+    answer(trial(&source, dir.path()))
+}
+
+/// `capability` from golden into a directory that may live on another
+/// filesystem. `select` calls it when the device ids of the two ends differ,
+/// because two btrfs subvolumes carry two device ids and still clone.
+pub fn capability_across(golden: &Path, destination: &Path) -> probe::Status {
+    let from = match TrialDir::next_to(golden) {
+        Ok(dir) => dir,
+        Err(why) => return probe::Status::Broken(why),
+    };
+    let to = match TrialDir::inside(destination) {
+        Ok(dir) => dir,
+        Err(why) => return probe::Status::Broken(why),
+    };
+    answer(trial(from.path(), to.path()))
+}
+
+/// Turn one trial into the probe result that `doctor` and `select` read.
+fn answer(result: std::result::Result<(), Trial>) -> probe::Status {
+    match result {
         Ok(()) => probe::Status::Present("FICLONE works on this filesystem".to_string()),
         Err(Trial::Unsupported(name)) => {
             probe::Status::Absent(format!("reflink unsupported: {name}"))
@@ -172,9 +198,10 @@ enum Trial {
     Failed(String),
 }
 
-fn trial_in(dir: &Path) -> std::result::Result<(), Trial> {
-    let from = dir.join("from");
-    let to = dir.join("to");
+/// Write one test file in `from_dir` and clone it into `to_dir`.
+fn trial(from_dir: &Path, to_dir: &Path) -> std::result::Result<(), Trial> {
+    let from = from_dir.join("from");
+    let to = to_dir.join("to");
     let write = || -> std::io::Result<()> {
         let mut file = fs::File::create(&from)?;
         file.write_all(&vec![0x6bu8; PROBE_BYTES])?;
@@ -204,15 +231,26 @@ fn classify(err: &std::io::Error) -> Trial {
 struct TrialDir(PathBuf);
 
 impl TrialDir {
+    /// A sibling of golden's `.wt` root, so the test runs on golden's
+    /// filesystem.
     fn next_to(golden: &Path) -> std::result::Result<TrialDir, String> {
         let root = paths::default_wt_root(golden);
+        let stem = root.file_name().unwrap_or_default().to_string_lossy();
+        TrialDir::create(&root.with_file_name(format!("{stem}.reflink")))
+    }
+
+    /// A child of `parent`, so the test runs on the filesystem of `parent`.
+    fn inside(parent: &Path) -> std::result::Result<TrialDir, String> {
+        TrialDir::create(&parent.join(".klon-reflink"))
+    }
+
+    /// Create the first free `<prefix>.<pid>.<n>` directory.
+    fn create(prefix: &Path) -> std::result::Result<TrialDir, String> {
         let pid = std::process::id();
         for n in 0..64u32 {
-            let name = format!(
-                "{}.reflink.{pid}.{n}",
-                root.file_name().unwrap_or_default().to_string_lossy()
-            );
-            let candidate = root.with_file_name(name);
+            let mut candidate = prefix.as_os_str().to_os_string();
+            candidate.push(format!(".{pid}.{n}"));
+            let candidate = PathBuf::from(candidate);
             match fs::create_dir(&candidate) {
                 Ok(()) => return Ok(TrialDir(candidate)),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -221,7 +259,10 @@ impl TrialDir {
                 }
             }
         }
-        Err("cannot create a reflink test directory next to golden".to_string())
+        Err(format!(
+            "cannot create a reflink test directory at {}",
+            prefix.display()
+        ))
     }
 
     fn path(&self) -> &Path {

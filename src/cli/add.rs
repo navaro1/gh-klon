@@ -88,8 +88,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     refuse_checked_out(&worktrees, &branch)?;
 
     // The probe writes a fixture next to golden and can fail, so it runs before
-    // the journal entry and before the first repository change (R5).
-    let choice = backend::select(&golden, &common, args.backend.as_deref())?;
+    // the journal entry and before the first repository change (R5). The
+    // destination decides whether a block-sharing backend can reach it.
+    let choice = backend::select(&golden, &common, Some(&path), args.backend.as_deref())?;
 
     // Step 0: the journal entry precedes the first repository change.
     let mut record = journal::Record::start(&common, journal::Op::Add, &path, Some(&branch))?;

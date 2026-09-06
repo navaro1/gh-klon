@@ -148,7 +148,13 @@ fn every_command_matches_its_documented_schema() {
     let add = parse(&stdout(&out));
     check_ok(&add, ADD);
     assert_eq!(add["schema"], "klon.add/1");
-    assert_eq!(add["backend"], "copy");
+    // The probe picks the backend from the filesystem under the fixture (C5).
+    // ext4 and macOS give `copy`; an xfs or btrfs checkout gives `reflink-walk`.
+    assert!(
+        ["copy", "reflink-walk"].contains(&add["backend"].as_str().expect("a backend name")),
+        "unknown backend {}",
+        add["backend"]
+    );
     assert_eq!(add["branch"], "feature");
 
     let out = klon(&fx.golden, &["list", "--json"]);

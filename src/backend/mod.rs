@@ -51,6 +51,14 @@ pub trait Backend: Send + Sync {
     /// Copy the children of `src` into the existing directory `dst`.
     fn clone(&self, src: &Path, dst: &Path, excludes: &Exclusions) -> Result<Timing>;
 
+    /// True when the backend shares blocks and therefore needs the source and
+    /// the destination on one filesystem. `select` drops such a backend when
+    /// `--path` names another filesystem, so `add` falls back instead of
+    /// failing halfway through with `EXDEV`.
+    fn same_filesystem_only(&self) -> bool {
+        false
+    }
+
     /// Remove a finished klon. The byte backends delete in the background at
     /// low priority (R8); C7's btrfs backend replaces this with one subvolume
     /// delete.
@@ -168,9 +176,19 @@ pub struct Choice {
 }
 
 /// The real backends in preference order. The first one whose probe passes wins.
+///
+/// `reflink-walk` is a Linux backend. On macOS `reflink-copy` calls
+/// `clonefile`, so its probe would pass on APFS and take a path that C6 owns:
+/// the handoff keeps macOS on `copy` until the `apfs-clone` backend lands
+/// (handoff §4, spec §7 C6). The `reflink` row of `doctor` still reports the
+/// host fact on every platform.
 fn registry() -> Vec<Box<dyn Backend>> {
-    // C7 inserts `btrfs-snapshot` and C6 inserts `apfs-clone` above this line.
-    vec![Box::new(reflink::Reflink), Box::new(copy::Copy)]
+    // C7 inserts `btrfs-snapshot` and C6 inserts `apfs-clone` ahead of these.
+    #[cfg(target_os = "linux")]
+    let list: Vec<Box<dyn Backend>> = vec![Box::new(reflink::Reflink), Box::new(copy::Copy)];
+    #[cfg(not(target_os = "linux"))]
+    let list: Vec<Box<dyn Backend>> = vec![Box::new(copy::Copy)];
+    list
 }
 
 /// The list that `select` probes. It holds the real backends, plus the
@@ -200,16 +218,42 @@ fn find(name: &str) -> Result<Box<dyn Backend>> {
     )))
 }
 
-/// Choose the backend for `golden`. `over` is the `--backend` value, which
-/// skips the probe and the cache. Otherwise the cached answer wins while it
-/// matches the current filesystem; else every probe runs and the answer is
-/// cached.
-pub fn select(golden: &Path, common: &Path, over: Option<&str>) -> Result<Choice> {
+/// Choose the backend for `golden`. `destination` is the klon path that `add`
+/// will fill; `doctor` passes None, because it clones nothing. `over` is the
+/// `--backend` value, which skips the probe and the cache.
+///
+/// Without an override the cached answer wins while it matches golden's
+/// filesystem; else every probe runs and the answer is cached. A backend that
+/// shares blocks is then dropped when the destination cannot receive its clone.
+pub fn select(
+    golden: &Path,
+    common: &Path,
+    destination: Option<&Path>,
+    over: Option<&str>,
+) -> Result<Choice> {
     if let Some(name) = over {
         let backend = find(name)?;
         let reason = format!("--backend {name}");
         return Ok(Choice { backend, reason });
     }
+    let choice = probed(golden, common)?;
+    // The probe answers for golden's filesystem, which is where the cache is
+    // keyed. The destination may sit on another one.
+    if choice.backend.same_filesystem_only() {
+        if let Some(dst) = destination {
+            if let Err(why) = cow_reaches(golden, dst) {
+                return Ok(Choice {
+                    backend: find(copy::Copy.name())?,
+                    reason: why,
+                });
+            }
+        }
+    }
+    Ok(choice)
+}
+
+/// The cached answer for golden's filesystem, or a fresh probe.
+fn probed(golden: &Path, common: &Path) -> Result<Choice> {
     let filesystem = probe::filesystem(golden);
     if !refresh_requested() {
         if let Some(cache) = read_cache(common)? {
@@ -235,6 +279,45 @@ pub fn select(golden: &Path, common: &Path, over: Option<&str>) -> Result<Choice
         },
     )?;
     Ok(Choice { backend, reason })
+}
+
+/// `Ok` when a block-sharing clone from `golden` can land in `destination`.
+///
+/// One device id usually settles it: one superblock always clones. Two btrfs
+/// subvolumes of one filesystem carry two device ids and still clone, so a
+/// differing device runs one real `FICLONE` before klon gives up the fast
+/// backend. The destination does not exist yet, so the test uses its nearest
+/// parent that does.
+fn cow_reaches(golden: &Path, destination: &Path) -> std::result::Result<(), String> {
+    let Some(parent) = nearest_existing(destination) else {
+        return Ok(());
+    };
+    let (Some(here), Some(there)) = (device(golden), device(&parent)) else {
+        // Without both device ids klon cannot tell. Keep the fast backend and
+        // let the clone report the real error.
+        return Ok(());
+    };
+    if here == there {
+        return Ok(());
+    }
+    match reflink::capability_across(golden, &parent) {
+        probe::Status::Present(_) => Ok(()),
+        other => Err(format!(
+            "the destination is on another filesystem: {}",
+            other.detail()
+        )),
+    }
+}
+
+/// The nearest ancestor of `path`, `path` itself included, that exists.
+fn nearest_existing(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find(|p| p.exists()).map(Path::to_path_buf)
+}
+
+/// The device id of `path`, or None when the stat fails.
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.dev())
 }
 
 /// Probe every backend in order and take the first that passes.
@@ -334,8 +417,16 @@ fn write_cache(common: &Path, cache: &Cache) -> Result<()> {
     Ok(())
 }
 
+/// Read the cache and answer only whether it is usable. `doctor` calls it
+/// before it repairs or deletes anything, so a cache from a future klon stops
+/// the command instead of losing a format that this binary cannot read
+/// (spec §4 "State on disk").
+pub fn check_probe_cache(common: &Path) -> Result<()> {
+    read_cache(common).map(|_| ())
+}
+
 /// Delete the cached answer, so the next `select` probes again. `doctor
-/// --repair` calls this.
+/// --repair` calls this after `check_probe_cache` accepted the file.
 pub fn forget_probe(common: &Path) -> Result<()> {
     let path = cache_path(common);
     match fs::remove_file(&path) {
@@ -426,6 +517,74 @@ mod tests {
     #[test]
     fn the_test_only_backend_is_not_reachable_through_the_override() {
         assert!(find_error("drop-one").is_some());
+    }
+
+    /// `reflink-walk` is a Linux backend. On macOS `reflink-copy` calls
+    /// `clonefile`, which C6 owns, so the name must not resolve there.
+    #[test]
+    fn the_registry_holds_reflink_walk_on_linux_only() {
+        let names: Vec<&str> = registry().iter().map(|b| b.name()).collect();
+        assert!(names.contains(&"copy"), "copy is the universal fallback");
+        assert_eq!(
+            names.contains(&"reflink-walk"),
+            cfg!(target_os = "linux"),
+            "reflink-walk belongs to Linux only, found {names:?}"
+        );
+        assert_eq!(
+            find_error("reflink-walk").is_none(),
+            cfg!(target_os = "linux")
+        );
+    }
+
+    /// The universal backend never needs one filesystem; the clone backend
+    /// does. `select` reads this to keep `--path` on another mount working.
+    #[test]
+    fn only_the_block_sharing_backend_needs_one_filesystem() {
+        assert!(!copy::Copy.same_filesystem_only());
+        assert!(reflink::Reflink.same_filesystem_only());
+    }
+
+    #[test]
+    fn the_nearest_existing_ancestor_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c");
+        assert_eq!(nearest_existing(&deep).as_deref(), Some(tmp.path()));
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(nearest_existing(&deep).as_deref(), Some(deep.as_path()));
+    }
+
+    /// A destination on golden's own filesystem always accepts the clone, so
+    /// the check costs one stat and answers yes.
+    #[test]
+    fn a_destination_beside_golden_reaches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = golden_in(&tmp);
+        let destination = tmp.path().join("golden.wt").join("feature");
+        assert_eq!(cow_reaches(&golden, &destination), Ok(()));
+    }
+
+    /// `/dev/shm` is a tmpfs on Linux, so it is a second filesystem that cannot
+    /// answer `FICLONE`. A destination there must lose the clone backend.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_destination_on_another_filesystem_does_not_reach() {
+        let shm = Path::new("/dev/shm");
+        if !shm.is_dir() {
+            println!("skipped: this host has no /dev/shm tmpfs");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = golden_in(&tmp);
+        if device(&golden) == device(shm) {
+            println!("skipped: golden and /dev/shm share one filesystem");
+            return;
+        }
+        let why = cow_reaches(&golden, &shm.join("klon-test-destination"))
+            .expect_err("tmpfs cannot receive a reflink");
+        assert!(
+            why.starts_with("the destination is on another filesystem"),
+            "unexpected reason {why}"
+        );
     }
 
     #[test]

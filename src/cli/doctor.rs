@@ -49,9 +49,11 @@ pub fn run(args: Args, json: bool) -> Result<()> {
     let golden = git::main_worktree(&cwd)?;
     let common = git::common_dir(&cwd)?;
 
-    // The journal is read first. An unknown version fails here, before any
-    // probe runs and before `--repair` touches anything.
+    // The two state files are read first. An unknown version of either fails
+    // here, before any probe runs and before `--repair` touches anything. An
+    // old binary must never repair or delete a format it cannot read.
     let found = journal::list(&common)?;
+    backend::check_probe_cache(&common)?;
     let (repaired, failure) = if args.repair {
         repair_all(&golden, &common, &found)?
     } else {
@@ -311,9 +313,10 @@ fn reflink_support(host: &Host) -> probe::Status {
 }
 
 /// The backend that `add` will use, and why. A probe failure is a report row,
-/// not an exit code: the user asked for a report.
+/// not an exit code: the user asked for a report. `doctor` names no
+/// destination, because it clones nothing.
 fn backend_row(golden: &Path, common: &Path) -> (String, String) {
-    match backend::select(golden, common, None) {
+    match backend::select(golden, common, None, None) {
         Ok(choice) => (choice.backend.name().to_string(), choice.reason),
         Err(err) => ("none".to_string(), err.to_string()),
     }

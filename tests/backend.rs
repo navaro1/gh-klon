@@ -157,17 +157,18 @@ fn the_probe_answer_is_cached_and_refreshed() {
     assert_eq!(fourth["backend_reason"], first["backend_reason"]);
 }
 
-/// A probe cache from a future klon fails closed, like the journal.
+/// A probe cache from a future klon fails closed, like the journal. `doctor
+/// --repair` must not delete a format that this binary cannot read, so it stops
+/// before it repairs anything.
 #[test]
 fn a_future_probe_cache_version_fails_closed() {
     let fx = Fixture::generate(SEED, 20, 2, 2, 1);
     let dir = fx.golden.join(".git").join("klon");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(
-        dir.join("probe.json"),
-        r#"{"version":99,"backend":"copy","reason":"x","filesystem":"ext4","created":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
+    let cache = dir.join("probe.json");
+    let future = r#"{"version":99,"backend":"copy","reason":"x","filesystem":"ext4","created":"2026-01-01T00:00:00Z"}"#;
+    fs::write(&cache, future).unwrap();
+
     let out = klon(&fx.golden, &["add", "feature"]);
     assert!(!out.status.success(), "add must refuse a future cache");
     assert!(
@@ -176,6 +177,79 @@ fn a_future_probe_cache_version_fails_closed() {
         stderr(&out)
     );
     assert!(!fx.default_klon_path().exists(), "add must change nothing");
+
+    // A stale journal entry gives the repair real work. It must stay untouched.
+    let journal = dir.join("journal");
+    fs::create_dir_all(&journal).unwrap();
+    let entry = serde_json::json!({
+        "version": 1,
+        "op": "add",
+        "state": "planned",
+        "path": fx.klon_path("gone"),
+        "branch": "feature",
+        "started": "2026-09-05T10:00:00Z",
+    })
+    .to_string();
+    fs::write(journal.join("stale.json"), &entry).unwrap();
+
+    for args in [
+        vec!["doctor", "--json"],
+        vec!["doctor", "--json", "--repair"],
+    ] {
+        let out = klon(&fx.golden, &args);
+        assert!(!out.status.success(), "{args:?} must refuse a future cache");
+        assert!(
+            stderr(&out).contains("unknown probe cache version 99"),
+            "{args:?} stderr: {}",
+            stderr(&out)
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&cache).unwrap(),
+        future,
+        "the repair must not delete a cache it cannot read"
+    );
+    assert!(
+        journal.join("stale.json").is_file(),
+        "the repair must not run before the version check"
+    );
+}
+
+/// A destination on another filesystem cannot receive a block-sharing clone.
+/// `add` must fall back to `copy` instead of failing halfway with `EXDEV`.
+/// It needs a reflink golden and a second filesystem, so CI is the proof.
+#[test]
+fn a_destination_on_another_filesystem_falls_back_to_copy() {
+    let name = "a_destination_on_another_filesystem_falls_back_to_copy";
+    let Some(base) = reflink_dir(name) else {
+        return;
+    };
+    let fx = Fixture::generate_in(&base, SEED, 40, 4, 10, 2);
+    if doctor(&fx.golden, &[])["backend"] != "reflink-walk" {
+        println!("skipped: {name}: the probe did not pick reflink-walk on {base:?}");
+        return;
+    }
+    // The runner's temporary directory is not on the loop filesystem.
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let target = elsewhere.path().join("klon");
+    let out = klon(
+        &fx.golden,
+        &[
+            "add",
+            "--json",
+            "--path",
+            target.to_str().unwrap(),
+            "feature",
+        ],
+    );
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let report = parse(&stdout(&out));
+    assert_eq!(
+        report["backend"], "copy",
+        "a cross-filesystem destination must fall back"
+    );
+    common::assert_clean(&target);
+    assert_no_shared_inode(&fx.golden, &target);
 }
 
 /// The third C5 acceptance line: a backend that drops one file fails the probe,
