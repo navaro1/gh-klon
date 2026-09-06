@@ -104,6 +104,7 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         let options = Options {
             no_fence: true,
             stdout: step_stdout(json)?,
+            netns: None,
         };
         let status = Envelope::spawn_and_wait(Root::Golden(&golden), &argv, options)?;
         if !status.success() {

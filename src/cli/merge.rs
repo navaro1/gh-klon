@@ -399,6 +399,7 @@ fn exec_step(klon: &Path, argv: &[String], what: &str, json: bool) -> Result<()>
     let options = Options {
         no_fence: false,
         stdout: step_stdout(json)?,
+        netns: None,
     };
     match Envelope::spawn_and_wait(Root::Klon(klon), argv, options) {
         // The command already reported its own failure on its own stderr.
