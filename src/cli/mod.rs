@@ -5,6 +5,7 @@ pub mod bench;
 pub mod check;
 pub mod claim;
 pub mod doctor;
+pub mod fence_exec;
 pub mod hibernate;
 pub mod init;
 pub mod init_volume;

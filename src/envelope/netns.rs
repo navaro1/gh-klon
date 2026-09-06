@@ -11,9 +11,20 @@
 //!
 //! A host without pasta gets one stderr line and the command runs on the host
 //! network as before. `doctor` reports the tool and the install line.
+//!
+//! The write fence (C18) cannot wrap pasta itself: the kernel denies every
+//! mount-topology syscall (mount, umount, pivot_root) to a process inside a
+//! Landlock domain, and no rule can grant them back (see the `sb_mount`,
+//! `sb_umount`, and `sb_pivotroot` hooks in the kernel's
+//! `security/landlock/fs.c`). pasta needs exactly those syscalls to sandbox
+//! itself. The fence therefore moves inside the namespace: when the fence is
+//! on, the command after pasta's `--` is `gh-klon __fence-exec`, which
+//! applies the same ruleset and then execs the command. pasta runs unfenced;
+//! the command runs under the same fence as without `--netns`.
 
 use crate::envelope::{env, Envelope, Part};
 use crate::{probe, Error, Result};
+use std::path::{Path, PathBuf};
 
 /// The ports pasta maps when neither `--netns-ports` nor `.klon.toml` names
 /// any. These are the ports a web frontend, a Vite dev server, and two common
@@ -44,24 +55,54 @@ fn port_value(ip: &str, ports: &[u16]) -> String {
     format!("{ip}/{list}")
 }
 
+/// The inner fence carrier: when the write fence is on, the command after
+/// pasta's `--` is `exe __fence-exec <klon> [--cgroup <dir>] -- <cmd>`.
+struct FencedExec {
+    /// The klon binary itself, so the wrapper never depends on `PATH`.
+    exe: PathBuf,
+    /// The klon directory, for the fence's allow set.
+    klon: PathBuf,
+    /// The scope cgroup (C20) the fence may open for its `cgroup.procs` rule.
+    /// The join itself happens outside pasta, so the rule only keeps the
+    /// moved fence identical to the fence a run without `--netns` builds.
+    cgroup: Option<PathBuf>,
+}
+
 /// The envelope part: pasta with the host's network configuration, the port
-/// mapping for the klon's address, and the command after `--`.
-fn part(ip: &str, ports: &[u16]) -> Part {
+/// mapping for the klon's address, and the command after `--`. With the
+/// write fence on, the command is the `__fence-exec` re-exec.
+fn part(ip: &str, ports: &[u16], fenced: Option<FencedExec>) -> Part {
+    let mut wrapper = vec![
+        "pasta".to_string(),
+        "--config-net".to_string(),
+        "-t".to_string(),
+        port_value(ip, ports),
+        "--".to_string(),
+    ];
+    if let Some(fenced) = fenced {
+        wrapper.push(fenced.exe.to_string_lossy().into_owned());
+        wrapper.push("__fence-exec".to_string());
+        wrapper.push(fenced.klon.to_string_lossy().into_owned());
+        if let Some(dir) = fenced.cgroup {
+            wrapper.push("--cgroup".to_string());
+            wrapper.push(dir.to_string_lossy().into_owned());
+        }
+        wrapper.push("--".to_string());
+    }
     Part {
         vars: Vec::new(),
-        wrapper: vec![
-            "pasta".to_string(),
-            "--config-net".to_string(),
-            "-t".to_string(),
-            port_value(ip, ports),
-            "--".to_string(),
-        ],
+        wrapper,
     }
 }
 
 /// Turn the pasta wrapper on for `envelope`. A host without pasta prints one
 /// line and leaves the envelope as it is, so the command runs as before.
-pub fn enable(envelope: &mut Envelope, ports: &[u16]) -> Result<()> {
+///
+/// `cgroup` is the scope cgroup (C20) the fence names in its allow set. When
+/// the write fence is on, `enable` takes it out of the envelope: pasta must
+/// start unfenced (a Landlock domain denies pasta's own mount sandbox), and
+/// the fence moves into the wrapper as the `__fence-exec` re-exec.
+pub fn enable(envelope: &mut Envelope, ports: &[u16], cgroup: Option<&Path>) -> Result<()> {
     let ip = envelope
         .var("KLON_IP")
         .ok_or_else(|| {
@@ -75,7 +116,17 @@ pub fn enable(envelope: &mut Envelope, ports: &[u16]) -> Result<()> {
         eprintln!("{ABSENT}");
         return Ok(());
     }
-    envelope.netns = Some(part(&ip, ports));
+    let fenced = envelope.fence.take().is_some();
+    let exec = if fenced {
+        Some(FencedExec {
+            exe: std::env::current_exe().map_err(Error::io("find the klon binary"))?,
+            klon: envelope.klon.clone(),
+            cgroup: cgroup.map(Path::to_path_buf),
+        })
+    } else {
+        None
+    };
+    envelope.netns = Some(part(&ip, ports, exec));
     Ok(())
 }
 
@@ -106,7 +157,7 @@ mod tests {
 
     #[test]
     fn the_wrapper_carries_the_address_and_the_port_list() {
-        let part = part("127.0.0.3", &[3000, 5173]);
+        let part = part("127.0.0.3", &[3000, 5173], None);
         assert!(part.vars.is_empty());
         assert_eq!(
             part.wrapper,
@@ -118,8 +169,34 @@ mod tests {
                 "--".to_string(),
             ]
         );
-        // No argv element holds a space: getopt would read it as part of the
-        // option value.
-        assert!(part.wrapper.iter().all(|word| !word.contains(' ')));
+        // No word before pasta's `--` holds a space: getopt would read it as
+        // part of the option value.
+        assert!(part.wrapper.iter().take(4).all(|word| !word.contains(' ')));
+    }
+
+    #[test]
+    fn the_fence_moves_inside_the_namespace_as_the_reexec() {
+        let fenced = FencedExec {
+            exe: PathBuf::from("/opt/gh-klon"),
+            klon: PathBuf::from("/repo/.klon-work/feature"),
+            cgroup: Some(PathBuf::from("/sys/fs/cgroup/klon-1")),
+        };
+        let part = part("127.0.0.2", &[3000], Some(fenced));
+        assert_eq!(
+            part.wrapper,
+            vec![
+                "pasta".to_string(),
+                "--config-net".to_string(),
+                "-t".to_string(),
+                "127.0.0.2/3000".to_string(),
+                "--".to_string(),
+                "/opt/gh-klon".to_string(),
+                "__fence-exec".to_string(),
+                "/repo/.klon-work/feature".to_string(),
+                "--cgroup".to_string(),
+                "/sys/fs/cgroup/klon-1".to_string(),
+                "--".to_string(),
+            ]
+        );
     }
 }

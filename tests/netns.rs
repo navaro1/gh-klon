@@ -296,9 +296,11 @@ fn outbound_traffic_works_inside_the_namespace() {
     );
 }
 
-/// C23 x C18: pasta starts under the write fence. The fence is on by default,
-/// and pasta writes `/proc/self/uid_map` inside it, so `allow_set` holds a
-/// `/proc` rule. The `KLON_DEBUG` lines are the proof the rule is there.
+/// C23 x C18: the command runs under the write fence inside the namespace.
+/// The kernel denies mount, umount, and pivot_root inside a Landlock domain,
+/// so pasta itself starts unfenced; the wrapper execs `gh-klon __fence-exec`
+/// inside the namespace, which applies the same fence to the command. The
+/// `KLON_DEBUG` lines are the proof the fence is on.
 #[test]
 fn pasta_starts_under_the_write_fence() {
     if !has_pasta() {
