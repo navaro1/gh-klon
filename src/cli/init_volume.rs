@@ -481,16 +481,12 @@ fn refuse_a_host_that_cannot(golden: &Path, common: &Path) -> Result<()> {
             found.image.display()
         )));
     }
+    // A golden that already sits on a volume is a subvolume, so this also
+    // catches a repository whose record was lost. `golden` is the resolved
+    // path that git reports, never the symlink that stands at the old one.
     if btrfs::is_subvolume(golden) {
         return Err(Error::klon(format!(
             "{} is already a btrfs subvolume, so gh klon add snapshots it already",
-            golden.display()
-        )));
-    }
-    if fs::symlink_metadata(golden).is_ok_and(|meta| meta.is_symlink()) {
-        return Err(Error::klon(format!(
-            "{} is a symlink, so klon cannot replace it with one; \
-             run gh klon doctor --repair",
             golden.display()
         )));
     }

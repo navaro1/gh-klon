@@ -532,6 +532,48 @@ fn add_after_init_volume_keeps_the_ignored_manifest() {
     common::assert_clean(&klon_path);
 }
 
+/// A klon that stood before the conversion still works after it.
+///
+/// Every `.git` file and every admin `gitdir` file holds an absolute path into
+/// golden. Golden's symlink answers for them, and `git worktree repair` writes
+/// them out again, so the register list stays right from both ends.
+#[test]
+fn a_klon_made_before_the_move_still_works() {
+    let name = "a_klon_made_before_the_move_still_works";
+    let Some(sandbox) = sandbox(name) else {
+        return;
+    };
+    let fx = Fixture::generate(SEED, 60, 5, 10, 3);
+    let out = klon(&fx.golden, &sandbox, &["add", "--json", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let old_klon = path_of(&parse(&stdout(&out)), "path");
+
+    let record = convert(&fx, &sandbox, SIZE);
+    let golden_new = path_of(&record, "golden_new");
+
+    // The klon stayed on the old filesystem, and it still names a repository.
+    assert!(old_klon.is_dir(), "the klon must survive the move");
+    assert_eq!(git_ok(&old_klon, &["status", "--porcelain"]), "");
+    let list = git_ok(&old_klon, &["worktree", "list", "--porcelain"]);
+    assert!(
+        list.contains(&golden_new.display().to_string()),
+        "the klon must name golden's new path: {list}"
+    );
+    assert!(
+        list.contains(&old_klon.display().to_string()),
+        "the register list must still hold the klon: {list}"
+    );
+    // Golden names it too, and a new klon still lands on the volume.
+    let from_golden = git_ok(&fx.golden, &["worktree", "list", "--porcelain"]);
+    assert!(
+        from_golden.contains(&old_klon.display().to_string()),
+        "golden must still name the klon: {from_golden}"
+    );
+    let out = klon(&fx.golden, &sandbox, &["add", "--json", "second"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&stdout(&out))["backend"], "btrfs-snapshot");
+}
+
 /// The 100k timing line. It needs a big fixture and a big image, so it runs
 /// only when `KLON_FIXTURE=100k` asks for it, like every other 100k cell.
 #[test]

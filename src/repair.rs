@@ -305,8 +305,8 @@ fn finish_undo(
     crate::backend::forget_probe(&common)?;
     drop_staged(record, actions);
     actions.push(format!(
-        "the volume image {} stays; run gh klon init --volume --undo is not needed, \
-         delete it with rm -f {}",
+        "golden is off the volume; the image {} stays mounted, and rm -f {} \
+         deletes it once you unmount it",
         record.image.display(),
         record.image.display()
     ));
