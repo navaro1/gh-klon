@@ -1,13 +1,15 @@
 //! `gh klon list`: one line per klon with path, branch, short HEAD, a dirty flag,
 //! the five C30 extras columns (disk, RSS, live processes, PR, checks), the C12
-//! warm column, the C26 receipt column, and the three C24 radar columns:
+//! warm column, the C26 receipt column, the C27 claim column, and the three
+//! C24 radar columns:
 //! `<path> <branch> <head>[ *] | <disk> | <rss> | <procs> | <pr> | <checks> |
-//! <warm> | <receipt> | <vs-base> | <vs-siblings> | behind <n>`. The radar
+//! <warm> | <receipt> | <claims> | <vs-base> | <vs-siblings> | behind <n>`. The radar
 //! columns close the line, so a reader that cuts the last three fields keeps
 //! working. The main worktree is not a klon and never appears. `--json` prints
 //! the same rows with the full HEAD, and `--no-gh` skips the pull request
 //! fetch.
 
+use crate::claims;
 use crate::envelope::env;
 use crate::extras;
 use crate::paths;
@@ -77,6 +79,14 @@ struct Row {
     /// nothing has ever checked the branch, or when klon cannot read the
     /// receipt directory.
     receipt: Option<&'static str>,
+    /// The paths the klon owns (C27), in the order it took them. It is empty
+    /// for a klon that never ran `claim`, and for a claim table klon cannot
+    /// read.
+    claims: Vec<String>,
+    /// True when a claim of this klon conflicts with a claim of another. The
+    /// append refuses such a pair, so this can only follow a hand-edited file
+    /// or a klon that wrote without the lock.
+    claim_overlap: bool,
     #[serde(flatten)]
     radar: radar::Row,
 }
@@ -102,6 +112,13 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         .and_then(|cfg| cfg.proof.and_then(|proof| proof.steps))
         .unwrap_or_default();
     let steps_hash = (!proof_steps.is_empty()).then(|| receipt::steps_hash(&proof_steps));
+    // The claim table is read once for the whole list. A table klon cannot
+    // read costs the two claim fields and one stderr line, never the list:
+    // every other column still answers.
+    let table = claims::load(&common).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        claims::Table::empty()
+    });
     let mut rows = Vec::new();
     for (worktree, radar) in worktrees.iter().skip(1).zip(radar_rows) {
         let path = paths::absolute(&worktree.path)?;
@@ -122,6 +139,7 @@ pub fn run(args: Args, json: bool) -> Result<()> {
             Some(facts) => (Some(facts.number), facts.checks.clone()),
             None => (None, None),
         };
+        let (claimed, overlap) = claims_of(&table, branch.as_deref());
         rows.push(Row {
             head: head_of(&path, json),
             dirty: dirty(&path),
@@ -139,6 +157,8 @@ pub fn run(args: Args, json: bool) -> Result<()> {
                 branch.as_deref(),
                 steps_hash.as_deref(),
             ),
+            claims: claimed,
+            claim_overlap: overlap,
             branch,
             locked: worktree.locked,
             hibernated: false,
@@ -154,6 +174,9 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         if hibernate::is_awake(&worktrees, &record) {
             continue;
         }
+        // A hibernated klon keeps its claims: its work comes back, and the
+        // paths it owns must still be its own when it does.
+        let (claimed, overlap) = claims_of(&table, Some(&record.branch));
         rows.push(Row {
             head: short_head(&record.head, json),
             dirty: false,
@@ -178,6 +201,8 @@ pub fn run(args: Args, json: bool) -> Result<()> {
                 Some(record.branch.as_str()),
                 steps_hash.as_deref(),
             ),
+            claims: claimed,
+            claim_overlap: overlap,
             branch: Some(record.branch),
             locked: false,
             hibernated: true,
@@ -247,10 +272,27 @@ fn extra_columns(row: &Row) -> String {
         .receipt
         .map(mark)
         .unwrap_or_else(|| receipt::Verdict::Missing.column());
+    // C27: the number of owned paths, and a `!` when one of them is also
+    // owned by another klon. A klon that claimed nothing shows a dash.
+    let claims = match (row.claims.len(), row.claim_overlap) {
+        (0, _) => "-".to_string(),
+        (count, false) => count.to_string(),
+        (count, true) => format!("{count}!"),
+    };
     format!(
-        "| {disk} | {rss} | {} | {pr} | {checks} | {warm} | {receipt}",
+        "| {disk} | {rss} | {} | {pr} | {checks} | {warm} | {receipt} | {claims}",
         row.procs
     )
+}
+
+/// The claim fields of one klon: the paths it owns, and whether one of them
+/// overlaps another klon's. A klon with a detached HEAD has no branch, so
+/// nothing names it in the table and it owns nothing.
+fn claims_of(table: &claims::Table, branch: Option<&str>) -> (Vec<String>, bool) {
+    match branch {
+        Some(branch) => (table.paths_of(branch), table.overlaps(branch)),
+        None => (Vec::new(), false),
+    }
 }
 
 /// The `list` mark of a receipt verdict. The JSON name and the mark stay in

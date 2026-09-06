@@ -3,6 +3,7 @@
 pub mod add;
 pub mod bench;
 pub mod check;
+pub mod claim;
 pub mod doctor;
 pub mod hibernate;
 pub mod init;

@@ -4,6 +4,7 @@
 //! with `--merged`, and only after klon proved it is merged.
 
 use crate::branch;
+use crate::claims;
 use crate::envelope::slots;
 use crate::journal::{self, State};
 use crate::paths;
@@ -102,6 +103,16 @@ pub fn run(args: Args, json: bool) -> Result<()> {
         args.no_spare,
     )?;
 
+    // The klon is gone, so its claims go with it (C27). The call sits here and
+    // not in `remove_target`, because `hibernate` removes a tree that comes
+    // back and must keep its paths. A failure costs one stderr line, never the
+    // removal, and a repository with no claim table pays one `stat`.
+    if let Some(name) = branch.as_deref() {
+        if let Err(err) = claims::release_all(&common, name) {
+            eprintln!("{err}");
+        }
+    }
+
     if let Some((name, evidence)) = merged_branch {
         branch::delete_branch(&golden, &name, &evidence)?;
     }
@@ -139,6 +150,10 @@ pub enum Guard {
 /// Steps 2 to 8 of the removal, after the caller resolved `target`. `rm` and
 /// `merge` (C25) share it. The answer is the trash path, or None when the klon
 /// never reached the trash.
+///
+/// The C27 claims are **not** released here. `hibernate` calls this to give a
+/// directory back, and that klon keeps its paths until `wake` puts it back. A
+/// caller that ends a klon for good calls `claims::release_all` itself.
 pub fn remove_target(
     golden: &Path,
     common: &Path,

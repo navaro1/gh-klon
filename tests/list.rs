@@ -62,9 +62,11 @@ fn list_shows_every_klon_with_a_dirty_flag() {
     // bounds the ignored-directory size and every other extra shows `-`; the
     // ignored directory is small, so the clone copied it inline and nothing is
     // warming; the repository names no `[proof] steps`, so no klon carries a
-    // receipt. Neither klon touches a file the other touches, so the radar
-    // reads `clean`.
-    let extras = |path: &Path| format!("| ≤ {} B | - | 0 | - | - | - | -", ignored_bytes(path));
+    // receipt. C27 adds the claim column last before the radar, and no klon
+    // claimed a path. Neither klon touches a file the other touches, so the
+    // radar reads `clean`.
+    let extras =
+        |path: &Path| format!("| ≤ {} B | - | 0 | - | - | - | - | -", ignored_bytes(path));
     const RADAR: &str = "| clean | clean | behind 0";
     assert_eq!(
         stdout(&out).trim(),

@@ -86,6 +86,14 @@ pub struct Receipt {
     pub duration_ms: u64,
     /// The end of the run, RFC 3339 in UTC.
     pub created: String,
+    /// The paths the klon changed against base that no claim of the klon
+    /// covers (C27). It is empty for a klon that holds no claim at all, and
+    /// for one whose every change stays inside its claims. A new field lands
+    /// at the end of the file, so a reader that diffs two receipts sees a
+    /// stable prefix, and `#[serde(default)]` lets this klon read a receipt
+    /// that an older klon wrote.
+    #[serde(default)]
+    pub claim_escape: Vec<String>,
 }
 
 /// What a klon's HEAD receipt says. `merge` turns each answer into a refusal
@@ -305,6 +313,7 @@ pub fn build(
     steps_hash: &str,
     results: Vec<StepResult>,
     duration_ms: u64,
+    claim_escape: Vec<String>,
 ) -> Receipt {
     let status = match results.iter().all(|step| step.status == Status::Pass) {
         true => Status::Pass,
@@ -320,6 +329,7 @@ pub fn build(
         status,
         duration_ms,
         created: time::now_rfc3339(),
+        claim_escape,
     }
 }
 
@@ -355,6 +365,7 @@ mod tests {
                 duration_ms: 3,
             }],
             4,
+            Vec::new(),
         );
         let text = serde_json::to_string(&receipt).unwrap();
         assert!(text.contains("\"status\":\"pass\""), "{text}");
@@ -384,6 +395,7 @@ mod tests {
                 },
             ],
             2,
+            Vec::new(),
         );
         assert_eq!(receipt.status, Status::Failed);
     }
@@ -410,7 +422,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let common = dir.path();
         let hash = steps_hash(&steps(&["true"]));
-        let mut record = build("elsewhere", "7ea", "feature", &hash, Vec::new(), 1);
+        let mut record = build(
+            "elsewhere",
+            "7ea",
+            "feature",
+            &hash,
+            Vec::new(),
+            1,
+            Vec::new(),
+        );
         // The file lands under the wanted commit; its content names another.
         record.commit = "wanted".to_string();
         write(common, &record).unwrap();
