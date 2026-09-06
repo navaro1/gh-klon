@@ -173,7 +173,15 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     // in step 6 writes its own `rm` entry over this one, so a kill there
     // repairs through the `rm` tail; see `repair::entry`.
     let record = journal::Record::start(&common, journal::Op::Merge, &klon, Some(&args.branch))?;
-    let landed = git::run(&golden, &["merge", mode.flag(), "--no-edit", &full]);
+    // The merge names the full ref, because a tag beats a branch of the same
+    // name in git's short-name order. The message then has to be explicit too:
+    // git would title the commit `Merge branch 'refs/heads/x'` from that ref.
+    // A fast-forward writes no commit and ignores the message.
+    let message = format!("Merge branch '{}'", args.branch);
+    let landed = git::run(
+        &golden,
+        &["merge", mode.flag(), "--no-edit", "-m", &message, &full],
+    );
     if let Err(err) = landed {
         // `--ff-only` on a branch that needs a merge commit fails with no
         // conflicted path. That is git's own refusal, so klon passes it on.
@@ -208,12 +216,15 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
         })?;
     } else {
         println!(
-            "{base} {} {} ({}) after {}",
+            "{base} takes {}: {} to {} ({})",
+            args.branch,
             short(&head_before),
             short(&head_after),
-            mode.name(),
-            args.branch
+            mode.name()
         );
+        if removed {
+            println!("removed {}", klon.display());
+        }
     }
     Ok(())
 }
