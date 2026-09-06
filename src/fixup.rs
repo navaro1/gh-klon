@@ -269,10 +269,10 @@ impl Pass {
     ) -> ignore::WalkState {
         let entry = match entry {
             Ok(entry) => entry,
-            // A vanished file is not a reason to stop: another process may own
-            // the ignored tree. Report it and continue.
+            // An entry that vanished stays a warning; anything else means the
+            // pass could not visit a file it had to rewrite.
             Err(err) => {
-                eprintln!("klon: fixup: {err}");
+                found.record(walk_error("walk the ignored entries".to_string(), &err));
                 return ignore::WalkState::Continue;
             }
         };
@@ -303,7 +303,7 @@ impl Pass {
             // one syscall for nothing on a big build tree.
             match entry.metadata() {
                 Ok(meta) => self.fix_file(path, &meta, searcher),
-                Err(err) => Err(Error::klon(format!("stat {}: {err}", self.relative(path)))),
+                Err(err) => Err(walk_error(format!("stat {}", self.relative(path)), &err)),
             }
         } else {
             Ok(None)
@@ -530,6 +530,16 @@ fn continues_name(rest: &str) -> bool {
     rest.chars()
         .next()
         .is_some_and(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '~' | '+' | '@'))
+}
+
+/// Turn a walk error into a klon error that keeps its `io::ErrorKind`, so
+/// `Shared::record` can tell a vanished entry from a real failure.
+fn walk_error(context: String, err: &ignore::Error) -> Error {
+    let kind = err
+        .io_error()
+        .map(std::io::Error::kind)
+        .unwrap_or(std::io::ErrorKind::Other);
+    Error::io(context)(io::Error::new(kind, err.to_string()))
 }
 
 /// True when `path` is `.next/cache`, `.ninja_log`, or `.ninja_deps`.
