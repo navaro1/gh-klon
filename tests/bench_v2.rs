@@ -309,6 +309,12 @@ fn the_disk_cell_reports_unique_bytes_and_its_method() {
         // The M5 claim itself: a klon shares its extents with golden and a
         // plain worktree writes its own. A klon that shares everything holds
         // zero exclusive bytes, which is the answer, not a missing reading.
+        //
+        // Both rows read zero on the smoke shape, because btrfs stores a file
+        // of a few hundred bytes inside its metadata and `fi du` counts no
+        // data extent for it. What this step proves is the method: only a
+        // btrfs host answers `btrfs-fi-du`, and only the acceptance line of
+        // C31 asks for it. A full profile puts real extents on both sides.
         assert!(
             bytes <= base_bytes,
             "a klon must not hold more exclusive bytes than a fresh worktree: \
