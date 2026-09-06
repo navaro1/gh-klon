@@ -147,6 +147,10 @@ struct SparePolicy<'a> {
 /// Directories inside golden where a klon may live.
 const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
 
+/// The most untracked paths that `git clean` takes on its command line (G1).
+/// Above it, `add` runs the plain `git clean -fdq` walk instead.
+const CLEAN_LIST_LIMIT: usize = 1000;
+
 /// What the transaction made, for a caller that prints its own report.
 /// `sync --fresh` (C14) uses it: there `sync` owns stdout.
 pub struct Spawned {
@@ -836,21 +840,16 @@ fn fill(
             crate::untracked::paths_from_porcelain(&status)
         }
     };
-    // The paths go through stdin as literal names, so a name with a glob
-    // character is still one name.
-    if !untracked.is_empty() {
-        git::run_input(
-            path,
-            &[
-                "--literal-pathspecs",
-                "clean",
-                "-fdq",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-            ],
-            &crate::untracked::nul_list(&untracked),
-            &[0],
-        )?;
+    // The paths go on the command line as literal names, so a name with a
+    // glob character is still one name (`git clean` on 2.34 reads no
+    // pathspec file). A list too long for one command line, which no
+    // working golden has, falls back to the walk.
+    if untracked.len() > CLEAN_LIST_LIMIT {
+        git::run(path, &["clean", "-fdq"])?;
+    } else if !untracked.is_empty() {
+        let mut args = vec!["--literal-pathspecs", "clean", "-fdq", "--"];
+        args.extend(untracked.iter().map(String::as_str));
+        git::run(path, &args)?;
     }
     steps.mark("clean");
 

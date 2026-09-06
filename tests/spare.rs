@@ -704,3 +704,88 @@ fn add_100k_with_a_spare() {
         "the next spare must appear"
     );
 }
+
+/// G1: the builder records the untracked paths of the spare and warms its
+/// untracked cache; `add` cleans exactly those paths and the klon's first
+/// `git status` reads the cache that the claim relocated, so it creates no
+/// directory node. `git fsck` proves the rewritten index checksum.
+#[test]
+fn a_spare_klon_is_cleaned_from_the_recorded_list_and_reads_the_relocated_cache() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    fs::write(fx.golden.join("junk.txt"), "untracked in golden\n").unwrap();
+    fs::create_dir(fx.golden.join("junkdir")).unwrap();
+    fs::write(fx.golden.join("junkdir").join("x.txt"), "also untracked\n").unwrap();
+    build_spare(&fx.golden);
+    let meta = read_meta(&fx.golden);
+    assert_eq!(
+        meta["untracked"],
+        serde_json::json!(["junk.txt", "junkdir/"]),
+        "the builder records the untracked paths of the spare: {meta}"
+    );
+    // The index inside the spare carries the cache, built at the spare's
+    // own location.
+    let index = fs::read(spare_dir(&fx.golden).join(".klon").join("index")).unwrap();
+    let ident = format!(
+        "Location {}",
+        spare_dir(&fx.golden).canonicalize().unwrap().display()
+    );
+    assert!(
+        index.windows(ident.len()).any(|w| w == ident.as_bytes()),
+        "the spare's index must hold an untracked cache for the spare path"
+    );
+
+    let out = klon_on(&fx.golden, &["add", "--json", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true, "the spare must serve the add");
+    let path = fx.default_klon_path();
+    assert_spare_klon(&fx, &path, "feature");
+    assert!(
+        !path.join("junk.txt").exists() && !path.join("junkdir").exists(),
+        "git clean removes the recorded untracked paths"
+    );
+    assert!(
+        fx.golden.join("junk.txt").exists(),
+        "golden keeps its files"
+    );
+
+    // The cache now names the klon, and the first status reads it.
+    let admin = fx.golden.join(".git").join("worktrees");
+    let entry = fs::read_dir(&admin)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("index").is_file())
+        .expect("the klon's admin entry");
+    let index = fs::read(entry.join("index")).unwrap();
+    let ident = format!("Location {}", path.canonicalize().unwrap().display());
+    assert!(
+        index.windows(ident.len()).any(|w| w == ident.as_bytes()),
+        "the claim must point the untracked cache at the klon"
+    );
+    let trace = fx.golden.parent().unwrap().join("trace.txt");
+    let status = common::git_env(
+        &path,
+        &["status", "--porcelain"],
+        &[("GIT_TRACE2_PERF", trace.to_str().unwrap())],
+    );
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        stderr(&status)
+    );
+    assert!(stdout(&status).trim().is_empty(), "the klon is clean");
+    let text = fs::read_to_string(&trace).unwrap();
+    if text.contains("node-creation") {
+        assert!(
+            text.contains("node-creation:0"),
+            "the first status must read the relocated cache, not rebuild it"
+        );
+    } else {
+        println!("skipped the counter check: this git build reports no untracked cache counters");
+    }
+    let fsck = git_ok(&path, &["fsck", "--no-dangling", "--no-progress"]);
+    assert!(fsck.trim().is_empty(), "fsck must be quiet: {fsck}");
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}

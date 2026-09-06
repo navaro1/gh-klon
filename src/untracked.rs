@@ -244,17 +244,6 @@ pub fn paths_from_porcelain(status: &str) -> Vec<String> {
     out
 }
 
-/// The NUL-terminated form of `paths`, for `git --literal-pathspecs clean
-/// --pathspec-from-file=- --pathspec-file-nul`.
-pub fn nul_list(paths: &[String]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for path in paths {
-        out.extend_from_slice(path.as_bytes());
-        out.push(0);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,7 +325,6 @@ mod tests {
     fn the_porcelain_parser_keeps_the_untracked_entries_and_skips_rename_sources() {
         let status = "?? new.txt\0 M edited.txt\0R  moved.txt\0old.txt\0?? dir/\0A  added.txt\0";
         assert_eq!(paths_from_porcelain(status), vec!["new.txt", "dir/"]);
-        assert_eq!(nul_list(&["a".to_string(), "b c".to_string()]), b"a\0b c\0");
         assert!(paths_from_porcelain("").is_empty());
     }
 
