@@ -72,6 +72,7 @@ reflink                     absent: reflink unsupported: EOPNOTSUPP
 scope                       present: systemd 249 scope: MemoryHigh=63966M TasksMax=4096
 slots                       present: no address in use
 systemd-run                 present: systemd 249 (249.11-0ubuntu3.22)
+volume                      absent: no klon volume; gh klon init --volume <size> makes one
 journal: no open entry
 ```
 
@@ -171,6 +172,48 @@ klon looks for the `btrfs` binary on `PATH`, and under `$KLON_BTRFS_TOOLS` when
 that variable names a directory. A user can unpack `btrfs-progs` there without
 root.
 
+## ext4: `gh klon init --volume`
+
+ext4 has no snapshot, so `add` copies bytes there. `gh klon init --volume` gives
+an ext4 laptop the same 5 ms clone without a partition, without a reformat, and
+without a password:
+
+```sh
+gh klon init --volume 60G --yes   # builds the volume and moves golden onto it
+gh klon init --volume --undo      # moves golden back and removes the volume
+```
+
+klon creates a sparse image under `~/.local/share/klon/`, formats it with
+`mkfs.btrfs -L klon-<repo>`, and asks udisks to attach and mount it. The image
+seeds one directory that you own, because the mount root itself belongs to
+`root`. Golden moves into it as a subvolume, and a symlink takes golden's old
+path, so every absolute path in git, in a build cache, and in your shell history
+still resolves. `git worktree repair` writes every worktree path out again.
+
+The image costs no disk space until klon fills it, so ask for more than you need.
+
+`init --volume` refuses a host that would ask for a password. udisks grants the
+attach and the mount to an **active local session** only, so an ssh session and
+a headless runner are refused with one line. It refuses a dirty golden with
+`dirty`, a repository that already has a volume, and a host without
+`btrfs-progs`, where it prints the install line. Each refusal changes nothing.
+
+After a reboot the volume is down and golden's symlink points at nothing. The
+next `gh klon add` attaches and mounts the image again, which takes about a
+second and no password. No shell can enter a dangling symlink, so run that
+command from the directory above golden: klon finds the repository, brings the
+volume up, and works in it.
+
+`--undo` copies golden back to its old filesystem, empties the volume, and
+detaches it. It refuses while klons live on the volume, because they go away
+with it; `--force` removes them. klon releases the loop device and deletes the
+image only when udisks reports this user as its owner. Otherwise the image stays
+and klon prints the `rm -f` line for it, because a release of a foreign loop
+device raises a password dialog.
+
+klon never bundles `mkfs.btrfs`: `btrfs-progs` is GPLv2 and every distribution
+packages it. Set `$KLON_BTRFS_TOOLS` to use an unpacked copy without root.
+
 ## Configuration
 
 `add` reads `.klon.toml` from the golden root. All keys are optional.
@@ -231,6 +274,14 @@ stops a command.
 | `init` `swapped`, golden missing | Rename `<golden>.klon-old` back to golden, then delete the staging copy. |
 | `init` `swapped`, golden present | Delete the staging copy and the replaced copy. |
 | `init` `ready` | Delete the replaced copy. Golden is complete. |
+| `init --volume` `planned`, `attached`, or `copied` | Delete the staged copy on the volume. Golden never moved. The image stays, and the report names it. |
+| `init --volume` `swapped`, golden missing | Rename `<golden>.klon-old` back to golden, then delete the staged copy. |
+| `init --volume` `swapped` or `ready`, golden is a symlink | Finish: write the volume record, repair the worktrees, delete the replaced copy. |
+| `init --volume --undo` `swapped` or `ready`, golden is a directory | Drop the volume record and name the image. Golden is off the volume. |
+
+A repair never deletes a volume image. It can hold the only copy of a path in
+the window where the repair cannot tell what landed, so the report prints its
+path and a person decides.
 
 A repeated command repairs its own entry too. `add` closes the entry of its
 destination before it validates the path, so a second `add` after an interrupted

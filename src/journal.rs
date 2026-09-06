@@ -35,6 +35,9 @@ pub enum Op {
 pub enum State {
     /// `add` chose a path and has changed nothing yet.
     Planned,
+    /// `init --volume` built the image and udisks mounted it. Golden is
+    /// untouched, so a repair only leaves the image behind (C15).
+    Attached,
     /// `git worktree add --no-checkout --detach --lock` registered the path.
     Registered,
     /// The backend filled the working directory and rewrote the `.git` file.
@@ -61,6 +64,7 @@ impl State {
     pub fn key(self) -> &'static str {
         match self {
             State::Planned => "planned",
+            State::Attached => "attached",
             State::Registered => "registered",
             State::Cloned => "cloned",
             State::CheckedOut => "checked-out",
@@ -84,6 +88,11 @@ pub struct Entry {
     pub branch: Option<String>,
     /// The start of the command, RFC 3339 in UTC.
     pub started: String,
+    /// The volume that `init --volume` builds or removes (C15). It is absent
+    /// for every other command, and an older klon that cannot read the field
+    /// still parses the entry, so the version stays 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeMark>,
     /// The file stem. It is derived from `path`, so the file does not carry it.
     #[serde(skip)]
     pub name: String,
@@ -99,9 +108,21 @@ impl Entry {
             path: path.to_path_buf(),
             branch: branch.map(str::to_string),
             started: time::now_rfc3339(),
+            volume: None,
             name: name_for(path),
         }
     }
+}
+
+/// The volume half of an `init` entry (C15). `doctor --repair` reads it to
+/// finish or to undo a conversion that stopped: the record names every path
+/// that the transaction touched, and `undo` says which way it was going.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMark {
+    /// The record that a completed `init --volume` writes.
+    pub record: crate::volume::Volume,
+    /// True for `init --volume --undo`, which moves golden back off the volume.
+    pub undo: bool,
 }
 
 /// The journal side of one transaction. `add`, `rm`, and `init` (C7, C15) hold
@@ -122,6 +143,37 @@ impl Record {
         };
         write(&record.common, &record.entry)?;
         Ok(record)
+    }
+
+    /// `start` for `init --volume`, which carries the volume mark (C15).
+    pub fn start_volume(common: &Path, path: &Path, mark: VolumeMark) -> Result<Record> {
+        let mut entry = Entry::new(Op::Init, path, None);
+        entry.volume = Some(mark);
+        let record = Record {
+            common: common.to_path_buf(),
+            entry,
+        };
+        write(&record.common, &record.entry)?;
+        Ok(record)
+    }
+
+    /// Replace the volume record on the entry (C15). The next `reach` writes
+    /// it, so `doctor --repair` reads the live mount point and not the plan.
+    pub fn set_volume(&mut self, record: crate::volume::Volume) {
+        if let Some(mark) = self.entry.volume.as_mut() {
+            mark.record = record;
+        }
+    }
+
+    /// Name the directory that holds the entry from now on.
+    ///
+    /// `init` replaces golden, and the copy carries the journal with it, so
+    /// after the swap the entry lives in the new tree. The common directory
+    /// that `start` captured is an absolute path into the tree that is going
+    /// away, and a write there would land in a copy that a background delete
+    /// is removing (C7, C15).
+    pub fn relocate(&mut self, common: &Path) {
+        self.common = common.to_path_buf();
     }
 
     /// Record the step that just completed.
@@ -323,6 +375,7 @@ mod tests {
     fn every_state_key_round_trips_through_json() {
         for state in [
             State::Planned,
+            State::Attached,
             State::Registered,
             State::Cloned,
             State::CheckedOut,
