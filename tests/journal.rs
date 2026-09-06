@@ -462,21 +462,17 @@ fn rm_writes_its_entry_where_doctor_reads_it() {
 fn json_is_refused_where_no_document_exists() {
     // C14 gave `up` a document of its own, so only `prune` is left here.
     let fx = Fixture::generate(SEED, 20, 2, 2, 2);
-    for command in ["prune"] {
-        let out = klon(&fx.golden, &[command, "--json"]);
-        assert!(!out.status.success(), "{command} --json must fail");
-        assert!(
-            stderr(&out).contains("--json is not available"),
-            "{command} --json must say why: {}",
-            stderr(&out)
-        );
-        assert_eq!(stdout(&out), "", "{command} --json must print no document");
-    }
-    // The same commands still work without the flag.
-    for command in ["prune"] {
-        let out = klon(&fx.golden, &[command]);
-        assert!(out.status.success(), "{command} failed: {}", stderr(&out));
-    }
+    let out = klon(&fx.golden, &["prune", "--json"]);
+    assert!(!out.status.success(), "prune --json must fail");
+    assert!(
+        stderr(&out).contains("--json is not available"),
+        "prune --json must say why: {}",
+        stderr(&out)
+    );
+    assert_eq!(stdout(&out), "", "prune --json must print no document");
+    // The command still works without the flag.
+    let out = klon(&fx.golden, &["prune"]);
+    assert!(out.status.success(), "prune failed: {}", stderr(&out));
 }
 
 /// An interrupted `rm` that changed nothing leaves the klon in place.
