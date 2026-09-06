@@ -701,7 +701,21 @@ fn fill(
 
     // One status builds the untracked cache in the fresh index. Without it,
     // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
-    git::run(path, &["status", "--porcelain"])?;
+    //
+    // `GIT_FORCE_UNTRACKED_CACHE=1` is what makes the build survive the exit
+    // (R11, G2). git 2.34 reads `core.untrackedCache=true` when it opens the
+    // index, so it builds the cache in memory, but it marks the index dirty
+    // only when the variable above is set (`read_directory` in `dir.c`).
+    // Without the variable `status` throws the whole scan away, and every
+    // later `status` reopens all 1001 directories: 271 ms of the 452 ms first
+    // call on the 100k fixture. With it, the scan lands in the index and the
+    // untracked step costs 7 ms. Later git versions also honour the config
+    // key, and the variable stays correct there.
+    git::run_env(
+        path,
+        &["status", "--porcelain"],
+        &[("GIT_FORCE_UNTRACKED_CACHE", "1")],
+    )?;
     steps.mark("status-warm");
     git::run(
         golden,

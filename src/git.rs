@@ -9,12 +9,22 @@ use std::sync::OnceLock;
 
 /// Run `git -C <cwd> <args>` and return its stdout. A non-zero exit becomes `Error::Git`.
 pub fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(Error::io("run git"))?;
+    run_env(cwd, args, &[])
+}
+
+/// Run `git -C <cwd> <args>` with extra environment variables and return its
+/// stdout. The pairs are added to the inherited environment, not a replacement
+/// for it, so the caller keeps `PATH` and the git identity.
+///
+/// One caller needs this: `add` warms the untracked cache and git 2.34 reads
+/// `GIT_FORCE_UNTRACKED_CACHE` from the environment only (see `src/cli/add.rs`).
+pub fn run_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(Error::io("run git"))?;
     if output.status.success() {
         String::from_utf8(output.stdout).map_err(|_| Error::klon("git output must be valid UTF-8"))
     } else {
