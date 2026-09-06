@@ -421,7 +421,7 @@ fn jobserver_store(_host: &Host) -> probe::Status {
             jobserver::OFF_VAR
         ));
     }
-    match jobserver::top_up(jobserver::Look::Always) {
+    match jobserver::top_up(jobserver::Job::Look) {
         Ok(report) => probe::Status::Present(report.detail()),
         Err(err) => probe::Status::Broken(err.to_string()),
     }

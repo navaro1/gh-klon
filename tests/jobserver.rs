@@ -519,8 +519,8 @@ fn a_killed_client_leaves_a_shortfall_that_doctor_reports_and_a_new_run_repairs(
         "doctor must name the missing token: {detail}"
     );
     assert!(
-        detail.contains("klon process"),
-        "doctor must name the klon that holds the store: {detail}"
+        detail.contains("a klon holds the store open"),
+        "doctor must say that a klon holds the store: {detail}"
     );
     // A live klon keeps its tokens: a write here would make the count grow
     // past the target when that klon gives a token back.
@@ -599,7 +599,7 @@ fn the_top_up_leaves_a_live_client_alone() {
         "the top-up must leave a live client alone: {detail}"
     );
     assert!(
-        detail.contains("klon process"),
+        detail.contains("a klon holds the store open"),
         "doctor must name the holder: {detail}"
     );
     drop(reaper);
