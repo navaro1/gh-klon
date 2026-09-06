@@ -489,6 +489,31 @@ mod tests {
         assert!(!env.klon_commit.is_empty(), "build.rs must set KLON_COMMIT");
     }
 
+    /// The table names every verdict that failed, and only those. A passing
+    /// verdict, `not-applicable` included, must never look like a fault.
+    #[test]
+    fn the_reason_names_the_failed_verdicts_only() {
+        let mut correctness = Correctness {
+            matched: true,
+            ignored_manifest: "not-applicable: the baseline copies no ignored state".to_string(),
+            tracked: "on feature at 1a2b3c".to_string(),
+            status: "clean".to_string(),
+            removal: "removed".to_string(),
+        };
+        assert_eq!(correctness.reason(), "none");
+
+        correctness.matched = false;
+        correctness.status = "dirty: M .gitignore".to_string();
+        assert_eq!(correctness.reason(), "dirty: M .gitignore");
+
+        correctness.ignored_manifest = "mismatch: o0.bin differs".to_string();
+        correctness.removal = "the removal left /w/x in place".to_string();
+        assert_eq!(
+            correctness.reason(),
+            "mismatch: o0.bin differs; dirty: M .gitignore; the removal left /w/x in place"
+        );
+    }
+
     #[test]
     fn the_result_file_name_holds_the_date_and_the_host() {
         let mut report = sample_report();
