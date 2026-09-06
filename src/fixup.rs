@@ -30,12 +30,11 @@ use crate::{git, Error, Result};
 use grep_matcher::{Match, Matcher, NoCaptures, NoError};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use std::cell::RefCell;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// The biggest file klon rewrites (R15). A bigger one is an artifact, not a
 /// configuration file.
@@ -56,6 +55,10 @@ const LOG: &str = "fixup.log";
 /// The suffix of the temporary file that a rewrite renames over the original.
 const TEMP_SUFFIX: &str = ".klon-fixup.tmp";
 
+/// Workers on the walk. The pass reads every byte of the build tree, so it
+/// takes the measured optimum of the clone walk (handoff §4 "Backends").
+const WORKERS: usize = 4;
+
 /// What one pass changed. `add` prints nothing; `.klon/fixup.log` is the record.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -75,16 +78,86 @@ pub fn run(golden: &Path, klon: &Path, config: &Config) -> Result<Summary> {
     if golden == klon {
         return Ok(Summary::default());
     }
+    let roots = ignored_roots(klon)?;
+    let Some((first, rest)) = roots.split_first() else {
+        return Ok(Summary::default());
+    };
     let pass = Pass::new(golden, klon, config)?;
+    let found = Shared::default();
+    pass.walk(first, rest, &found);
+
     let mut summary = Summary::default();
-    let mut log = Vec::new();
-    for root in ignored_roots(klon)? {
-        pass.walk(&root, &mut summary, &mut log)?;
+    let mut log = found.changes.into_inner().expect("fixup lock");
+    for path in found.doomed.into_inner().expect("fixup lock") {
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {
+                summary.deleted += 1;
+                log.push(Change::deleted(pass.relative(&path)));
+            }
+            Err(err) => eprintln!("klon: fixup: delete {}: {err}", path.display()),
+        }
+    }
+    for change in &log {
+        match change.kind {
+            Kind::File => summary.files += 1,
+            Kind::Symlink => summary.symlinks += 1,
+            Kind::Deleted => {}
+        }
     }
     if !log.is_empty() {
+        // The workers finish in no fixed order, so the log is sorted. A stable
+        // file makes two runs on one tree comparable.
+        log.sort_by(|a, b| a.line.cmp(&b.line));
         write_log(klon, &log)?;
     }
     Ok(summary)
+}
+
+/// What the workers found, and what the caller must still delete.
+#[derive(Default)]
+struct Shared {
+    changes: Mutex<Vec<Change>>,
+    doomed: Mutex<Vec<PathBuf>>,
+}
+
+/// One line of the log, with the kind that the summary counts.
+struct Change {
+    kind: Kind,
+    line: String,
+}
+
+enum Kind {
+    File,
+    Symlink,
+    Deleted,
+}
+
+impl Change {
+    fn file(relative: &str, count: usize) -> Change {
+        Change {
+            kind: Kind::File,
+            line: format!("{relative} {count}"),
+        }
+    }
+
+    fn symlink(relative: &str) -> Change {
+        Change {
+            kind: Kind::Symlink,
+            line: format!("{relative} symlink"),
+        }
+    }
+
+    fn deleted(relative: String) -> Change {
+        Change {
+            kind: Kind::Deleted,
+            line: format!("{relative} deleted"),
+        }
+    }
 }
 
 /// One configured pass over one klon.
@@ -95,9 +168,7 @@ struct Pass {
     replacement: String,
     klon: PathBuf,
     /// The `[fixup] skip` globs, compiled against the klon root.
-    skip: Option<ignore::gitignore::Gitignore>,
-    /// One reusable searcher. The walk is single threaded, so a cell is enough.
-    searcher: RefCell<Searcher>,
+    skip: ignore::gitignore::Gitignore,
 }
 
 impl Pass {
@@ -119,26 +190,21 @@ impl Pass {
             needle,
             replacement,
             klon: klon.to_path_buf(),
-            skip: Some(skip),
-            // `quit` stops at the first NUL byte, so a binary file never
-            // reaches the rewrite and never reports a hit.
-            searcher: RefCell::new(
-                SearcherBuilder::new()
-                    .binary_detection(BinaryDetection::quit(0))
-                    .line_number(false)
-                    .build(),
-            ),
+            skip,
         })
     }
 
-    /// Walk one ignored entry and fix every file, symlink, and delete target
-    /// below it. `root` is absolute.
-    fn walk(&self, root: &Path, summary: &mut Summary, log: &mut Vec<String>) -> Result<()> {
-        let doomed: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let collect = Arc::clone(&doomed);
-        let walk = WalkBuilder::new(root)
-            // The entries are already known to be ignored, so every gitignore
-            // filter is off and nothing below the root is hidden from the walk.
+    /// Walk every ignored entry with `WORKERS` threads and fix what it finds.
+    /// The pass reads every byte of the build tree, so it sits where the clone
+    /// walk sits: on four workers (handoff §4).
+    fn walk(&self, first: &Path, rest: &[PathBuf], found: &Shared) {
+        let mut builder = WalkBuilder::new(first);
+        for root in rest {
+            builder.add(root);
+        }
+        builder
+            // The roots are already known to be ignored, so every gitignore
+            // filter is off and nothing below them is hidden from the walk.
             .hidden(false)
             .parents(false)
             .ignore(false)
@@ -146,86 +212,103 @@ impl Pass {
             .git_global(false)
             .git_exclude(false)
             .follow_links(false)
-            .filter_entry(move |entry| {
-                if on_delete_list(entry.path()) {
-                    collect
-                        .lock()
-                        .expect("fixup lock")
-                        .push(entry.path().to_path_buf());
-                    return false;
-                }
-                true
-            })
-            .build();
-        for entry in walk {
-            let entry = match entry {
-                Ok(entry) => entry,
-                // A vanished file is not a reason to stop: another process may
-                // own the ignored tree. Report it and continue.
-                Err(err) => {
-                    eprintln!("klon: fixup: {err}");
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if path.to_string_lossy().ends_with(TEMP_SUFFIX) {
-                continue;
+            .threads(WORKERS);
+        builder.build_parallel().run(|| {
+            // One searcher per worker: a `Searcher` holds a line buffer and is
+            // not shareable.
+            let mut searcher = SearcherBuilder::new()
+                // `quit` stops at the first NUL byte, so a binary file never
+                // reaches the rewrite and never reports a hit.
+                .binary_detection(BinaryDetection::quit(0))
+                .line_number(false)
+                .build();
+            Box::new(move |entry| self.visit(entry, &mut searcher, found))
+        });
+    }
+
+    /// Handle one walk entry on one worker.
+    fn visit(
+        &self,
+        entry: std::result::Result<ignore::DirEntry, ignore::Error>,
+        searcher: &mut Searcher,
+        found: &Shared,
+    ) -> ignore::WalkState {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A vanished file is not a reason to stop: another process may own
+            // the ignored tree. Report it and continue.
+            Err(err) => {
+                eprintln!("klon: fixup: {err}");
+                return ignore::WalkState::Continue;
             }
-            let Some(kind) = entry.file_type() else {
-                continue;
-            };
-            let outcome = if kind.is_symlink() {
-                self.fix_symlink(path)
-            } else if kind.is_file() {
-                self.fix_file(path)
-            } else {
-                Ok(None)
-            };
-            match outcome {
-                Ok(None) => {}
-                Ok(Some(line)) => {
-                    if kind.is_symlink() {
-                        summary.symlinks += 1;
-                    } else {
-                        summary.files += 1;
-                    }
-                    log.push(line);
-                }
-                Err(err) => eprintln!("klon: fixup: {err}"),
-            }
+        };
+        let path = entry.path();
+        if on_delete_list(path) {
+            found
+                .doomed
+                .lock()
+                .expect("fixup lock")
+                .push(path.to_path_buf());
+            // The caller deletes it, so no worker may descend into it.
+            return ignore::WalkState::Skip;
         }
-        let doomed = std::mem::take(&mut *doomed.lock().expect("fixup lock"));
-        for path in doomed {
-            let removed = if path.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            match removed {
-                Ok(()) => {
-                    summary.deleted += 1;
-                    log.push(format!("{} deleted", self.relative(&path)));
-                }
-                Err(err) => eprintln!("klon: fixup: delete {}: {err}", path.display()),
-            }
+        if path
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(TEMP_SUFFIX.as_bytes())
+        {
+            return ignore::WalkState::Continue;
         }
-        Ok(())
+        let Some(kind) = entry.file_type() else {
+            return ignore::WalkState::Continue;
+        };
+        let outcome = if kind.is_symlink() {
+            self.fix_symlink(path)
+        } else if kind.is_file() {
+            // The walk already stat-ed the entry; a second stat per file costs
+            // one syscall for nothing on a big build tree.
+            match entry.metadata() {
+                Ok(meta) => self.fix_file(path, &meta, searcher),
+                Err(err) => Err(Error::klon(format!("stat {}: {err}", self.relative(path)))),
+            }
+        } else {
+            Ok(None)
+        };
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(change)) => found.changes.lock().expect("fixup lock").push(change),
+            Err(err) => eprintln!("klon: fixup: {err}"),
+        }
+        ignore::WalkState::Continue
     }
 
     /// Rewrite one file when it passes every rail. The answer is the log line.
-    fn fix_file(&self, path: &Path) -> Result<Option<String>> {
+    ///
+    /// The rails run from the cheapest to the dearest: the name, then the size
+    /// from the walk's own stat, then one read, then the search. A build tree
+    /// holds tens of thousands of files, so the order decides the cost.
+    fn fix_file(
+        &self,
+        path: &Path,
+        meta: &fs::Metadata,
+        searcher: &mut Searcher,
+    ) -> Result<Option<Change>> {
+        if skipped_extension(path) || meta.len() > MAX_BYTES {
+            return Ok(None);
+        }
         let relative = self.relative(path);
-        if self.skipped(&relative) || skipped_extension(path) {
-            return Ok(None);
-        }
-        let meta = fs::symlink_metadata(path).map_err(Error::io(format!("stat {relative}")))?;
-        if meta.len() > MAX_BYTES {
-            return Ok(None);
-        }
-        if !self.holds_needle(path)? {
+        if self.skipped(&relative) {
             return Ok(None);
         }
         let bytes = fs::read(path).map_err(Error::io(format!("read {relative}")))?;
+        // Almost every file in a build tree never names golden. One `memmem`
+        // scan settles those, and only a candidate pays for the text test.
+        if memchr::memmem::find(&bytes, self.needle.as_bytes()).is_none() {
+            return Ok(None);
+        }
+        if !holds_needle(searcher, self.needle.as_bytes(), &bytes, &relative)? {
+            return Ok(None);
+        }
         // The searcher already refused a NUL byte. This refuses every other
         // byte sequence that is not text, so the splice cannot cut a codepoint.
         let Ok(text) = String::from_utf8(bytes) else {
@@ -235,22 +318,12 @@ impl Pass {
         if count == 0 {
             return Ok(None);
         }
-        replace_content(path, rewritten.as_bytes(), &meta)?;
-        Ok(Some(format!("{relative} {count}")))
-    }
-
-    /// True when `grep-searcher` found the needle in a file it read as text.
-    fn holds_needle(&self, path: &Path) -> Result<bool> {
-        let mut found = Found::default();
-        let mut searcher = self.searcher.borrow_mut();
-        searcher
-            .search_path(Fixed(self.needle.as_bytes()), path, &mut found)
-            .map_err(Error::io(format!("search {}", self.relative(path))))?;
-        Ok(found.hit && !found.binary)
+        replace_content(path, rewritten.as_bytes(), meta)?;
+        Ok(Some(Change::file(&relative, count)))
     }
 
     /// Point a symlink that resolves into golden at the same place in the klon.
-    fn fix_symlink(&self, path: &Path) -> Result<Option<String>> {
+    fn fix_symlink(&self, path: &Path) -> Result<Option<Change>> {
         let relative = self.relative(path);
         if self.skipped(&relative) {
             return Ok(None);
@@ -271,14 +344,14 @@ impl Pass {
         fs::remove_file(path).map_err(Error::io(format!("replace {relative}")))?;
         std::os::unix::fs::symlink(&new, path).map_err(Error::io(format!("relink {relative}")))?;
         crate::backend::set_symlink_times(path, &meta)?;
-        Ok(Some(format!("{relative} symlink")))
+        Ok(Some(Change::symlink(&relative)))
     }
 
     /// True when a `[fixup] skip` glob names this path.
     fn skipped(&self, relative: &str) -> bool {
         self.skip
-            .as_ref()
-            .is_some_and(|s| s.matched_path_or_any_parents(relative, false).is_ignore())
+            .matched_path_or_any_parents(relative, false)
+            .is_ignore()
     }
 
     /// The path of `entry` relative to the klon, for the log and the messages.
@@ -288,6 +361,21 @@ impl Pass {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+/// True when `grep-searcher` reads `bytes` as text and finds `needle` there.
+/// The caller already holds the bytes, so the search opens no second file.
+fn holds_needle(
+    searcher: &mut Searcher,
+    needle: &[u8],
+    bytes: &[u8],
+    relative: &str,
+) -> Result<bool> {
+    let mut found = Found::default();
+    searcher
+        .search_slice(Fixed(needle), bytes, &mut found)
+        .map_err(Error::io(format!("search {relative}")))?;
+    Ok(found.hit && !found.binary)
 }
 
 /// The top-level ignored entries of `klon`. `--directory` collapses a fully
@@ -321,7 +409,7 @@ fn ignored_roots(klon: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Append the log lines to `<klon>/.klon/fixup.log`.
-fn write_log(klon: &Path, lines: &[String]) -> Result<()> {
+fn write_log(klon: &Path, lines: &[Change]) -> Result<()> {
     use std::io::Write;
     let dir = klon.join(".klon");
     fs::create_dir_all(&dir).map_err(Error::io(format!("create {}", dir.display())))?;
@@ -332,8 +420,8 @@ fn write_log(klon: &Path, lines: &[String]) -> Result<()> {
         .open(&path)
         .map_err(Error::io(format!("open {}", path.display())))?;
     let mut text = String::new();
-    for line in lines {
-        text.push_str(line);
+    for change in lines {
+        text.push_str(&change.line);
         text.push('\n');
     }
     file.write_all(text.as_bytes())
@@ -434,6 +522,11 @@ fn utf8(path: &Path) -> Result<&str> {
 
 /// A `grep-searcher` matcher for one fixed string. klon searches for one
 /// absolute path, so a regular expression engine would only add a dependency.
+///
+/// The search itself is `memchr::memmem`, which `grep-searcher` already pulls
+/// in. A hand-written byte loop looked simpler and was 12 times slower than
+/// `grep -r` on a 20k-file build tree, because a test binary is unoptimized
+/// while `memmem` and `std` are not.
 #[derive(Clone, Copy)]
 struct Fixed<'a>(&'a [u8]);
 
@@ -449,13 +542,7 @@ impl Matcher for Fixed<'_> {
         if at > haystack.len() {
             return Ok(None);
         }
-        if self.0.is_empty() {
-            return Ok(Some(Match::new(at, at)));
-        }
-        let window = &haystack[at..];
-        let found = window
-            .windows(self.0.len())
-            .position(|slice| slice == self.0)
+        let found = memchr::memmem::find(&haystack[at..], self.0)
             .map(|start| Match::new(at + start, at + start + self.0.len()));
         Ok(found)
     }

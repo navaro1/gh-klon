@@ -300,6 +300,7 @@ dependencies = [
  "ignore",
  "landlock",
  "libc",
+ "memchr",
  "rayon",
  "reflink-copy",
  "serde",
