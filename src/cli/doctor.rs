@@ -479,8 +479,15 @@ fn ninja_version(_host: &Host) -> probe::Status {
     probe::version_of("ninja", &["--version"])
 }
 
+/// `pasta` on PATH (C23). An absent tool names the install command, so the
+/// row also answers "how do I get it".
 fn pasta_version(_host: &Host) -> probe::Status {
-    probe::version_of("pasta", &["--version"])
+    match probe::version_of("pasta", &["--version"]) {
+        probe::Status::Absent(_) => {
+            probe::Status::Absent("install with: sudo apt install passt".to_string())
+        }
+        status => status,
+    }
 }
 
 /// Which `merge-tree` form the conflict radar uses (C24). Both forms work, so
