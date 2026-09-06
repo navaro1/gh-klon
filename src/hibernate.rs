@@ -26,6 +26,10 @@ use std::path::{Path, PathBuf};
 /// The format version of a record. A record with another version fails closed.
 pub const VERSION: u32 = 1;
 
+/// The author and committer of a work commit. See `work_commit`.
+const IDENTITY_NAME: &str = "gh-klon";
+const IDENTITY_EMAIL: &str = "gh-klon@localhost";
+
 /// One hibernated klon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -303,6 +307,11 @@ fn save(golden: &Path, common: &Path, path: &Path, branch: &str, name: &str) -> 
 ///
 /// The index is copied first, so `git add -A` keeps the stat cache and rehashes
 /// only the files that changed. A fresh index would rehash the whole tree.
+///
+/// The commit carries klon's own identity, not the user's. It is machinery: it
+/// never reaches a branch, a pull request, or a merge, and `wake` deletes it.
+/// klon's identity also lets `hibernate` work in a repository where the user
+/// configured none, which `git commit-tree` would otherwise refuse.
 fn work_commit(path: &Path, head: &str, branch: &str) -> Result<String> {
     let admin = admin_dir(path)?;
     let temp = admin.join(format!("klon-hibernate.{}.index", std::process::id()));
@@ -322,11 +331,19 @@ fn work_commit(path: &Path, head: &str, branch: &str) -> Result<String> {
             .trim()
             .to_string();
         let message = format!("klon hibernate {branch}\n");
-        Ok(
-            git::run(path, &["commit-tree", &tree, "-p", head, "-m", &message])?
-                .trim()
-                .to_string(),
-        )
+        let author: [(&str, &OsStr); 4] = [
+            ("GIT_AUTHOR_NAME", OsStr::new(IDENTITY_NAME)),
+            ("GIT_AUTHOR_EMAIL", OsStr::new(IDENTITY_EMAIL)),
+            ("GIT_COMMITTER_NAME", OsStr::new(IDENTITY_NAME)),
+            ("GIT_COMMITTER_EMAIL", OsStr::new(IDENTITY_EMAIL)),
+        ];
+        Ok(git::run_env(
+            path,
+            &["commit-tree", &tree, "-p", head, "-m", &message],
+            &author,
+        )?
+        .trim()
+        .to_string())
     })();
     let _ = fs::remove_file(&temp);
     result
