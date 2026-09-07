@@ -198,10 +198,11 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
     out.extend_from_slice(&bytes[..12]);
     let mut stat_at = vec![None; changes.len()];
     let mut offsets: Vec<u32> = Vec::with_capacity(layout.count);
-    // The full path of the previous entry, in the old index and in the new
-    // one. Version 4 spells each path against the previous one, so an entry
-    // may be copied byte for byte only while the two agree.
-    let mut prev_old: Vec<u8> = Vec::new();
+    // `path` holds the full path of the entry the walk is on, and so, at the
+    // top of each turn, of the previous entry in the old index. `prev_new` is
+    // the same for the new index. Version 4 spells each path against the
+    // previous one, so an entry may be copied byte for byte only while the two
+    // agree; before version 4 every entry spells its own path and always may.
     let mut prev_new: Vec<u8> = Vec::new();
     let mut path: Vec<u8> = Vec::new();
     let mut next = 0usize;
@@ -211,20 +212,21 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
 
     for _ in 0..layout.count {
         let start = at;
+        let mut in_sync = layout.version != 4 || prev_new == path;
         let (mode, flags, name_at) = read_head(bytes, start, hash_len, layout.version, end)?;
         at = name_at;
         // The path, then the end of the entry.
         if layout.version == 4 {
             let (strip, n) = untracked::decode_varint(&bytes[at..end]).ok_or("a broken entry")?;
             at += n;
-            if strip > prev_old.len() {
+            if strip > path.len() {
                 return Err("an entry strips more than the previous path holds");
             }
             let nul = bytes[at..end]
                 .iter()
                 .position(|b| *b == 0)
                 .ok_or("an unterminated path")?;
-            path.truncate(prev_old.len() - strip);
+            path.truncate(path.len() - strip);
             path.extend_from_slice(&bytes[at..at + nul]);
             at += nul + 1;
         } else {
@@ -246,8 +248,6 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
         if declared != 0x0fff && declared != path.len() {
             return Err("an entry's name length disagrees with its path");
         }
-        prev_old.clear();
-        prev_old.extend_from_slice(&path);
 
         // A merge stage, an assume-valid mark, or an extended flag all change
         // what a checkout does with an entry, and a submodule needs a whole
@@ -277,6 +277,9 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
             ));
             prev_new.clear();
             prev_new.extend_from_slice(&changes[i].path);
+            // The entry before this one is no longer the one the old bytes
+            // spell their path against, so those bytes cannot be copied.
+            in_sync = false;
             next += 1;
         }
 
@@ -298,10 +301,9 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
                 offsets.push(out.len() as u32);
                 stat_at[i] = Some(emit(&mut out, layout.version, &prev_new, &path, target));
             }
-            // The branch leaves the path alone. Version 4 spells a path
-            // against the previous one, so the old bytes still say the same
-            // thing only while the previous path agrees.
-            None if layout.version != 4 || prev_new == prev_old => match &mut run {
+            // The branch leaves the path alone, and the entry before it is the
+            // one it was, so the old bytes still say the same thing.
+            None if in_sync => match &mut run {
                 Some(open) => {
                     offsets.push((open.at + (start - open.from)) as u32);
                     open.to = at;
@@ -848,6 +850,24 @@ mod tests {
                 .windows(9)
                 .any(|w| w == b"/new, sys".as_slice() || w == b"Location ".as_slice()));
             assert!(!after.windows(4).any(|w| w == b"/old".as_slice()));
+
+            // The point of the splice: every other entry keeps its bytes. One
+            // path changed and kept its length, so the entry region has the
+            // same size and differs only inside that one entry.
+            let old = untracked::parse(&before).unwrap();
+            let new = untracked::parse(&after).unwrap();
+            assert_eq!(new.extensions_at, old.extensions_at, "version {version}");
+            let differ: Vec<usize> = (12..old.extensions_at)
+                .filter(|i| before[*i] != after[*i])
+                .collect();
+            assert!(!differ.is_empty(), "version {version}: something changed");
+            let (first, last) = (differ[0], differ[differ.len() - 1]);
+            assert!(
+                last - first < 62,
+                "version {version}: {} bytes changed, from {first} to {last}, \
+                 which is more than one entry's fixed fields",
+                differ.len()
+            );
         }
     }
 
