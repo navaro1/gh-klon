@@ -20,8 +20,9 @@
 //!   commit` write a wrong tree, and a correct patch of it means re-emitting a
 //!   recursive structure. git treats a missing cached tree as "nothing cached"
 //!   and rebuilds it from the entries, which are the truth, so dropping is the
-//!   one choice that cannot be silently wrong. The first `git commit` in the
-//!   klon pays about 200 ms for the rebuild, off the `add` path.
+//!   one choice that cannot be silently wrong. The first `git write-tree` in
+//!   the klon pays for the rebuild: 0.76 s against 0.04 s on the 100k fixture,
+//!   and 0.04 s every time after it. That is off the `add` path.
 //! - `IEOT`, the entry offset table, is **recomputed**. Its blocks are byte
 //!   offsets of entries, so a splice moves them. Dropping it would cost every
 //!   later git command the threaded index read that G2 turned on, so the
