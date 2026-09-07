@@ -121,22 +121,38 @@ jobs:
       - name: Install the extension from the fresh release
         run: |
           set -eux
-          # The API answers /releases/latest with the newest stable release
-          # only, so a tag with a prerelease suffix pins the install to its
-          # own tag with --pin. The `owner/repo@tag` form is not a syntax the
-          # gh CLI accepts, and it answers "Could not find extension".
-          # A stable tag takes the default path.
+          # `gh extension install` reads /releases/latest to decide whether a
+          # repository ships a binary extension, and that endpoint answers 404
+          # while every release of the repository is a prerelease. So gh cannot
+          # install a prerelease, with or without --pin. A prerelease run
+          # downloads the asset of its own runner and proves the binary works;
+          # the first stable tag exercises the real install path.
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            gh extension install navaro1/gh-klon --pin "$GITHUB_REF_NAME"
+            case "$RUNNER_OS-$RUNNER_ARCH" in
+              Linux-X64) suffix="linux-amd64" ;;
+              Linux-ARM64) suffix="linux-arm64" ;;
+              macOS-X64) suffix="darwin-amd64" ;;
+              macOS-ARM64) suffix="darwin-arm64" ;;
+              *) echo "no asset for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+            esac
+            mkdir -p "$HOME/.local/bin"
+            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --pattern "gh-klon_*_${suffix}" --output "$HOME/.local/bin/gh-klon"
+            chmod +x "$HOME/.local/bin/gh-klon"
+            echo "KLON=$HOME/.local/bin/gh-klon" >> "$GITHUB_ENV"
           else
-            gh extension install navaro1/gh-klon
+            gh extension install "$GITHUB_REPOSITORY"
+            echo "KLON=gh klon" >> "$GITHUB_ENV"
           fi
-          gh klon --version
-      - name: gh klon doctor exits 0
+      - name: The binary reports the crate version
+        run: |
+          set -eux
+          $KLON --version
+      - name: doctor exits 0
         run: |
           set -eux
           mkdir -p "$HOME/doctor-check"
           cd "$HOME/doctor-check"
           git init -q
           git -c user.email=ci@example.com -c user.name=ci commit -q --allow-empty -m init
-          gh klon doctor
+          $KLON doctor
