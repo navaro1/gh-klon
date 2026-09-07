@@ -131,18 +131,11 @@ impl Spliced {
     }
 
     /// The finished index bytes, with the checksum git verifies on every read.
+    /// `plan` refuses every index but a SHA-1 one, so the trailer is a SHA-1.
     pub fn finish(mut self) -> Vec<u8> {
         let body = self.bytes.len() - self.hash_len;
-        match self.hash_len {
-            20 => {
-                let digest = sha1::Sha1::digest(&self.bytes[..body]);
-                self.bytes[body..].copy_from_slice(&digest);
-            }
-            _ => {
-                let digest = sha2::Sha256::digest(&self.bytes[..body]);
-                self.bytes[body..].copy_from_slice(&digest);
-            }
-        }
+        let digest = sha1::Sha1::digest(&self.bytes[..body]);
+        self.bytes[body..].copy_from_slice(&digest);
         self.bytes
     }
 }
@@ -171,6 +164,13 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
         }
     }
     let hash_len = layout.hash_len;
+    // `EOIE` holds a hash of the extension headers in the repository's own
+    // algorithm. Every repository this klon meets is SHA-1 on git 2.34, and a
+    // splice that guessed the other one would write a hash git rejects, so a
+    // SHA-256 index takes the checkout.
+    if hash_len != 20 {
+        return Err("the index is not a SHA-1 index");
+    }
     for change in changes {
         if let Some(target) = &change.to {
             if target.oid.len() != hash_len {
@@ -387,7 +387,6 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
             walk += 8 + size;
         }
         data.extend_from_slice(&hasher.finalize());
-        data.truncate(4 + hash_len);
         push_ext(&mut out, b"EOIE", &data);
     }
     out.extend(std::iter::repeat_n(0u8, hash_len));
