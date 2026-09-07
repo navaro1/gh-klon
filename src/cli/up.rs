@@ -118,7 +118,7 @@ pub fn run(args: Args, yes: bool, json: bool) -> Result<()> {
     // Step 5: the next spare. The builder is detached and low priority, and a
     // failure to start it costs one line, never the `up`.
     let spare_started = spare::enabled(cfg.spare, args.no_spare);
-    spare::start_after(&golden, cfg.spare, args.no_spare);
+    spare::start_after(&golden, cfg.spare, args.no_spare, None);
 
     if json {
         let report = Report {

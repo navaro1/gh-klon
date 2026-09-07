@@ -37,6 +37,27 @@ pub fn run_env(cwd: &Path, args: &[&str], envs: &[(&str, &OsStr)]) -> Result<Str
     }
 }
 
+/// Run `git -C <cwd> <args>` with extra environment variables and return the
+/// raw stdout bytes. The arguments are `OsStr`, so a path that is not UTF-8
+/// still reaches git as one argument, and the answer is bytes for the same
+/// reason: a `-z` listing names files as they are (G1).
+pub fn run_bytes_env(cwd: &Path, args: &[&OsStr], envs: &[(&str, &OsStr)]) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(Error::io("run git"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(Error::Git {
+            code: output.status.code().unwrap_or(1),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 /// Run `git -C <cwd> <args>` with `input` on stdin and return the exit code and the
 /// raw stdout. An exit code outside `ok` becomes `Error::Git`.
 ///

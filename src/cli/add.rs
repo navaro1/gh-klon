@@ -10,6 +10,7 @@ use crate::{budget, config, fixup, git, hooks, paths, repair, space, spare, warm
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -38,6 +39,26 @@ impl Steps {
         }
         self.last = Instant::now();
     }
+
+    /// Print a duration that a thread measured on its own, for a step that
+    /// ran beside another one. The mark of the pair follows.
+    fn note(&self, step: &str, took: std::time::Duration) {
+        if self.on {
+            eprintln!(
+                "klon: debug: add {step} {:.1} ms (in parallel)",
+                took.as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+/// The switches of the call that `fill` reads.
+struct Switches {
+    no_fixup: bool,
+    /// `--yes`, for an approval the deferred plan may need.
+    yes: bool,
+    /// `--json`, for the progress line of a deferred clone.
+    json: bool,
 }
 
 /// The JSON schema name. A field removal or a type change bumps the suffix.
@@ -126,6 +147,10 @@ struct SparePolicy<'a> {
 
 /// Directories inside golden where a klon may live.
 const ALLOWED_INSIDE_GOLDEN: &[&str] = &[".claude/worktrees", ".t3"];
+
+/// The most untracked paths that `git clean` takes on its command line (G1).
+/// Above it, `add` runs the plain `git clean -fdq` walk instead.
+const CLEAN_LIST_LIMIT: usize = 1000;
 
 /// What the transaction made, for a caller that prints its own report.
 /// `sync --fresh` (C14) uses it: there `sync` owns stdout.
@@ -300,40 +325,25 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
         .filter(|p| p != &golden);
     let mut exclude = Exclusions::new(&golden, others.chain(std::iter::once(path.clone())));
 
-    // R41: one walk of golden answers how many bytes the backend will write.
-    // A backend that shares blocks answers 0 without a walk, so only a byte
-    // copy pays for this. klon refuses here, before git registers anything, so
-    // a full filesystem leaves no half-made klon behind.
-    let estimate = choice.backend.estimate_bytes(&golden, &exclude);
-    space::check(&path, estimate)?;
-
-    // R36: the big ignored directories go to a detached warm process, and a
-    // `[copy] reinstall` command replaces the copy of its directory. The plan
-    // is empty for every backend but `copy`. The approval gate runs before the
-    // first change, like every other refusal.
-    let plan = warm::plan(&golden, &exclude, &config, choice.backend.name())?;
-    if plan
-        .iter()
-        .any(|step| matches!(step.action, warm::Action::Reinstall { .. }))
-    {
-        config.ensure_approved(yes, &["copy.reinstall"])?;
-    }
-    if choice.backend.name() == "copy" {
-        // R41: the progress line counts the inline part only, so it ends at
-        // the total it announced. The survey is the memoized one the estimate
-        // above already walked, so golden is walked once.
-        let survey = copy::survey(&golden, &exclude);
-        let inline = plan.iter().fold(survey.total, |left, step| {
-            match survey.dirs.get(&step.dir) {
-                Some(sizes) => left.without(*sizes),
-                None => left,
-            }
-        });
-        copy::arm_progress(inline, json);
-    }
-    for step in &plan {
-        exclude.add_exact(golden.join(&step.dir));
-    }
+    // The estimate, the free-space check, and the warm plan all walk golden,
+    // which is most of a spare-served `add` on a big tree (G1: 1.7 s of 3.6 s
+    // on the 100k fixture under load). A spare that passes every check of the
+    // claim is one rename and writes nothing, so the walk waits until the
+    // claim itself fails, which `fill` handles. Every other call plans here,
+    // before the first change, so a refusal leaves nothing behind.
+    let spare_ready = use_spare && spare::looks_usable(&golden, args.backend.as_deref());
+    let mut plan = match spare_ready {
+        true => None,
+        false => Some(plan_clone(
+            &golden,
+            &path,
+            &mut exclude,
+            choice.backend.as_ref(),
+            &config,
+            yes,
+            json,
+        )?),
+    };
     steps.mark("plan");
 
     // Step 0: the journal entry precedes the first repository change.
@@ -363,12 +373,17 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
     let result = fill(
         &golden,
         &common,
-        &exclude,
+        &mut exclude,
+        &mut plan,
         &path,
         &branch,
         choice.backend.as_ref(),
         &config,
-        args.no_fixup,
+        Switches {
+            no_fixup: args.no_fixup,
+            yes,
+            json,
+        },
         SparePolicy {
             on: use_spare,
             wanted: args.backend.as_deref(),
@@ -381,33 +396,39 @@ pub fn spawn(args: Args, yes: bool, json: bool) -> Result<Spawned> {
         // The rollback finished, so the entry has no work left either.
         record.close()?;
     }
-    let spare_backend = result?;
+    let Filled {
+        spare: spare_meta,
+        warmed_inline,
+    } = result?;
     record.reach(State::Ready)?;
     record.close()?;
 
     // Step 8: the next spare. The builder is detached and low priority, and a
-    // failure to start it costs one line, never the klon.
+    // failure to start it costs one line, never the klon. A klon that `fill`
+    // did not warm itself is warmed by that builder first: one forced `git
+    // status` writes its untracked cache back complete (G1).
     if use_spare {
-        spare::start_after(&golden, config.spare, args.no_spare);
+        let warm = (!warmed_inline).then_some(path.as_path());
+        spare::start_after(&golden, config.spare, args.no_spare, warm);
         steps.mark("spare-start");
     }
 
     // Step 8b: the klon is ready and unlocked, so the big ignored directories
     // can fill behind it. `list` reports `warming` until the last one lands.
     // A spare already holds every one of them, so it leaves nothing to warm.
-    let warming = match spare_backend.is_some() {
+    let warming = match spare_meta.is_some() {
         true => Vec::new(),
-        false => warm::start(&golden, &path, plan, args.no_fixup),
+        false => warm::start(&golden, &path, plan.unwrap_or_default(), args.no_fixup),
     };
     hint_volume(&common, choice.backend.name());
     steps.mark("warm-start");
 
     Ok(Spawned {
-        backend: spare_backend
-            .as_deref()
-            .unwrap_or(choice.backend.name())
+        backend: spare_meta
+            .as_ref()
+            .map_or(choice.backend.name(), |meta| meta.backend.as_str())
             .to_string(),
-        spare: spare_backend.is_some(),
+        spare: spare_meta.is_some(),
         duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         path,
         branch,
@@ -581,36 +602,95 @@ fn refuse_checked_out(worktrees: &[git::Worktree], branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Steps 3 to 10. Runs after git registered the worktree. The answer names
-/// the backend of the hot spare when the spare filled the working directory.
+/// The estimate, the free-space check, and the warm plan of a clone (R36,
+/// R41). One walk of golden answers how many bytes the backend will write; a
+/// backend that shares blocks answers 0 without a walk, so only a byte copy
+/// pays for this. The plan is empty for every backend but `copy`, and the
+/// approval gate for a `[copy] reinstall` command sits with it. The exclusion
+/// set grows by the directories the warm process brings.
+fn plan_clone(
+    golden: &Path,
+    path: &Path,
+    exclude: &mut Exclusions,
+    backend: &dyn Backend,
+    config: &config::Config,
+    yes: bool,
+    json: bool,
+) -> Result<Vec<warm::Step>> {
+    let estimate = backend.estimate_bytes(golden, exclude);
+    space::check(path, estimate)?;
+    let plan = warm::plan(golden, exclude, config, backend.name())?;
+    if plan
+        .iter()
+        .any(|step| matches!(step.action, warm::Action::Reinstall { .. }))
+    {
+        config.ensure_approved(yes, &["copy.reinstall"])?;
+    }
+    if backend.name() == "copy" {
+        // R41: the progress line counts the inline part only, so it ends at
+        // the total it announced. The survey is the memoized one the estimate
+        // above already walked, so golden is walked once.
+        let survey = copy::survey(golden, exclude);
+        let inline = plan.iter().fold(survey.total, |left, step| {
+            match survey.dirs.get(&step.dir) {
+                Some(sizes) => left.without(*sizes),
+                None => left,
+            }
+        });
+        copy::arm_progress(inline, json);
+    }
+    for step in &plan {
+        exclude.add_exact(golden.join(&step.dir));
+    }
+    Ok(plan)
+}
+
+/// Steps 3 to 10. Runs after git registered the worktree. The answer is the
+/// record of the hot spare when the spare filled the working directory.
 #[allow(clippy::too_many_arguments)]
 fn fill(
     golden: &Path,
     common: &Path,
-    exclude: &Exclusions,
+    exclude: &mut Exclusions,
+    plan: &mut Option<Vec<warm::Step>>,
     path: &Path,
     branch: &str,
     backend: &dyn Backend,
     config: &config::Config,
-    no_fixup: bool,
+    switches: Switches,
     policy: SparePolicy,
     record: &mut journal::Record,
     steps: &mut Steps,
-) -> Result<Option<String>> {
+) -> Result<Filled> {
     let admin_dir = read_admin_dir(path)?;
     exclude_klon_dir(common)?;
 
     // Step 4: the spare, when one is ready (C9); else clone golden minus .git,
     // the destination, and every registered worktree.
-    let spare_backend = match policy.on {
+    let spare_meta = match policy.on {
         true => match spare::claim(golden, path, &admin_dir, policy.wanted)? {
-            spare::Claim::Used(name) => Some(name),
+            spare::Claim::Used(meta) => Some(*meta),
             spare::Claim::Direct => None,
         },
         false => None,
     };
-    let used_spare = spare_backend.is_some();
+    let used_spare = spare_meta.is_some();
     if !used_spare {
+        // The plan waited for a spare that then failed its claim (G1). It
+        // runs now, after the registration: a refusal here rolls the `add`
+        // back through the caller, so the outcome is the same as a refusal
+        // before it, one process later.
+        if plan.is_none() {
+            *plan = Some(plan_clone(
+                golden,
+                path,
+                exclude,
+                backend,
+                config,
+                switches.yes,
+                switches.json,
+            )?);
+        }
         // The set leaves out `.git`, the destination, every registered
         // worktree, and the directories the warm process will bring (R36).
         backend.clone(golden, path, exclude)?;
@@ -659,18 +739,89 @@ fn fill(
     ensure_config(golden)?;
     steps.mark("config");
 
-    // Steps 8 to 10.
-    git::run(path, &["checkout", "-q", "--force", branch])?;
-    steps.mark("checkout");
-    git::run(path, &["clean", "-fdq"])?;
-    steps.mark("clean");
-    // Step 5b: the ignored directories still name golden. `git clean` ran
-    // first, so every entry that the pass walks is an ignored one (handoff §4).
-    // It runs before the envelope, so the pass never reads the new `.klon/`.
-    if !no_fixup {
-        fixup::run(golden, path, config)?;
-        steps.mark("fixup");
-    }
+    // What the spare record says about the tree, and what the checkout is
+    // about to change in it (G1). One `git diff-tree` between the commit the
+    // spare was made from and the branch names every path the checkout will
+    // write or remove. The recorded lists are shortcuts around two walks of
+    // the whole tree, and each holds only while the tree the spare carries
+    // still matches the commit that diff starts from. Four conditions say
+    // when it does:
+    //
+    // - `index_matches_head`: the spare carries the index golden had when
+    //   the builder ran. A staged change makes the spare's files differ from
+    //   `head` in a way a diff between two commits cannot name. A staged
+    //   `git rm --cached` of a file an ignore rule matches is the case that
+    //   bites: the diff says nothing, and the checkout restores the file as
+    //   tracked while the fixup treats it as ignored.
+    // - `shared_ignore_hash`: `info/exclude` and `core.excludesFile` decide
+    //   what is ignored, live in no commit, and so no diff can see them
+    //   change.
+    // - `rules_stable`: no `.gitignore` differs between the two commits. A
+    //   branch that drops a rule turns ignored paths into untracked ones,
+    //   and a branch that adds one turns an untracked directory into an
+    //   ignored one that the recorded entries do not name.
+    // - `entries_safe`: no path the checkout writes meets a recorded ignored
+    //   entry. `meets` is symmetric on purpose: a branch may track files
+    //   inside an ignored directory, and it may also replace the directory
+    //   itself with a tracked file or symlink of the same name.
+    //
+    // A spare from an older builder has neither list, and a direct clone has
+    // no record at all; both take the git-asked paths below.
+    let recorded = spare_meta.as_ref().and_then(|meta| {
+        let entries = meta.ignored_entries.as_ref()?;
+        let touched = tree_diff(path, &meta.head, branch)?;
+        Some((entries, touched))
+    });
+    let spare_tree_is_its_commit = spare_meta.as_ref().is_some_and(|meta| {
+        meta.index_matches_head == Some(true)
+            && meta.shared_ignore_hash.as_deref()
+                == Some(spare::shared_ignore_hash(golden, common).as_str())
+    });
+    let rules_stable = spare_tree_is_its_commit
+        && recorded.as_ref().is_some_and(|(_, touched)| {
+            !touched
+                .iter()
+                .any(|changed| crate::untracked::is_ignore_file(changed))
+        });
+    // The recorded entries are safe to walk beside the checkout only while
+    // the rules that produced them still hold, so this builds on
+    // `rules_stable`.
+    let entries_safe = rules_stable
+        && recorded.as_ref().is_some_and(|(entries, touched)| {
+            !touched
+                .iter()
+                .any(|changed| entries.iter().any(|entry| meets(changed, entry)))
+        });
+    let recorded_untracked = spare_meta
+        .as_ref()
+        .filter(|_| rules_stable)
+        .and_then(|meta| meta.untracked.clone());
+
+    // Step 8: the tracked files of the branch, with step 5b, the path fixup
+    // (R15), beside it when the recorded entries are safe: the fixup walks
+    // only those, the checkout touches none of them, and the slower one sets
+    // the pace. The recorded list saves one walk of the whole tree, which is
+    // what asking git for it in the klon costs.
+    let fixup_beside_checkout = match (&recorded, entries_safe, switches.no_fixup) {
+        (Some((entries, _)), true, false) => {
+            Some(move || fixup::run_named(golden, path, config, entries.iter()).map(|_| ()))
+        }
+        _ => None,
+    };
+    let fixup_beside = fixup_beside_checkout.is_some();
+    let mut fixup_done = fixup_beside || switches.no_fixup;
+    beside(
+        steps,
+        "checkout",
+        || git::run(path, &["checkout", "-q", "--force", branch]).map(|_| ()),
+        "fixup",
+        fixup_beside_checkout,
+    )?;
+    steps.mark(if fixup_beside {
+        "checkout+fixup"
+    } else {
+        "checkout"
+    });
 
     // Step 10a (C22, R20): the per-tree hooks. The copy is the klon's own
     // snapshot of the repository hooks, so an edit in this klon never runs in
@@ -682,7 +833,8 @@ fn fill(
 
     // Step 10b: the envelope contract (handoff §5). `/.klon/` is already in
     // `info/exclude`, so the new directory keeps the klon clean for git. It is
-    // written before the status below, so the untracked cache already knows it.
+    // written before the status below, so the index that the status writes
+    // is newer than the root directory, and no later status re-reads the root.
     let ip = slots::allocate(common, branch, path)?;
     env::write(path, branch, &ip)?;
     steps.mark("env");
@@ -693,44 +845,202 @@ fn fill(
     hooks::export_to_plain_git(golden, path);
     steps.mark("hooks-export");
 
-    // The state comes after the envelope, not before it. `doctor --repair`
-    // reads `checked-out` as "only the unlock is left" and finishes there, so a
-    // klon that reached that state without an env file would stay half made:
-    // `run`, `shell`, and `stop` all need the file. A crash before this line
-    // leaves the state `cloned`, and the repair rolls the whole `add` back.
+    // Step 9: the untracked, non-ignored paths that golden had at the clone,
+    // which `git clean` must remove. A `git clean -fdq` over the whole tree
+    // cost 270 to 360 ms on the 100k fixture, almost always for nothing, so
+    // the clean gets the list instead and walks nothing when it is empty.
+    //
+    // A spare from this builder brings the list when the rules are stable:
+    // the status that built the untracked cache of the spare printed it.
+    // Such a klon also needs no status here: the cache came relocated in the
+    // index, the checkout kept it and marked only the directories it wrote,
+    // and the builder that `spawn` starts next writes it back complete. The
+    // first `git status` in the klon reads the cache either way (R11, G2).
+    //
+    // Every other klon runs the status now, and reads the list from it.
+    // `GIT_FORCE_UNTRACKED_CACHE=1` is what makes the scan survive the exit:
+    // git 2.34 builds the cache whenever `core.untrackedCache` is on, but
+    // writes it back only under that variable (`read_directory` in `dir.c`).
+    // Later versions honour the config key and the variable alike. A fixup
+    // that has not run yet runs beside that status, from git's own list of
+    // the ignored entries, which the checkout has already shaped: the status
+    // never enters the ignored directories, so the slower of the two sets
+    // the pace. An untracked file that the clean then removes was rewritten
+    // for nothing, which costs microseconds and never a wrong byte.
+    let mut warmed_inline = false;
+    let untracked: Vec<Vec<u8>> = match recorded_untracked {
+        Some(list) => list.into_iter().map(String::into_bytes).collect(),
+        None => {
+            let fixup_beside_status =
+                (!fixup_done).then_some(|| fixup::run(golden, path, config).map(|_| ()));
+            let fixup_beside = fixup_beside_status.is_some();
+            let (status, _) = beside(
+                steps,
+                "status-warm",
+                || {
+                    git::run_bytes_env(
+                        path,
+                        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"]
+                            .map(OsStr::new),
+                        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
+                    )
+                },
+                "fixup",
+                fixup_beside_status,
+            )?;
+            fixup_done = true;
+            warmed_inline = true;
+            steps.mark(if fixup_beside {
+                "status-warm+fixup"
+            } else {
+                "status-warm"
+            });
+            crate::untracked::scan_porcelain(&status).untracked
+        }
+    };
+    // The recorded entries were not safe beside the checkout, so the fixup
+    // runs now, from git's list, after it.
+    if !fixup_done {
+        fixup::run(golden, path, config)?;
+        steps.mark("fixup");
+    }
+    // The paths go on the command line as literal names, so a name with a
+    // glob character is still one name (`git clean` on 2.34 reads no
+    // pathspec file). A list too long for one command line, which no
+    // working golden has, falls back to the walk.
+    if untracked.len() > CLEAN_LIST_LIMIT {
+        git::run(path, &["clean", "-fdq"])?;
+    } else if !untracked.is_empty() {
+        let mut args: Vec<&OsStr> = ["--literal-pathspecs", "clean", "-fdq", "--"]
+            .map(OsStr::new)
+            .to_vec();
+        args.extend(untracked.iter().map(|p| OsStr::from_bytes(p)));
+        git::run_bytes_env(path, &args, &[])?;
+    }
+    steps.mark("clean");
+
+    // The state comes after the envelope and the fixup, not before them.
+    // `doctor --repair` reads `checked-out` as "only the unlock is left" and
+    // finishes there, so a klon that reached that state without an env file
+    // would stay half made: `run`, `shell`, and `stop` all need the file. A
+    // crash before this line leaves the state `cloned`, and the repair rolls
+    // the whole `add` back.
     record.reach(State::CheckedOut)?;
 
-    // One status builds the untracked cache in the fresh index. Without it,
-    // the first `rm` pays the build and misses its 100 ms budget (handoff §11).
-    //
-    // `GIT_FORCE_UNTRACKED_CACHE=1` is what makes the build survive the exit
-    // (R11, G2). git 2.34 reads `core.untrackedCache=true` when it opens the
-    // index, so it builds the cache in memory, but it marks the index dirty
-    // only when the variable above is set (`read_directory` in `dir.c`).
-    // Without the variable `status` throws the whole scan away, and every
-    // later `status` reopens all 1001 directories: 271 ms of the 452 ms first
-    // call on the 100k fixture. With it, the scan lands in the index and the
-    // untracked step costs 7 ms. Later git versions also honour the config
-    // key, and the variable stays correct there.
-    git::run_env(
-        path,
-        &["status", "--porcelain"],
-        &[("GIT_FORCE_UNTRACKED_CACHE", OsStr::new("1"))],
-    )?;
-    steps.mark("status-warm");
     git::run(
         golden,
         &["worktree", "unlock", path.to_str().unwrap_or_default()],
     )?;
     steps.mark("unlock");
-    Ok(spare_backend)
+    Ok(Filled {
+        spare: spare_meta,
+        warmed_inline,
+    })
 }
 
-/// The three keys that make the first `git status` cheap (handoff §4). One
+/// What `fill` made.
+struct Filled {
+    /// The record of the hot spare when the spare filled the working
+    /// directory.
+    spare: Option<spare::Meta>,
+    /// True when `fill` ran the forced `git status` itself. Else the builder
+    /// that `spawn` starts runs it in the background (G1).
+    warmed_inline: bool,
+}
+
+/// True when a path the checkout writes and a recorded ignored entry can
+/// touch the same file. The two meet when they are equal, when the changed
+/// path lies inside the entry, or when the entry lies inside the changed
+/// path. The last case is the one a descendant-only test misses: a branch
+/// that replaces an ignored `build/` with a tracked symlink named `build`
+/// changes the path `build`, which no descendant test matches.
+fn meets(changed: &[u8], entry: &str) -> bool {
+    fn inside(inner: &[u8], outer: &[u8]) -> bool {
+        inner.len() > outer.len()
+            && inner.starts_with(outer)
+            && inner.get(outer.len()) == Some(&b'/')
+    }
+    let entry = entry.strip_suffix('/').unwrap_or(entry).as_bytes();
+    changed == entry || inside(changed, entry) || inside(entry, changed)
+}
+
+/// The paths that differ between the tree of `from` and the tree of
+/// `branch`, as `git diff-tree` names them: what a checkout from one to the
+/// other writes or removes. None when git cannot answer, for example when
+/// `from` is gone; the caller then takes the paths that ask git again.
+fn tree_diff(klon: &Path, from: &str, branch: &str) -> Option<Vec<Vec<u8>>> {
+    let out = git::run_bytes_env(
+        klon,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            from,
+            branch,
+        ]
+        .map(OsStr::new),
+        &[],
+    )
+    .ok()?;
+    Some(
+        out.split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
+/// Run `main` on this thread and `side`, when there is one, on another; then
+/// print both durations under their names. The slower of the two sets the
+/// pace, and an error from either one is the error of the pair.
+fn beside<T, U, F, G>(
+    steps: &Steps,
+    main_name: &str,
+    main: F,
+    side_name: &str,
+    side: Option<G>,
+) -> Result<(T, Option<U>)>
+where
+    F: FnOnce() -> Result<T>,
+    G: FnOnce() -> Result<U> + Send,
+    U: Send,
+{
+    std::thread::scope(|scope| {
+        let side = side.map(|side| {
+            scope.spawn(move || {
+                let started = Instant::now();
+                side().map(|value| (value, started.elapsed()))
+            })
+        });
+        let started = Instant::now();
+        let main = main();
+        if side.is_some() {
+            steps.note(main_name, started.elapsed());
+        }
+        let side = match side.map(|handle| handle.join()) {
+            None => None,
+            Some(Ok(Ok((value, took)))) => {
+                steps.note(side_name, took);
+                Some(Ok(value))
+            }
+            Some(Ok(Err(err))) => Some(Err(err)),
+            Some(Err(_)) => Some(Err(Error::klon(format!("the {side_name} thread died")))),
+        };
+        Ok((main?, side.transpose()?))
+    })
+}
+
+/// The four keys that make the first `git status` cheap (handoff §4). One
 /// read tells which of them golden lacks; a key that already holds its value
 /// is not rewritten, so two concurrent `add` calls do not fight over git's
 /// `config.lock`, and every `add` after the first spawns no `git config`.
-fn ensure_config(golden: &Path) -> Result<()> {
+///
+/// The spare builder calls it too, before it warms the untracked cache of
+/// the spare (G1): without `core.checkStat=minimal` that status would re-hash
+/// every file.
+pub fn ensure_config(golden: &Path) -> Result<()> {
     const WANTED: [(&str, &str); 4] = [
         ("core.checkStat", "minimal"),
         ("core.untrackedCache", "true"),
@@ -778,8 +1088,9 @@ fn read_admin_dir(path: &Path) -> Result<PathBuf> {
 /// `/.klon/` hides the envelope. `/*.klon-warming/` hides the staging
 /// directory of the warm process (C12): without it a klon would read dirty
 /// while a big ignored directory fills, and `git clean` would delete the
-/// half-finished copy.
-fn exclude_klon_dir(common: &Path) -> Result<()> {
+/// half-finished copy. The spare builder calls it before it warms the
+/// untracked cache of the spare, so the cache never lists `.klon/` (G1).
+pub fn exclude_klon_dir(common: &Path) -> Result<()> {
     const LINES: &[&str] = &["/.klon/", "/*.klon-warming/"];
     let file = common.join("info").join("exclude");
     let mut current = match fs::read(&file) {

@@ -18,6 +18,48 @@ use std::time::{Duration, Instant};
 
 const SEED: u64 = 42;
 
+/// Every file directly inside `dir` as `(name, bytes)`, sorted. A test
+/// compares this before and after an `add` to prove that nothing wrote into
+/// golden: a lost file, a new file, and a rewritten byte all show up.
+fn dir_contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                fs::read(e.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// `git <args>` with `input` on stdin, and its stdout. Used to write a blob
+/// without a file on disk.
+fn git_ok_stdin(cwd: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("git");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8(out.stdout).expect("utf-8")
+}
+
 /// `gh-klon <args>` with the spare on.
 fn klon_on(cwd: &Path, args: &[&str]) -> std::process::Output {
     klon_env(cwd, &[("KLON_SPARE", OsStr::new("1"))], args)
@@ -88,7 +130,8 @@ fn load_average_1m() -> Option<f64> {
 }
 
 /// A wall-clock budget means nothing while other builds share the host. The
-/// budget check runs only on a quiet host; CI runners are quiet.
+/// budget check runs only where the load average is readable and low. A host
+/// that reports no load average, macOS among them, skips the budget.
 fn host_is_quiet() -> bool {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let quiet = (cores / 2).max(1) as f64;
@@ -97,7 +140,13 @@ fn host_is_quiet() -> bool {
             eprintln!("skip the timing budget: the load average {load} is above {quiet}");
             false
         }
-        _ => true,
+        Some(_) => true,
+        None => {
+            // macOS has no /proc/loadavg. A wall-clock budget on a host whose
+            // load nothing can read is a coin toss, so it does not run.
+            eprintln!("skip the timing budget: this host reports no load average");
+            false
+        }
     }
 }
 
@@ -701,6 +750,431 @@ fn add_100k_with_a_spare() {
     }
     assert!(
         wait_for_spare(&fx.golden, Duration::from_secs(300)),
+        "the next spare must appear"
+    );
+}
+
+/// G1: the builder records the untracked paths of the spare and warms its
+/// untracked cache; `add` cleans exactly those paths and the klon's first
+/// `git status` reads the cache that the claim relocated, so it creates no
+/// directory node. `git fsck` proves the rewritten index checksum.
+#[test]
+fn a_spare_klon_is_cleaned_from_the_recorded_list_and_reads_the_relocated_cache() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    fs::write(fx.golden.join("junk.txt"), "untracked in golden\n").unwrap();
+    fs::create_dir(fx.golden.join("junkdir")).unwrap();
+    fs::write(fx.golden.join("junkdir").join("x.txt"), "also untracked\n").unwrap();
+    build_spare(&fx.golden);
+    let meta = read_meta(&fx.golden);
+    assert_eq!(
+        meta["untracked"],
+        serde_json::json!(["junk.txt", "junkdir/"]),
+        "the builder records the untracked paths of the spare: {meta}"
+    );
+    // The index inside the spare carries the cache, built at the spare's
+    // own location.
+    let index = fs::read(spare_dir(&fx.golden).join(".klon").join("index")).unwrap();
+    let ident = format!(
+        "Location {}",
+        spare_dir(&fx.golden).canonicalize().unwrap().display()
+    );
+    assert!(
+        index.windows(ident.len()).any(|w| w == ident.as_bytes()),
+        "the spare's index must hold an untracked cache for the spare path"
+    );
+
+    let out = klon_on(&fx.golden, &["add", "--json", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true, "the spare must serve the add");
+    let path = fx.default_klon_path();
+    assert_spare_klon(&fx, &path, "feature");
+    assert!(
+        !path.join("junk.txt").exists() && !path.join("junkdir").exists(),
+        "git clean removes the recorded untracked paths"
+    );
+    assert!(
+        fx.golden.join("junk.txt").exists(),
+        "golden keeps its files"
+    );
+
+    // The cache now names the klon, and the first status reads it.
+    let admin = fx.golden.join(".git").join("worktrees");
+    let entry = fs::read_dir(&admin)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join("index").is_file())
+        .expect("the klon's admin entry");
+    let index = fs::read(entry.join("index")).unwrap();
+    let ident = format!("Location {}", path.canonicalize().unwrap().display());
+    assert!(
+        index.windows(ident.len()).any(|w| w == ident.as_bytes()),
+        "the claim must point the untracked cache at the klon"
+    );
+    let trace = fx.golden.parent().unwrap().join("trace.txt");
+    let status = common::git_env(
+        &path,
+        &["status", "--porcelain"],
+        &[("GIT_TRACE2_PERF", trace.to_str().unwrap())],
+    );
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        stderr(&status)
+    );
+    assert!(stdout(&status).trim().is_empty(), "the klon is clean");
+    let text = fs::read_to_string(&trace).unwrap();
+    if text.contains("node-creation") {
+        assert!(
+            text.contains("node-creation:0"),
+            "the first status must read the relocated cache, not rebuild it"
+        );
+    } else {
+        println!("skipped the counter check: this git build reports no untracked cache counters");
+    }
+    let fsck = git_ok(&path, &["fsck", "--no-dangling", "--no-progress"]);
+    assert!(fsck.trim().is_empty(), "fsck must be quiet: {fsck}");
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// Commit `files` on a new branch `name` from `main`, forced past the ignore
+/// rules, and go back to `main`.
+fn commit_branch(fx: &Fixture, name: &str, files: &[(&str, &str)]) {
+    git_ok(&fx.golden, &["checkout", "-qb", name]);
+    for (rel, content) in files {
+        let path = fx.golden.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        git_ok(&fx.golden, &["add", "-f", rel]);
+    }
+    git_ok(&fx.golden, &["commit", "-qm", name]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    assert_clean(&fx.golden);
+}
+
+/// G1 review: a branch that tracks files inside a directory golden ignores.
+/// The checkout writes those files, so the fixup must not walk that directory
+/// beside it; the klon holds the committed bytes, golden's path included.
+#[test]
+fn a_branch_that_tracks_files_inside_an_ignored_directory_is_checked_out_intact() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let golden_path = fx.golden.to_str().unwrap().to_string();
+    let content = format!("cache = {golden_path}/build\n");
+    let files: Vec<(String, &str)> = (0..30)
+        .map(|i| (format!("build/tracked-{i}.txt"), content.as_str()))
+        .collect();
+    let refs: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+    commit_branch(&fx, "tracked-build", &refs);
+    build_spare(&fx.golden);
+    assert_eq!(
+        read_meta(&fx.golden)["ignored_entries"],
+        serde_json::json!(["build/"]),
+        "golden's build/ is wholly ignored when the spare is made"
+    );
+
+    let out = klon_env(
+        &fx.golden,
+        &[
+            ("KLON_SPARE", OsStr::new("1")),
+            ("KLON_DEBUG", OsStr::new("1")),
+        ],
+        &["add", "--json", "tracked-build"],
+    );
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    // The debug lines prove the order: the fixup ran after the checkout, on
+    // its own, not beside it.
+    let debug = stderr(&out);
+    assert!(
+        debug.contains("add checkout ") && debug.contains("add fixup "),
+        "the fixup must wait for the checkout: {debug}"
+    );
+    assert!(
+        !debug.contains("checkout+fixup"),
+        "the fixup must not run beside the checkout: {debug}"
+    );
+    let path = fx.klon_path("tracked-build");
+    assert_clean(&path);
+    assert_eq!(
+        git_ok(&path, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/tracked-build"
+    );
+    for (rel, _) in &files {
+        assert_eq!(
+            fs::read_to_string(path.join(rel)).unwrap(),
+            content,
+            "{rel}: a tracked file keeps its committed bytes; the fixup never rewrites it"
+        );
+    }
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review: an ignored top-level file, not only a directory, gets the path
+/// fixup from a spare-served `add`.
+#[test]
+fn an_ignored_top_level_file_gets_the_path_fixup_from_a_spare() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let exclude = fx.golden.join(".git").join("info").join("exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    fs::write(&exclude, "/CMakeCache.txt\n").unwrap();
+    let golden_path = fx.golden.to_str().unwrap().to_string();
+    fs::write(
+        fx.golden.join("CMakeCache.txt"),
+        format!("CMAKE_HOME_DIRECTORY:INTERNAL={golden_path}\n"),
+    )
+    .unwrap();
+    build_spare(&fx.golden);
+    let meta = read_meta(&fx.golden);
+    assert_eq!(
+        meta["ignored_entries"],
+        serde_json::json!(["CMakeCache.txt", "build/"]),
+        "the record names the file and the directory: {meta}"
+    );
+
+    let out = klon_on(&fx.golden, &["add", "--json", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    let path = fx.default_klon_path();
+    assert_spare_klon(&fx, &path, "feature");
+    assert_eq!(
+        fs::read_to_string(path.join("CMakeCache.txt")).unwrap(),
+        format!("CMAKE_HOME_DIRECTORY:INTERNAL={}\n", path.display()),
+        "the ignored file names the klon after the fixup"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review 2: a branch may replace an ignored directory with a tracked
+/// symlink of the same name. The changed path is then the entry itself, not
+/// a path inside it, so the overlap test must look both ways. If it does not,
+/// the checkout installs the symlink while the fixup walks the same name, and
+/// the fixup writes through the link into golden.
+#[test]
+fn a_branch_that_replaces_an_ignored_directory_with_a_symlink_leaves_golden_alone() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let golden_build = fx.golden.join("build");
+    let before = dir_contents(&golden_build);
+    assert!(
+        !before.is_empty(),
+        "the fixture ignores a build/ with files"
+    );
+
+    // The branch tracks `build` as a symlink that points at golden's own
+    // ignored directory. The index entry goes in without touching the
+    // worktree, so golden keeps its files the whole time.
+    let target = golden_build.to_str().unwrap().to_string();
+    let blob = git_ok_stdin(&fx.golden, &["hash-object", "-w", "--stdin"], &target);
+    let blob = blob.trim();
+    git_ok(&fx.golden, &["checkout", "-qb", "link-build"]);
+    git_ok(
+        &fx.golden,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{blob},build"),
+        ],
+    );
+    git_ok(&fx.golden, &["commit", "-qm", "build is a symlink"]);
+    // A plain checkout back to main would refuse: the worktree holds a
+    // directory where the branch commits a symlink. Moving HEAD and resetting
+    // the index leaves the worktree exactly as it is, which is the state this
+    // test needs: golden on main, with `build/` ignored again.
+    git_ok(&fx.golden, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git_ok(&fx.golden, &["reset", "-q"]);
+    assert_clean(&fx.golden);
+    assert_eq!(
+        dir_contents(&golden_build),
+        before,
+        "the setup left golden's build/ alone"
+    );
+    build_spare(&fx.golden);
+
+    let out = klon_env(
+        &fx.golden,
+        &[
+            ("KLON_SPARE", OsStr::new("1")),
+            ("KLON_DEBUG", OsStr::new("1")),
+        ],
+        &["add", "--json", "link-build"],
+    );
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    assert!(
+        !stderr(&out).contains("checkout+fixup"),
+        "the fixup must not run beside a checkout that writes the entry itself: {}",
+        stderr(&out)
+    );
+    let path = fx.klon_path("link-build");
+    assert_clean(&path);
+    assert!(
+        path.join("build").is_symlink(),
+        "the klon holds the tracked symlink"
+    );
+    assert_eq!(
+        dir_contents(&golden_build),
+        before,
+        "golden's ignored build/ keeps every file and every byte"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review 2: the spare carries golden's index, not golden's HEAD commit.
+/// A staged `git rm --cached` of a file an ignore rule matches makes the two
+/// disagree: the spare holds the file as ignored, the diff between the two
+/// commits names nothing, and the checkout restores it as tracked. The fixup
+/// must not run beside a checkout it cannot predict.
+#[test]
+fn a_staged_removal_of_an_ignored_file_keeps_the_tracked_bytes() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let golden_path = fx.golden.to_str().unwrap().to_string();
+    let content = format!("home = {golden_path}\n");
+    // `build/config.txt` is tracked on main and on the branch, and the
+    // `build/` rule of the fixture matches it.
+    fs::create_dir_all(fx.golden.join("build")).unwrap();
+    fs::write(fx.golden.join("build").join("config.txt"), &content).unwrap();
+    git_ok(&fx.golden, &["add", "-f", "build/config.txt"]);
+    git_ok(&fx.golden, &["commit", "-qm", "track the config"]);
+    git_ok(&fx.golden, &["branch", "keep-config"]);
+    // Golden stages the removal. The file stays in the worktree, ignored.
+    git_ok(&fx.golden, &["rm", "-q", "--cached", "build/config.txt"]);
+    build_spare(&fx.golden);
+    let meta = read_meta(&fx.golden);
+    assert_eq!(
+        meta["index_matches_head"],
+        serde_json::json!(false),
+        "the record must say the index differs from the commit: {meta}"
+    );
+
+    let out = klon_env(
+        &fx.golden,
+        &[
+            ("KLON_SPARE", OsStr::new("1")),
+            ("KLON_DEBUG", OsStr::new("1")),
+        ],
+        &["add", "--json", "keep-config"],
+    );
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    assert!(
+        !stderr(&out).contains("checkout+fixup"),
+        "a staged change must stop the parallel fixup: {}",
+        stderr(&out)
+    );
+    let path = fx.klon_path("keep-config");
+    assert_eq!(
+        fs::read_to_string(path.join("build").join("config.txt")).unwrap(),
+        content,
+        "the checkout restored the tracked file and the fixup left its bytes alone"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review 2: a branch that adds an ignore rule turns an untracked
+/// directory into an ignored one. The recorded entries were made under the
+/// old rules and do not name it, so `add` must ask git after the checkout;
+/// otherwise the new directory keeps golden's path.
+#[test]
+fn a_branch_that_adds_an_ignore_rule_gets_the_path_fixup() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let golden_path = fx.golden.to_str().unwrap().to_string();
+    let content = format!("root = {golden_path}\n");
+    let base = fs::read_to_string(fx.golden.join(".gitignore")).unwrap();
+    commit_branch(
+        &fx,
+        "more-ignores",
+        &[(".gitignore", format!("{base}/out/\n").as_str())],
+    );
+    // `out/` is untracked under main's rules and ignored under the branch's.
+    fs::create_dir_all(fx.golden.join("out")).unwrap();
+    fs::write(fx.golden.join("out").join("cache.txt"), &content).unwrap();
+    build_spare(&fx.golden);
+
+    let out = klon_on(&fx.golden, &["add", "--json", "more-ignores"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    let path = fx.klon_path("more-ignores");
+    assert_clean(&path);
+    assert_eq!(
+        fs::read_to_string(path.join("out").join("cache.txt")).unwrap(),
+        format!("root = {}\n", path.display()),
+        "the newly ignored directory gets the path fixup too"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review 2: `info/exclude` holds ignore rules that no commit carries, so
+/// a diff between two commits cannot see it change. A rule dropped after the
+/// spare was built turns ignored paths into untracked ones, and the recorded
+/// clean list, made under the old rules, would leave them in the klon.
+#[test]
+fn a_changed_info_exclude_makes_add_clean_from_a_fresh_status() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    let exclude = fx.golden.join(".git").join("info").join("exclude");
+    fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let original = fs::read_to_string(&exclude).unwrap_or_default();
+    fs::write(&exclude, format!("{original}/scratch/\n")).unwrap();
+    fs::create_dir_all(fx.golden.join("scratch")).unwrap();
+    fs::write(fx.golden.join("scratch").join("junk.txt"), "junk\n").unwrap();
+    build_spare(&fx.golden);
+    let before = read_meta(&fx.golden)["shared_ignore_hash"].clone();
+    assert!(before.is_string(), "the record hashes the shared rules");
+
+    // The rule goes away after the spare is built. `scratch/` is untracked now.
+    fs::write(&exclude, &original).unwrap();
+    let out = klon_on(&fx.golden, &["add", "--json", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    let path = fx.default_klon_path();
+    assert_clean(&path);
+    assert!(
+        !path.join("scratch").exists(),
+        "scratch/ is untracked under the current rules, so git clean removed it"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
+        "the next spare must appear"
+    );
+}
+
+/// G1 review: a branch that drops an ignore rule turns ignored paths into
+/// untracked ones. The recorded list cannot know them, so `add` must run the
+/// status after the checkout and clean what it reports, as it always did.
+#[test]
+fn a_branch_that_drops_an_ignore_rule_gets_a_clean_klon() {
+    let fx = Fixture::generate(SEED, 300, 10, 20, 5);
+    commit_branch(&fx, "unignore", &[(".gitignore", "")]);
+    build_spare(&fx.golden);
+    assert_eq!(read_meta(&fx.golden)["untracked"], serde_json::json!([]));
+
+    let out = klon_on(&fx.golden, &["add", "--json", "unignore"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    assert_eq!(parse(&out)["spare"], true);
+    let path = fx.klon_path("unignore");
+    assert_clean(&path);
+    assert!(
+        !path.join("build").exists(),
+        "build/ is untracked on this branch, so git clean removed it"
+    );
+    assert!(
+        wait_for_spare(&fx.golden, Duration::from_secs(60)),
         "the next spare must appear"
     );
 }

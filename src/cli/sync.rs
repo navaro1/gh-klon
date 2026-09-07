@@ -466,7 +466,12 @@ fn fresh(
         yes,
         json,
     )?;
-    spare::start_after(&repo.golden, spare::configured_depth(&repo.golden), false);
+    spare::start_after(
+        &repo.golden,
+        spare::configured_depth(&repo.golden),
+        false,
+        None,
+    );
     let head_after = head(&spawned.path);
     Ok(Outcome {
         schema: SCHEMA,
