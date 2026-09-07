@@ -536,16 +536,22 @@ pub fn checkout(
     klon: &Path,
     admin_dir: &Path,
     branch: &str,
-    from: &str,
+    changes: &[Change],
     index: &[u8],
     real: &Path,
 ) -> crate::Result<Done> {
-    let reference = format!("refs/heads/{branch}");
-    let changes = match diff(klon, from, &reference) {
-        Ok(changes) => changes,
-        Err(why) => return Ok(Done::Refused(why)),
-    };
-    let mut spliced = match plan(index, &changes, real) {
+    for change in changes {
+        // The attributes of a path decide how git writes it, and a branch that
+        // changes them changes what a write means part way through.
+        if change.path == b".gitattributes" || change.path.ends_with(b"/.gitattributes") {
+            return Ok(Done::Refused("the diff changes the attributes of the tree"));
+        }
+        // A submodule needs a whole subsystem of its own.
+        if change.to.as_ref().is_some_and(|to| to.mode == 0o160_000) {
+            return Ok(Done::Refused("the diff names a submodule"));
+        }
+    }
+    let mut spliced = match plan(index, changes, real) {
         Ok(spliced) => spliced,
         Err(why) => return Ok(Done::Refused(why)),
     };
@@ -590,17 +596,16 @@ pub fn checkout(
     let was = was.trim();
     let was = was.strip_prefix("ref: refs/heads/").unwrap_or(was);
     let message = format!("checkout: moving from {was} to {branch}");
-    crate::git::run(
-        klon,
-        &["symbolic-ref", "-m", &message, "HEAD", &reference],
-    )?;
+    let reference = format!("refs/heads/{branch}");
+    crate::git::run(klon, &["symbolic-ref", "-m", &message, "HEAD", &reference])?;
     Ok(Done::Spliced)
 }
 
 /// Every path that differs between the two commits, with the mode and object
-/// id the branch holds. `--raw` says both in the same line, so the splice
-/// needs no second call to name what it writes.
-fn diff(klon: &Path, from: &str, reference: &str) -> Result<Vec<Change>, Refused> {
+/// id the branch holds. `--raw` says both in the same line, so `add` runs one
+/// `git diff-tree` for the two shortcuts that read it: the recorded lists of
+/// G1 compare the names, and the splice writes the entries.
+pub fn diff(klon: &Path, from: &str, reference: &str) -> Result<Vec<Change>, Refused> {
     let out = crate::git::run_bytes_env(
         klon,
         &["diff-tree", "-r", "-z", "--raw", "--no-renames", from, reference]
@@ -623,15 +628,7 @@ fn diff(klon: &Path, from: &str, reference: &str) -> Result<Vec<Change>, Refused
         let _src_oid = next()?;
         let dst_oid = next()?;
         let status = next()?;
-        // A submodule on either side needs a whole subsystem of its own.
-        if src == "160000" || dst == "160000" {
-            return Err("the diff names a submodule");
-        }
-        // The attributes of a path decide how git writes it, and a branch that
-        // changes them changes what the write means part way through.
-        if path == b".gitattributes" || path.ends_with(b"/.gitattributes") {
-            return Err("the diff changes the attributes of the tree");
-        }
+        let _ = src;
         let to = match status {
             "D" => None,
             "A" | "M" | "T" => Some(Target {

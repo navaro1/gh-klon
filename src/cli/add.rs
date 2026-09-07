@@ -784,11 +784,23 @@ fn fill(
     //
     // A spare from an older builder has neither list, and a direct clone has
     // no record at all; both take the git-asked paths below.
-    let recorded = spare_meta.as_ref().and_then(|meta| {
-        let entries = meta.ignored_entries.as_ref()?;
-        let touched = tree_diff(path, &meta.head, branch)?;
-        Some((entries, touched))
+    //
+    // One `git diff-tree --raw` answers both shortcuts and the splice, which
+    // is 43 ms on the 100k fixture and was worth running twice for nothing
+    // (G4). The record names the modes and object ids too, so the splice
+    // needs no second call to say what it writes.
+    let touched = spare_meta.as_ref().and_then(|meta| {
+        crate::splice::diff(path, &meta.head, &format!("refs/heads/{branch}")).ok()
     });
+    let recorded = spare_meta.as_ref().zip(touched.as_ref()).and_then(
+        |(meta, touched)| -> Option<(&Vec<String>, Vec<&[u8]>)> {
+            let entries = meta.ignored_entries.as_ref()?;
+            Some((
+                entries,
+                touched.iter().map(|change| change.path.as_slice()).collect(),
+            ))
+        },
+    );
     let spare_tree_is_its_commit = spare_meta.as_ref().is_some_and(|meta| {
         meta.index_matches_head == Some(true)
             && meta.shared_ignore_hash.as_deref()
@@ -837,7 +849,6 @@ fn fill(
         false => None,
     };
     let held_bytes = held.take();
-    let from = spare_meta.as_ref().map(|meta| meta.head.clone());
     beside(
         steps,
         "checkout",
@@ -846,7 +857,7 @@ fn fill(
                 path,
                 &admin_dir,
                 branch,
-                from.as_deref(),
+                touched.as_deref(),
                 held_bytes,
                 real.as_deref(),
             )
@@ -1032,12 +1043,12 @@ fn checkout_branch(
     path: &Path,
     admin_dir: &Path,
     branch: &str,
-    from: Option<&str>,
+    changes: Option<&[crate::splice::Change]>,
     held: Option<Vec<u8>>,
     real: Option<&Path>,
 ) -> Result<()> {
-    if let (Some(bytes), Some(from), Some(real)) = (&held, from, real) {
-        match crate::splice::checkout(path, admin_dir, branch, from, bytes, real)? {
+    if let (Some(bytes), Some(changes), Some(real)) = (&held, changes, real) {
+        match crate::splice::checkout(path, admin_dir, branch, changes, bytes, real)? {
             crate::splice::Done::Spliced => {
                 debug(&format!("the index splice served {branch}"));
                 return Ok(());
@@ -1077,34 +1088,6 @@ fn meets(changed: &[u8], entry: &str) -> bool {
     }
     let entry = entry.strip_suffix('/').unwrap_or(entry).as_bytes();
     changed == entry || inside(changed, entry) || inside(entry, changed)
-}
-
-/// The paths that differ between the tree of `from` and the tree of
-/// `branch`, as `git diff-tree` names them: what a checkout from one to the
-/// other writes or removes. None when git cannot answer, for example when
-/// `from` is gone; the caller then takes the paths that ask git again.
-fn tree_diff(klon: &Path, from: &str, branch: &str) -> Option<Vec<Vec<u8>>> {
-    let out = git::run_bytes_env(
-        klon,
-        &[
-            "diff-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            "--no-renames",
-            from,
-            branch,
-        ]
-        .map(OsStr::new),
-        &[],
-    )
-    .ok()?;
-    Some(
-        out.split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-    )
 }
 
 /// Run `main` on this thread and `side`, when there is one, on another; then
