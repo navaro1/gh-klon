@@ -1450,3 +1450,29 @@ fn a_branch_that_changes_gitattributes_falls_back_to_git_checkout() {
     assert_spare_klon(&fx, &klon, "feature");
     assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
 }
+
+/// G4: a split index carries a `link` extension, which is not even ignorable,
+/// so the splice stands aside on the bytes themselves and git does the
+/// checkout from the shared index the claim carried over.
+#[test]
+fn a_split_index_falls_back_to_git_checkout() {
+    let fx = Fixture::generate(SEED, 40, 4, 6, 3);
+    git_ok(&fx.golden, &["update-index", "--split-index"]);
+    build_spare(&fx.golden);
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        !log.contains("the index splice served"),
+        "the splice must stand aside on a split index: {log}"
+    );
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+        ""
+    );
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
