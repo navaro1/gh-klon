@@ -41,26 +41,10 @@ pub fn relocate(bytes: &mut Vec<u8>, worktree: &Path) -> Relocated {
     let Some((untr_at, untr_len)) = layout.untr else {
         return Relocated::NoCache;
     };
-    // The identity: a varint length, then the string.
     let data = &bytes[untr_at..untr_at + untr_len];
-    let Some((ident_len, varint_len)) = decode_varint(data) else {
+    let Some((head, old_head_len)) = retarget_head(data, worktree) else {
         return Relocated::Unreadable;
     };
-    if varint_len + ident_len > data.len() {
-        return Relocated::Unreadable;
-    }
-    let old_ident = &data[varint_len..varint_len + ident_len];
-    // Keep git's own system suffix; only the location changes.
-    let Some(comma) = find(old_ident, b", system ") else {
-        return Relocated::Unreadable;
-    };
-    let mut ident = Vec::with_capacity(ident_len + 64);
-    ident.extend_from_slice(b"Location ");
-    ident.extend_from_slice(worktree.as_os_str().as_encoded_bytes());
-    ident.extend_from_slice(&old_ident[comma..]);
-    let mut head = encode_varint(ident.len());
-    head.extend_from_slice(&ident);
-    let old_head_len = varint_len + ident_len;
     let delta = head.len() as i64 - old_head_len as i64;
 
     // Splice the new identity in and fix the extension size.
@@ -99,21 +83,70 @@ pub fn relocate(bytes: &mut Vec<u8>, worktree: &Path) -> Relocated {
     Relocated::Patched
 }
 
+/// The new head of an `UNTR` body that names `worktree`, and the length of
+/// the head it replaces. The head is the varint length of the identity string
+/// and the string itself; the cache follows it and stays as it is.
+///
+/// None when the body is not one this code reads, so a caller leaves the bytes
+/// alone rather than guessing.
+fn retarget_head(data: &[u8], worktree: &Path) -> Option<(Vec<u8>, usize)> {
+    // The identity: a varint length, then the string.
+    let (ident_len, varint_len) = decode_varint(data)?;
+    if varint_len + ident_len > data.len() {
+        return None;
+    }
+    let old_ident = &data[varint_len..varint_len + ident_len];
+    // Keep git's own system suffix; only the location changes.
+    let comma = find(old_ident, b", system ")?;
+    let mut ident = Vec::with_capacity(ident_len + 64);
+    ident.extend_from_slice(b"Location ");
+    ident.extend_from_slice(worktree.as_os_str().as_encoded_bytes());
+    ident.extend_from_slice(&old_ident[comma..]);
+    let mut head = encode_varint(ident.len());
+    head.extend_from_slice(&ident);
+    Some((head, varint_len + ident_len))
+}
+
+/// A whole `UNTR` body that names `worktree`, for a caller that rebuilds the
+/// extension region instead of patching it in place (G4). None when the body
+/// is not one this code reads.
+pub(crate) fn retarget(data: &[u8], worktree: &Path) -> Option<Vec<u8>> {
+    let (head, old_head_len) = retarget_head(data, worktree)?;
+    let mut out = head;
+    out.extend_from_slice(&data[old_head_len..]);
+    Some(out)
+}
+
+/// One extension header: its four-byte signature, the start of its data, and
+/// the size the header declares.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ext {
+    pub(crate) sig: [u8; 4],
+    pub(crate) at: usize,
+    pub(crate) size: usize,
+}
+
 /// Where the parts of an index sit.
-struct Layout {
+pub(crate) struct Layout {
+    /// 2, 3, or 4.
+    pub(crate) version: u32,
+    /// The number of entries the header declares.
+    pub(crate) count: usize,
     /// The first byte after the last entry.
-    extensions_at: usize,
+    pub(crate) extensions_at: usize,
+    /// Every extension header, in the order the file holds them.
+    pub(crate) exts: Vec<Ext>,
     /// The `UNTR` data: its start and length.
     untr: Option<(usize, usize)>,
     /// The start of the `EOIE` data, when the extension is present.
     eoie: Option<usize>,
     /// 20 for SHA-1, 32 for SHA-256.
-    hash_len: usize,
+    pub(crate) hash_len: usize,
 }
 
 /// Walk the entries and the extension headers. SHA-1 is tried first; a
 /// SHA-256 index leaves the SHA-1 walk off the end and is tried second.
-fn parse(bytes: &[u8]) -> Option<Layout> {
+pub(crate) fn parse(bytes: &[u8]) -> Option<Layout> {
     parse_with(bytes, 20).or_else(|| parse_with(bytes, 32))
 }
 
@@ -127,6 +160,103 @@ fn parse_with(bytes: &[u8], hash_len: usize) -> Option<Layout> {
         return None;
     }
     let end = bytes.len() - hash_len;
+    // `EOIE` says where the entries end, so a reader that only wants the
+    // extensions need not walk 100,000 entries to find them. git reads it the
+    // same way and from the same fixed place (`read_eoie_extension`), and
+    // trusts it only after the hash over the extension headers agrees.
+    let at = match eoie_offset(bytes, end, hash_len) {
+        Some(at) => at,
+        None => walk_entries(bytes, version, count, hash_len, end)?,
+    };
+    let extensions_at = at;
+    let mut at = at;
+    let mut untr = None;
+    let mut eoie = None;
+    let mut exts = Vec::new();
+    while at + 8 <= end {
+        let sig = &bytes[at..at + 4];
+        if !sig.iter().all(|b| b.is_ascii_uppercase()) {
+            return None;
+        }
+        let sig: [u8; 4] = sig.try_into().ok()?;
+        let size = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        if at + 8 + size > end {
+            return None;
+        }
+        match &sig {
+            b"UNTR" => untr = Some((at + 8, size)),
+            b"EOIE" => eoie = Some(at + 8),
+            _ => {}
+        }
+        exts.push(Ext {
+            sig,
+            at: at + 8,
+            size,
+        });
+        at += 8 + size;
+    }
+    if at != end {
+        return None;
+    }
+    Some(Layout {
+        version,
+        count,
+        extensions_at,
+        exts,
+        untr,
+        eoie,
+        hash_len,
+    })
+}
+
+/// The offset where the entries end, from the `EOIE` extension.
+///
+/// The extension is written last and has a fixed size, so it sits at a known
+/// place before the trailer. Its hash covers the signature and the size of
+/// every extension before it, and this reads them from the offset it declares:
+/// a wrong offset gives a wrong hash and the answer is None, so the caller
+/// walks the entries instead.
+fn eoie_offset(bytes: &[u8], end: usize, hash_len: usize) -> Option<usize> {
+    let header = end.checked_sub(8 + 4 + hash_len)?;
+    if &bytes[header..header + 4] != b"EOIE" {
+        return None;
+    }
+    if u32::from_be_bytes(bytes[header + 4..header + 8].try_into().ok()?) as usize != 4 + hash_len {
+        return None;
+    }
+    let at = u32::from_be_bytes(bytes[header + 8..header + 12].try_into().ok()?) as usize;
+    if !(12..=header).contains(&at) {
+        return None;
+    }
+    // Only SHA-1 is read here. The trailer of a SHA-256 index is longer, so
+    // `parse` tries the other length and lands on the entry walk.
+    if hash_len != 20 {
+        return None;
+    }
+    let mut hasher = sha1::Sha1::new();
+    let mut walk = at;
+    while walk + 8 <= header {
+        hasher.update(&bytes[walk..walk + 8]);
+        let size = u32::from_be_bytes(bytes[walk + 4..walk + 8].try_into().ok()?) as usize;
+        walk = walk.checked_add(8)?.checked_add(size)?;
+        if walk > header {
+            return None;
+        }
+    }
+    if walk != header {
+        return None;
+    }
+    (hasher.finalize().as_slice() == &bytes[header + 12..header + 12 + hash_len]).then_some(at)
+}
+
+/// Walk every entry and answer the offset where they end.
+fn walk_entries(
+    bytes: &[u8],
+    version: u32,
+    count: usize,
+    hash_len: usize,
+    end: usize,
+) -> Option<usize> {
     let mut at = 12;
     for _ in 0..count {
         let start = at;
@@ -157,40 +287,13 @@ fn parse_with(bytes: &[u8], hash_len: usize) -> Option<Layout> {
             return None;
         }
     }
-    let extensions_at = at;
-    let mut untr = None;
-    let mut eoie = None;
-    while at + 8 <= end {
-        let sig = &bytes[at..at + 4];
-        if !sig.iter().all(|b| b.is_ascii_uppercase()) {
-            return None;
-        }
-        let size = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
-        if at + 8 + size > end {
-            return None;
-        }
-        match sig {
-            b"UNTR" => untr = Some((at + 8, size)),
-            b"EOIE" => eoie = Some(at + 8),
-            _ => {}
-        }
-        at += 8 + size;
-    }
-    if at != end {
-        return None;
-    }
-    Some(Layout {
-        extensions_at,
-        untr,
-        eoie,
-        hash_len,
-    })
+    Some(at)
 }
 
 /// git's varint (`varint.c`): seven bits per byte, high bit set on every byte
 /// but the last, and each continuation adds one. The answer is the value and
 /// the number of bytes read.
-fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut at = 0;
     let mut c = *bytes.get(at)?;
     at += 1;
@@ -207,7 +310,7 @@ fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((value, at))
 }
 
-fn encode_varint(mut value: usize) -> Vec<u8> {
+pub(crate) fn encode_varint(mut value: usize) -> Vec<u8> {
     let mut out = vec![(value & 127) as u8];
     value >>= 7;
     while value != 0 {
@@ -235,6 +338,11 @@ pub struct Scan {
     /// ignore rules of that tree differ from its commit, so a list of its
     /// untracked paths says nothing about another commit's rules.
     pub rules_dirty: bool,
+    /// True when the document names a tracked path at all: modified, staged,
+    /// deleted, or unmerged. The index splice keeps the entry bytes of every
+    /// path the branch leaves alone, so it needs the working tree of those
+    /// paths to match those entries already (G4).
+    pub tracked_dirty: bool,
 }
 
 /// Read a `-z` porcelain document. A rename or copy entry carries a second
@@ -252,7 +360,14 @@ pub fn scan_porcelain(status: &[u8]) -> Scan {
         }
         if code == b"?? " {
             scan.untracked.push(path.to_vec());
-        } else if path.ends_with(b"/.gitignore") || path == b".gitignore" {
+            continue;
+        }
+        // `!! ` is an ignored path, which `--untracked-files=normal` without
+        // `--ignored` never prints; every other code names a tracked path.
+        if code != b"!! " {
+            scan.tracked_dirty = true;
+        }
+        if path.ends_with(b"/.gitignore") || path == b".gitignore" {
             scan.rules_dirty = true;
         }
     }
@@ -347,7 +462,12 @@ mod tests {
         let scan = scan_porcelain(status);
         assert_eq!(scan.untracked, vec![b"new.txt".to_vec(), b"dir/".to_vec()]);
         assert!(!scan.rules_dirty);
+        assert!(scan.tracked_dirty, "the document names three tracked paths");
         assert_eq!(scan_porcelain(b""), Scan::default());
+        // Untracked paths alone leave the tracked paths clean.
+        assert!(!scan_porcelain(b"?? a\0?? b/\0").tracked_dirty);
+        assert!(scan_porcelain(b" M a\0").tracked_dirty);
+        assert!(scan_porcelain(b"UU a\0").tracked_dirty);
         // A non-UTF-8 name survives as bytes.
         assert_eq!(
             scan_porcelain(b"?? a\xffb\0").untracked,
@@ -359,6 +479,52 @@ mod tests {
         assert!(scan_porcelain(b"D  .gitignore\0").rules_dirty);
         assert!(!scan_porcelain(b"?? .gitignore\0").rules_dirty);
         assert!(is_ignore_file(b"a/b/.gitignore") && !is_ignore_file(b"a/.gitignore.bak"));
+    }
+
+    /// The `EOIE` shortcut must land where the entry walk lands, and must give
+    /// way to the walk as soon as anything about it disagrees.
+    #[test]
+    fn the_end_marker_shortcut_agrees_with_the_entry_walk() {
+        let mut bytes = index_with_ident(b"Location /old, system Linux");
+        let walked = parse(&bytes).expect("parses").extensions_at;
+        // Append an EOIE that names that offset, with the hash git checks.
+        let mut data = (walked as u32).to_be_bytes().to_vec();
+        let mut hasher = sha1::Sha1::new();
+        let mut at = walked;
+        let end = bytes.len() - 20;
+        while at + 8 <= end {
+            hasher.update(&bytes[at..at + 8]);
+            let size = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            at += 8 + size;
+        }
+        data.extend_from_slice(&hasher.finalize());
+        bytes.truncate(end);
+        bytes.extend_from_slice(b"EOIE");
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&data);
+        let digest = sha1::Sha1::digest(&bytes);
+        bytes.extend_from_slice(&digest);
+
+        let end = bytes.len() - 20;
+        assert_eq!(eoie_offset(&bytes, end, 20), Some(walked), "the shortcut");
+        assert_eq!(parse(&bytes).expect("parses").extensions_at, walked);
+        // A relocation over the shortcut still produces bytes that parse.
+        let mut moved = bytes.clone();
+        assert_eq!(relocate(&mut moved, Path::new("/new")), Relocated::Patched);
+        let layout = parse(&moved).expect("the moved index parses");
+        assert!(layout.exts.iter().any(|e| &e.sig == b"EOIE"));
+
+        // A broken offset gives a broken hash, so the walk answers instead.
+        let mut broken = bytes.clone();
+        let header = end - (8 + 24);
+        broken[header + 8..header + 12].copy_from_slice(&(walked as u32 + 4).to_be_bytes());
+        assert_eq!(eoie_offset(&broken, end, 20), None, "a wrong offset");
+        // A broken hash, with the offset intact.
+        let mut broken = bytes.clone();
+        broken[header + 12] ^= 0xff;
+        assert_eq!(eoie_offset(&broken, end, 20), None, "a wrong hash");
+        // The walk still finds the right place, so the layout is unchanged.
+        assert_eq!(parse(&broken).expect("parses").extensions_at, walked);
     }
 
     #[test]

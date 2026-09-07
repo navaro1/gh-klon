@@ -23,6 +23,7 @@ mod receipt;
 mod repair;
 mod space;
 mod spare;
+mod splice;
 mod time;
 mod untracked;
 mod volume;

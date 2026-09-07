@@ -41,6 +41,24 @@ fn source(golden: &Path) -> Result<PathBuf> {
     }
 }
 
+/// True when the repository has an executable hook of that name.
+///
+/// The index splice does the three jobs of `git checkout` by hand and runs no
+/// hook (G4). A repository whose `post-checkout` sets a klon up would stop
+/// silently, so `add` keeps the real checkout wherever such a hook exists. An
+/// unreadable hooks directory answers false: git would find no hook there
+/// either.
+pub fn exists(golden: &Path, name: &str) -> bool {
+    let Ok(dir) = source(golden) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(dir.join(name)) else {
+        return false;
+    };
+    use std::os::unix::fs::PermissionsExt;
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+}
+
 /// Copy the repository hooks into the klon. Only executable regular files
 /// survive the copy, and git's `*.sample` examples never do. The copy keeps
 /// the modes, so a hook that ran in golden runs in the klon.

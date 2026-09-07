@@ -6,7 +6,7 @@
 mod common;
 
 use common::{
-    assert_clean, assert_worktree_parity, git_ok, klon, klon_env, manifest, stderr, stdout,
+    assert_clean, assert_worktree_parity, git, git_ok, klon, klon_env, manifest, stderr, stdout,
     Fixture, BIN,
 };
 use serde_json::Value;
@@ -1177,4 +1177,448 @@ fn a_branch_that_drops_an_ignore_rule_gets_a_clean_klon() {
         wait_for_spare(&fx.golden, Duration::from_secs(60)),
         "the next spare must appear"
     );
+}
+
+// --- The index splice (G4) -----------------------------------------------------
+
+/// `gh-klon` with the spare on and the debug lines on, so a test can read
+/// whether the splice served the call or refused it.
+fn klon_loud(cwd: &Path, args: &[&str]) -> std::process::Output {
+    klon_env(
+        cwd,
+        &[
+            ("KLON_SPARE", OsStr::new("1")),
+            ("KLON_DEBUG", OsStr::new("1")),
+        ],
+        args,
+    )
+}
+
+/// The same, with the splice turned off, which is the `git checkout` path
+/// every klon took before G4.
+fn klon_no_splice(cwd: &Path, args: &[&str]) -> std::process::Output {
+    klon_env(
+        cwd,
+        &[
+            ("KLON_SPARE", OsStr::new("1")),
+            ("KLON_DEBUG", OsStr::new("1")),
+            ("KLON_NO_SPLICE", OsStr::new("1")),
+        ],
+        args,
+    )
+}
+
+/// The index file of a klon.
+fn index_path(klon: &Path) -> PathBuf {
+    PathBuf::from(
+        git_ok(
+            klon,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .trim()
+        .to_string(),
+    )
+}
+
+/// What git itself says the index holds, plus the header and the extensions.
+/// Two `add` calls never share the stat bytes of the files they wrote, nor the
+/// worktree path inside the untracked cache, so the comparison reads the index
+/// the way git reads it and looks at the bytes only where they must agree.
+fn index_facts(klon: &Path) -> Vec<String> {
+    let bytes = fs::read(index_path(klon)).expect("read the index");
+    let mut facts = vec![
+        format!(
+            "version {}",
+            u32::from_be_bytes(bytes[4..8].try_into().unwrap())
+        ),
+        format!(
+            "entries {}",
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+        ),
+        // Every entry: its mode, its object id, its stage, and its path.
+        format!("stage\n{}", git_ok(klon, &["ls-files", "--stage"])),
+        // The tree the index makes, which is what `git commit` would write.
+        format!("tree {}", git_ok(klon, &["write-tree"]).trim()),
+        format!("status <{}>", git_ok(klon, &["status", "--porcelain"])),
+    ];
+    // The extension signatures, from the offset that `EOIE` declares.
+    let end = bytes.len().saturating_sub(20);
+    let mut sigs = Vec::new();
+    if let Some(eoie) = bytes[..end].windows(4).rposition(|w| w == b"EOIE") {
+        let mut at = u32::from_be_bytes(bytes[eoie + 8..eoie + 12].try_into().unwrap()) as usize;
+        while at + 8 <= end {
+            let sig = String::from_utf8_lossy(&bytes[at..at + 4]).into_owned();
+            let size = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if !sig.bytes().all(|b| b.is_ascii_uppercase()) {
+                break;
+            }
+            sigs.push(sig);
+            at += 8 + size;
+        }
+    }
+    // The set, not the order: git writes `IEOT` before `TREE` and the splice
+    // writes the extensions it keeps before the two it rebuilds, and a reader
+    // takes them in any order.
+    sigs.sort();
+    facts.push(format!("extensions {sigs:?}"));
+    facts
+}
+
+/// Force golden's index to `version`, so a test can drive the splice over the
+/// prefix-compressed paths of version 4 as well as the plain ones of 2. git
+/// keeps the version an index already has, and `index.version` sets only the
+/// version of an index it makes from nothing.
+fn set_index_version(golden: &Path, version: u32) {
+    git_ok(
+        golden,
+        &["update-index", "--index-version", &version.to_string()],
+    );
+    let bytes = fs::read(golden.join(".git").join("index")).expect("read golden's index");
+    assert_eq!(
+        u32::from_be_bytes(bytes[4..8].try_into().unwrap()),
+        version,
+        "golden's index must be version {version}"
+    );
+}
+
+/// G4: the splice serves a spare-served `add`, and every check that says the
+/// klon is the one git would have made passes on it.
+#[test]
+fn the_index_splice_serves_add_and_git_agrees_with_the_klon() {
+    for version in [2u32, 4] {
+        let fx = Fixture::generate(SEED, 60, 6, 8, 5);
+        set_index_version(&fx.golden, version);
+        build_spare(&fx.golden);
+        let out = klon_loud(&fx.golden, &["add", "feature"]);
+        assert!(out.status.success(), "add failed: {}", stderr(&out));
+        let log = stderr(&out);
+        assert!(
+            log.contains("the index splice served feature"),
+            "version {version}: the splice must serve this add: {log}"
+        );
+        // The builder that `add` started warms the new klon with a forced
+        // `git status`, which takes the index lock; the `write-tree` and the
+        // `commit` below would fail on it. The record appears only after that
+        // warm and the clone that follows it, so waiting for it settles both.
+        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+        let klon = fx.default_klon_path();
+
+        // The correctness gate of the goal, line by line.
+        assert_spare_klon(&fx, &klon, "feature");
+        assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+            ""
+        );
+        assert!(git(&klon, &["diff", "--quiet", "HEAD"]).status.success());
+        assert_eq!(
+            git_ok(&klon, &["rev-parse", "HEAD^{tree}"]),
+            git_ok(&fx.golden, &["rev-parse", "refs/heads/feature^{tree}"])
+        );
+        // Every file re-hashed, not only the ones whose stat data moved.
+        assert_eq!(
+            git_ok(
+                &klon,
+                &["-c", "core.checkStat=default", "status", "--porcelain"]
+            ),
+            "",
+            "version {version}: a content check must find nothing"
+        );
+        // A second status is empty and leaves the index alone.
+        git_ok(&klon, &["status", "--porcelain"]);
+        let before = fs::read(index_path(&klon)).expect("read the index");
+        assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+        assert_eq!(
+            fs::read(index_path(&klon)).expect("read the index"),
+            before,
+            "version {version}: a settled status must not rewrite the index"
+        );
+        // The index makes the tree of the branch, which is what a commit needs.
+        assert_eq!(
+            git_ok(&klon, &["write-tree"]).trim(),
+            git_ok(&fx.golden, &["rev-parse", "refs/heads/feature^{tree}"]).trim()
+        );
+        common::identity(&klon);
+        assert!(
+            git(&klon, &["commit", "--allow-empty", "-m", "empty"])
+                .status
+                .success(),
+            "version {version}: commit must work"
+        );
+        assert_eq!(
+            git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+            "",
+            "version {version}: fsck after a commit"
+        );
+    }
+}
+
+/// G4: the spliced index says what the index that `git checkout` writes says.
+/// The two runs differ in the stat bytes of the files they wrote and in the
+/// worktree path inside the untracked cache, so the comparison reads the index
+/// through git; a wrong path, mode, object id, stage, or entry count shows up.
+#[test]
+fn the_spliced_index_says_what_git_checkout_writes() {
+    for version in [2u32, 4] {
+        let fx = Fixture::generate(SEED, 60, 6, 8, 5);
+        set_index_version(&fx.golden, version);
+
+        build_spare(&fx.golden);
+        let spliced = fx.klon_path("feature");
+        let out = klon_loud(&fx.golden, &["add", "feature"]);
+        assert!(out.status.success(), "add failed: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("the index splice served feature"),
+            "version {version}: the splice must serve the first add"
+        );
+        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+
+        let checked_out = fx.klon_path("second");
+        git_ok(&fx.golden, &["branch", "second", "feature"]);
+        let out = klon_no_splice(&fx.golden, &["add", "second"]);
+        assert!(out.status.success(), "add failed: {}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("the index splice served"),
+            "version {version}: KLON_NO_SPLICE must turn the splice off"
+        );
+
+        // The builder that the second `add` started runs a forced `git status`
+        // in the new klon before it clones, and that status takes the index
+        // lock. A `write-tree` beside it fails on the lock, which is git
+        // behaving correctly and this test racing it, so the comparison waits
+        // for the spare: the record appears only after the warm and the clone.
+        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+
+        // One status in each, so both indexes are as settled as git makes them.
+        git_ok(&spliced, &["status", "--porcelain"]);
+        git_ok(&checked_out, &["status", "--porcelain"]);
+        let a = index_facts(&spliced);
+        let b = index_facts(&checked_out);
+        for (left, right) in a.iter().zip(&b) {
+            // The cached tree is the one part the splice drops on purpose: git
+            // rebuilds it from the entries, which the line above compares.
+            let left = left.replace("\"TREE\", ", "");
+            let right = right.replace("\"TREE\", ", "");
+            assert_eq!(left, right, "version {version}: the two indexes differ");
+        }
+        assert_eq!(a.len(), b.len());
+    }
+}
+
+/// G4: a spare whose files do not match its index makes the splice stand
+/// aside, and `git checkout --force` then throws the change away as it always
+/// did. Without the guard the klon would carry golden's edit and read dirty.
+#[test]
+fn a_spare_that_does_not_match_its_index_falls_back_to_git_checkout() {
+    let fx = Fixture::generate(SEED, 40, 4, 6, 3);
+    // A tracked file that the branch leaves alone, edited in golden. The spare
+    // copies the edit; the index it carries still names the committed blob.
+    let untouched = fx.tracked_rel(3);
+    assert!(!fx.diff_paths.contains(&untouched));
+    fs::write(fx.golden.join(&untouched), "edited in golden\n").unwrap();
+    build_spare(&fx.golden);
+    assert_eq!(
+        read_meta(&fx.golden)["tracked_clean"],
+        Value::Bool(false),
+        "the builder must record that the spare does not match its index"
+    );
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        !log.contains("the index splice served"),
+        "the splice must stand aside: {log}"
+    );
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert_eq!(
+        fs::read_to_string(klon.join(&untouched)).unwrap(),
+        fx.tracked_content(3),
+        "the checkout must restore the committed bytes"
+    );
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4: a branch that changes the attributes of the tree changes what writing a
+/// file means, so the splice stands aside and git does the checkout.
+#[test]
+fn a_branch_that_changes_gitattributes_falls_back_to_git_checkout() {
+    let fx = Fixture::generate(SEED, 40, 4, 6, 3);
+    git_ok(&fx.golden, &["checkout", "-q", "feature"]);
+    fs::write(fx.golden.join(".gitattributes"), "* -text\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "attributes"]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    build_spare(&fx.golden);
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("the index splice refused: the diff changes the attributes of the tree"),
+        "the splice must name why it stood aside: {log}"
+    );
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4: a split index carries a `link` extension, which is not even ignorable,
+/// so the splice stands aside on the bytes themselves and git does the
+/// checkout from the shared index the claim carried over.
+#[test]
+fn a_split_index_falls_back_to_git_checkout() {
+    let fx = Fixture::generate(SEED, 40, 4, 6, 3);
+    git_ok(&fx.golden, &["update-index", "--split-index"]);
+    build_spare(&fx.golden);
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        !log.contains("the index splice served"),
+        "the splice must stand aside on a split index: {log}"
+    );
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+        ""
+    );
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4, review finding 1: a branch that replaces a tracked directory with a
+/// symbolic link to somewhere outside the klon must not make the splice delete
+/// through that link. The removals run before the writes for exactly this
+/// case: afterwards the path `keep/outside.txt` would resolve into the target
+/// of the new link.
+#[test]
+fn a_branch_that_replaces_a_tracked_directory_with_a_symlink_deletes_nothing_outside() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    // A directory outside the klon, with a file the branch must not touch.
+    let outside = fx.golden.parent().unwrap().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "not the klon's to delete\n").unwrap();
+
+    // On main: a tracked directory `keep` with one tracked file in it.
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    fs::create_dir_all(fx.golden.join("keep")).unwrap();
+    fs::write(fx.golden.join("keep").join("keep.txt"), "tracked\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a tracked directory"]);
+    // On feature: the same name is a symbolic link to the outside directory.
+    git_ok(&fx.golden, &["checkout", "-q", "feature"]);
+    git_ok(&fx.golden, &["merge", "-q", "main", "-m", "take main"]);
+    fs::remove_dir_all(fx.golden.join("keep")).unwrap();
+    std::os::unix::fs::symlink(&outside, fx.golden.join("keep")).unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a symlink instead"]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+
+    build_spare(&fx.golden);
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon = fx.default_klon_path();
+    assert!(
+        outside.join("keep.txt").is_file(),
+        "the file outside the klon must survive: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read_link(klon.join("keep")).unwrap(),
+        outside,
+        "the klon holds the link the branch names"
+    );
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+        ""
+    );
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4, review finding 1 again, the other way round: a branch that turns a
+/// tracked file into a directory, and a directory into a file. Both need the
+/// removals to run before the writes, or git meets `ENOTDIR` and `EISDIR`.
+#[test]
+fn a_branch_that_swaps_a_file_and_a_directory_is_checked_out_whole() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    fs::write(fx.golden.join("swap"), "a file on main\n").unwrap();
+    fs::create_dir_all(fx.golden.join("other")).unwrap();
+    fs::write(fx.golden.join("other").join("inner.txt"), "inner\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a file and a directory"]);
+
+    git_ok(&fx.golden, &["checkout", "-q", "feature"]);
+    git_ok(&fx.golden, &["merge", "-q", "main", "-m", "take main"]);
+    fs::remove_file(fx.golden.join("swap")).unwrap();
+    fs::create_dir_all(fx.golden.join("swap")).unwrap();
+    fs::write(
+        fx.golden.join("swap").join("inner.txt"),
+        "now a directory\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(fx.golden.join("other")).unwrap();
+    fs::write(fx.golden.join("other"), "now a file\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "swap them"]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+
+    build_spare(&fx.golden);
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon = fx.default_klon_path();
+    assert_eq!(
+        fs::read_to_string(klon.join("swap").join("inner.txt")).unwrap(),
+        "now a directory\n"
+    );
+    assert_eq!(
+        fs::read_to_string(klon.join("other")).unwrap(),
+        "now a file\n"
+    );
+    assert_spare_klon(&fx, &klon, "feature");
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4, review finding 2: `git checkout` runs the `post-checkout` hook and the
+/// splice runs no hook, so a repository that has one keeps the real checkout
+/// and the hook still runs.
+#[test]
+fn a_post_checkout_hook_keeps_the_real_checkout_and_still_runs() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    let hooks = fx.golden.join(".git").join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    // The marker lands outside the klon: `git clean` removes an untracked file
+    // that a hook made inside it, which is what `add` has always done and is
+    // not what this test is about.
+    let marker = fx.golden.parent().unwrap().join("post-checkout-ran");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\n", marker.to_str().unwrap()),
+    )
+    .unwrap();
+    let mut mode = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    fs::set_permissions(&hook, mode).unwrap();
+    build_spare(&fx.golden);
+    assert!(!marker.exists(), "the builder runs no checkout");
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("the repository has a post-checkout hook"),
+        "the splice must name why it stood aside: {log}"
+    );
+    assert!(marker.is_file(), "the hook must still run: {log}");
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
 }

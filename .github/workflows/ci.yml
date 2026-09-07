@@ -181,6 +181,22 @@ jobs:
       # when the runner breaks them again.
       - run: cargo test --locked --test netns -- --nocapture
 
+  # The index splice writes index bytes that git reads back (G4). The
+  # development laptop and `ubuntu-22.04` both carry git 2.34.1, so this job is
+  # the only proof that a spliced index reads on a newer git: `ubuntu-24.04`
+  # carries 2.43. It runs the two suites that drive `add`, and prints the
+  # version so a failure names the git it failed on.
+  newer-git:
+    name: add and spare tests on a newer git (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: git --version
+      - run: cargo test --locked --test spare --test add -- --nocapture
+
   nightly:
     name: nightly, 100k fixture (ubuntu-22.04)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

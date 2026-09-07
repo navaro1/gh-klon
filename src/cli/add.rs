@@ -708,8 +708,25 @@ fn fill(
     // Step 6: an index with a fresh mtime. `--no-checkout` wrote no index. The
     // spare brings the index of the moment it was made, which describes its
     // files exactly; a direct clone takes golden's.
+    //
+    // A klon that may take the index splice keeps those bytes in memory
+    // instead (G4): the splice relocates the untracked cache and patches the
+    // entries in the same pass, so the big file is read once and written
+    // once. When the splice then refuses, `checkout_branch` writes the same
+    // bytes relocated, as step 6 would have.
     let index = admin_dir.join("index");
-    let from_spare = used_spare && spare::take_index(path, &admin_dir)?;
+    let hold = spare_meta
+        .as_ref()
+        .is_some_and(|meta| splice_ready(golden, meta));
+    let taken = match used_spare {
+        true => spare::take_index(path, &admin_dir, hold)?,
+        false => spare::Taken::Missing,
+    };
+    let from_spare = !matches!(taken, spare::Taken::Missing);
+    let mut held = match taken {
+        spare::Taken::Held(bytes) => Some(bytes),
+        _ => None,
+    };
     if !from_spare {
         fs::copy(common.join("index"), &index).map_err(Error::io("copy the index"))?;
         // A split index refers to a shared file beside the original index.
@@ -726,9 +743,11 @@ fn fill(
             fs::copy(shared, admin_dir.join(name)).map_err(Error::io("copy the shared index"))?;
         }
     }
-    fs::File::open(&index)
-        .and_then(|f| f.set_modified(SystemTime::now()))
-        .map_err(Error::io("touch the index"))?;
+    if held.is_none() {
+        fs::File::open(&index)
+            .and_then(|f| f.set_modified(SystemTime::now()))
+            .map_err(Error::io("touch the index"))?;
+    }
     if used_spare {
         // The builder's record and the claim's stub must not reach the klon.
         spare::drop_metadata(path)?;
@@ -767,11 +786,26 @@ fn fill(
     //
     // A spare from an older builder has neither list, and a direct clone has
     // no record at all; both take the git-asked paths below.
-    let recorded = spare_meta.as_ref().and_then(|meta| {
-        let entries = meta.ignored_entries.as_ref()?;
-        let touched = tree_diff(path, &meta.head, branch)?;
-        Some((entries, touched))
+    //
+    // One `git diff-tree --raw` answers both shortcuts and the splice (G4).
+    // The call costs 29 to 43 ms on the 100k fixture, which is not a price to
+    // pay twice, and its record names the modes and the object ids too, so the
+    // splice needs no second call to say what it writes.
+    let touched = spare_meta.as_ref().and_then(|meta| {
+        crate::splice::diff(path, &meta.head, &format!("refs/heads/{branch}")).ok()
     });
+    let recorded = spare_meta.as_ref().zip(touched.as_ref()).and_then(
+        |(meta, touched)| -> Option<(&Vec<String>, Vec<&[u8]>)> {
+            let entries = meta.ignored_entries.as_ref()?;
+            Some((
+                entries,
+                touched
+                    .iter()
+                    .map(|change| change.path.as_slice())
+                    .collect(),
+            ))
+        },
+    );
     let spare_tree_is_its_commit = spare_meta.as_ref().is_some_and(|meta| {
         meta.index_matches_head == Some(true)
             && meta.shared_ignore_hash.as_deref()
@@ -810,10 +844,29 @@ fn fill(
     };
     let fixup_beside = fixup_beside_checkout.is_some();
     let mut fixup_done = fixup_beside || switches.no_fixup;
+    // The index splice needs the real path of the klon, because that is the
+    // path git resolves for itself when it reads the untracked cache.
+    let real = match held.is_some() {
+        true => Some(
+            path.canonicalize()
+                .map_err(Error::io(format!("resolve {}", path.display())))?,
+        ),
+        false => None,
+    };
+    let held_bytes = held.take();
     beside(
         steps,
         "checkout",
-        || git::run(path, &["checkout", "-q", "--force", branch]).map(|_| ()),
+        || {
+            checkout_branch(
+                path,
+                &admin_dir,
+                branch,
+                touched.as_deref(),
+                held_bytes,
+                real.as_deref(),
+            )
+        },
         "fixup",
         fixup_beside_checkout,
     )?;
@@ -948,6 +1001,97 @@ struct Filled {
     warmed_inline: bool,
 }
 
+/// One line on stderr under `KLON_DEBUG=1`, for a decision a reader of the
+/// per-step lines needs to see.
+fn debug(message: &str) {
+    if crate::debug() {
+        eprintln!("klon: debug: add: {message}");
+    }
+}
+
+/// The escape hatch of the index splice. Any value but `0` and the empty
+/// string makes every `add` run `git checkout` as it did before G4, which is
+/// what the differential test compares against.
+const NO_SPLICE: &str = "KLON_NO_SPLICE";
+
+/// True when the record of a spare says the splice may look at its index
+/// (G4). Three promises, each of which a `git checkout --force` would not
+/// need, because it rewrites every path that differs:
+///
+/// - `index_matches_head`: the index the spare carries holds exactly the tree
+///   of `head`. Without it a staged change makes the spare differ from `head`
+///   in a way that a diff between two commits cannot name, and the splice
+///   would keep an entry the branch does not hold.
+/// - `tracked_clean`: the files of the spare match that index. The splice
+///   keeps the working-tree file of every path the branch leaves alone, so a
+///   file that already differs would stay different and `git status` would
+///   print it.
+/// - `shared_ignore_hash`: unchanged, so `info/exclude` and the file
+///   `core.excludesFile` names still say what they said at build time. The
+///   splice writes only tracked paths, so this guards the recorded lists
+///   beside it, not the splice itself; it costs nothing and it keeps the two
+///   shortcuts under one rule.
+///
+/// One more thing must be true, and it is about the repository, not the spare:
+/// `git checkout` runs the `post-checkout` hook and the splice runs no hook at
+/// all, so a repository that has one keeps the real checkout.
+fn splice_ready(golden: &Path, meta: &spare::Meta) -> bool {
+    let off = std::env::var(NO_SPLICE).is_ok_and(|value| !value.is_empty() && value != "0");
+    if off || meta.index_matches_head != Some(true) || meta.tracked_clean != Some(true) {
+        return false;
+    }
+    if hooks::exists(golden, "post-checkout") {
+        debug("the index splice stands aside: the repository has a post-checkout hook");
+        return false;
+    }
+    true
+}
+
+/// Step 8: put the tracked files, the index, and `HEAD` of `branch` in the
+/// klon.
+///
+/// `held` is the index of a spare that `splice_ready` accepted, read but not
+/// yet written. The splice does the whole job without letting git rewrite the
+/// whole index (G4); it refuses whatever it cannot certainly do, and the
+/// refusal falls back to the `git checkout --force` that every klon ran
+/// before. A klon without held bytes takes that path directly.
+fn checkout_branch(
+    path: &Path,
+    admin_dir: &Path,
+    branch: &str,
+    changes: Option<&[crate::splice::Change]>,
+    held: Option<Vec<u8>>,
+    real: Option<&Path>,
+) -> Result<()> {
+    if let (Some(bytes), Some(changes), Some(real)) = (&held, changes, real) {
+        match crate::splice::checkout(path, admin_dir, branch, changes, bytes, real)? {
+            crate::splice::Done::Spliced => {
+                debug(&format!("the index splice served {branch}"));
+                return Ok(());
+            }
+            crate::splice::Done::Refused(why) => {
+                debug(&format!("the index splice refused: {why}"));
+            }
+        }
+    }
+    // The splice refused or never ran, so the held bytes become the index the
+    // checkout starts from, relocated the way step 6 would have relocated
+    // them.
+    if let (Some(mut bytes), Some(real)) = (held, real) {
+        let outcome = crate::untracked::relocate(&mut bytes, real);
+        if outcome != crate::untracked::Relocated::Patched {
+            debug(&format!(
+                "the untracked cache was not relocated: {outcome:?}"
+            ));
+        }
+        spare::write_index(&bytes, admin_dir)?;
+        fs::File::open(admin_dir.join("index"))
+            .and_then(|f| f.set_modified(SystemTime::now()))
+            .map_err(Error::io("touch the index"))?;
+    }
+    git::run(path, &["checkout", "-q", "--force", branch]).map(|_| ())
+}
+
 /// True when a path the checkout writes and a recorded ignored entry can
 /// touch the same file. The two meet when they are equal, when the changed
 /// path lies inside the entry, or when the entry lies inside the changed
@@ -962,34 +1106,6 @@ fn meets(changed: &[u8], entry: &str) -> bool {
     }
     let entry = entry.strip_suffix('/').unwrap_or(entry).as_bytes();
     changed == entry || inside(changed, entry) || inside(entry, changed)
-}
-
-/// The paths that differ between the tree of `from` and the tree of
-/// `branch`, as `git diff-tree` names them: what a checkout from one to the
-/// other writes or removes. None when git cannot answer, for example when
-/// `from` is gone; the caller then takes the paths that ask git again.
-fn tree_diff(klon: &Path, from: &str, branch: &str) -> Option<Vec<Vec<u8>>> {
-    let out = git::run_bytes_env(
-        klon,
-        &[
-            "diff-tree",
-            "-r",
-            "-z",
-            "--name-only",
-            "--no-renames",
-            from,
-            branch,
-        ]
-        .map(OsStr::new),
-        &[],
-    )
-    .ok()?;
-    Some(
-        out.split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(<[u8]>::to_vec)
-            .collect(),
-    )
 }
 
 /// Run `main` on this thread and `side`, when there is one, on another; then
