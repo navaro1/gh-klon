@@ -123,9 +123,11 @@ jobs:
           set -eux
           # The API answers /releases/latest with the newest stable release
           # only, so a tag with a prerelease suffix pins the install to its
-          # own tag. A stable tag takes the default path.
+          # own tag with --pin. The `owner/repo@tag` form is not a syntax the
+          # gh CLI accepts, and it answers "Could not find extension".
+          # A stable tag takes the default path.
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            gh extension install navaro1/gh-klon@"$GITHUB_REF_NAME"
+            gh extension install navaro1/gh-klon --pin "$GITHUB_REF_NAME"
           else
             gh extension install navaro1/gh-klon
           fi
