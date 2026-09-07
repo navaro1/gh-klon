@@ -711,7 +711,7 @@ fn fill(
     //
     // A klon that may take the index splice keeps those bytes in memory
     // instead (G4): the splice relocates the untracked cache and patches the
-    // entries in the same pass, so the 10 MB file is read once and written
+    // entries in the same pass, so the big file is read once and written
     // once. When the splice then refuses, `checkout_branch` writes the same
     // bytes relocated, as step 6 would have.
     let index = admin_dir.join("index");
@@ -1039,7 +1039,7 @@ fn splice_ready(meta: &spare::Meta) -> bool {
 ///
 /// `held` is the index of a spare that `splice_ready` accepted, read but not
 /// yet written. The splice does the whole job without letting git rewrite the
-/// 10 MB index (G4); it refuses whatever it cannot certainly do, and the
+/// whole index (G4); it refuses whatever it cannot certainly do, and the
 /// refusal falls back to the `git checkout --force` that every klon ran
 /// before. A klon without held bytes takes that path directly.
 fn checkout_branch(

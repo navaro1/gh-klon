@@ -4,7 +4,7 @@
 //! working-tree files that differ between the spare's commit and the branch, it
 //! replaces the index with one that matches the branch, and it moves `HEAD`.
 //! On the 100k fixture the first job writes 22 files and the second rewrites
-//! all 10 MB of the index, which costs 355 to 423 ms (G1 §5.7). This module
+//! the whole index, which costs 355 to 423 ms (G1 §5.7). This module
 //! does the second job by hand: it copies the entry bytes of every path the
 //! branch leaves alone and re-emits only the entries the branch changes.
 //!
@@ -31,7 +31,7 @@
 //! and a hash over the extension headers, and both change. `UNTR` moves
 //! through `untracked::retarget`, so the splice also does the work that
 //! `spare::take_index` would otherwise do in a second pass over the same
-//! 10 MB.
+//! bytes.
 
 use crate::untracked;
 use sha1::Digest;

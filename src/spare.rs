@@ -786,7 +786,7 @@ pub enum Taken {
     /// The index sits in the admin entry, with its untracked cache relocated.
     Written,
     /// The bytes of the index, neither relocated nor written. The caller
-    /// splices them and writes the answer once, so the 10 MB file is read once
+    /// splices them and writes the answer once, so the big file is read once
     /// and written once instead of twice (G4).
     Held(Vec<u8>),
 }
