@@ -1256,6 +1256,10 @@ fn index_facts(klon: &Path) -> Vec<String> {
             at += 8 + size;
         }
     }
+    // The set, not the order: git writes `IEOT` before `TREE` and the splice
+    // writes the extensions it keeps before the two it rebuilds, and a reader
+    // takes them in any order.
+    sigs.sort();
     facts.push(format!("extensions {sigs:?}"));
     facts
 }
