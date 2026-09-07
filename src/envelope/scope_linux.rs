@@ -29,6 +29,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The task limit of one klon. A build fans out to a few hundred processes;
 /// four thousand leaves room for that and still stops a fork bomb.
@@ -385,14 +386,20 @@ fn quote(text: &str) -> String {
 
 // --- Names -------------------------------------------------------------------
 
-/// The systemd unit and cgroup name of one command: `klon-<branch>-<pid>`.
+/// The systemd unit and cgroup name of one command: `klon-<branch>-<pid>-<n>`.
 ///
 /// A systemd unit name holds only `A-Z a-z 0-9 : _ . -`, and a branch may hold
-/// a slash, so every other character becomes `-`. The process id keeps two
-/// commands of one klon apart, and `stop` reads the shape back to prove that a
-/// cgroup belongs to klon before it writes `cgroup.kill`.
+/// a slash, so every other character becomes `-`. The process id keeps the
+/// commands of two klon processes apart, and `n` counts the commands of one
+/// process: `up` runs the warm steps one after another from a single process,
+/// and systemd keeps a scope alive for a moment after its command exits, so a
+/// name without `n` collided with `Unit klon--<pid>.scope already exists` and
+/// the second step died. `stop` reads the shape back to prove that a cgroup
+/// belongs to klon before it writes `cgroup.kill`.
 fn unit_name(name: &str) -> String {
-    format!("klon-{}-{}", sanitize(name), std::process::id())
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("klon-{}-{}-{}", sanitize(name), std::process::id(), seq)
 }
 
 /// The branch name with every character a unit name refuses replaced by `-`.
@@ -459,9 +466,13 @@ fn is_klon_cgroup(dir: &Path, prefix: &str) -> bool {
     let Some(tail) = base.strip_prefix(prefix) else {
         return false;
     };
-    !tail.is_empty()
-        && tail.bytes().all(|byte| byte.is_ascii_digit())
-        && dir.join("cgroup.kill").exists()
+    // The tail is the process id and the command counter of `unit_name`, so
+    // it holds one or two runs of digits. An older klon wrote the process id
+    // alone, and such a cgroup still answers here.
+    let mut parts = tail.split('-');
+    let shaped = parts.clone().count() <= 2
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    shaped && dir.join("cgroup.kill").exists()
 }
 
 /// Send SIGKILL to every process of `dir` with one write. `cgroup.kill`
@@ -554,6 +565,24 @@ mod tests {
         assert!(unit_name("feat/x").starts_with("klon-feat-x-"));
     }
 
+    /// `up` runs its warm steps one after another from one process. systemd
+    /// keeps a scope for a moment after its command exits, so two commands
+    /// that share a unit name make the second one fail to start.
+    #[test]
+    fn two_commands_of_one_process_get_two_unit_names() {
+        let first = unit_name("feature");
+        let second = unit_name("feature");
+        assert_ne!(first, second, "each command needs its own unit");
+        for unit in [&first, &second] {
+            let tail = unit.strip_prefix("klon-feature-").expect("the prefix");
+            assert!(
+                tail.split('-')
+                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "stop reads this shape back: {unit}"
+            );
+        }
+    }
+
     #[test]
     fn the_cgroup_guard_refuses_a_directory_that_is_not_klons() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -570,6 +599,18 @@ mod tests {
             fs::write(dir.join("cgroup.kill"), "").unwrap();
             assert!(is_klon_cgroup(&dir, prefix), "{name} must match");
         }
+        // The counted shape that `unit_name` writes today.
+        for name in ["klon-feature-12-0.scope", "klon-feature-12-7"] {
+            let dir = tmp.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("cgroup.kill"), "").unwrap();
+            assert!(is_klon_cgroup(&dir, prefix), "{name} must match");
+        }
+        // Three runs of digits is not a shape klon writes.
+        let deep = tmp.path().join("klon-feature-1-2-3");
+        fs::create_dir(&deep).unwrap();
+        fs::write(deep.join("cgroup.kill"), "").unwrap();
+        assert!(!is_klon_cgroup(&deep, prefix));
         // The right prefix and no process id at all is not klon's shape.
         let odd = tmp.path().join("klon-feature-x");
         fs::create_dir(&odd).unwrap();
