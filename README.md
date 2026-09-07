@@ -12,10 +12,13 @@ Install klon as a `gh` extension from the precompiled release:
 gh extension install navaro1/gh-klon
 ```
 
-`gh` reads the newest stable release. A prerelease needs its own tag:
+`gh` reads the newest stable release. It cannot install a prerelease: it decides whether a
+repository ships a binary extension by reading the latest stable release, and that call fails
+while every release is a prerelease. Take the asset by hand until the first stable tag:
 
 ```sh
-gh extension install navaro1/gh-klon --pin v0.1.0-rc1
+gh release download v0.1.0-rc1 --repo navaro1/gh-klon --pattern 'gh-klon_*_linux-amd64' --output gh-klon
+chmod +x gh-klon
 ```
 
 `gh` downloads the release asset that matches its platform. Every release carries four assets:
