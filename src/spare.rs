@@ -489,8 +489,8 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
 
     let choice = backend::select(golden, &common, Some(&layout.tmp), None)?;
     fs::create_dir(&layout.tmp).map_err(Error::io(format!("create {}", layout.tmp.display())))?;
-    let filled = fill_tmp(golden, &common, layout, choice.backend.as_ref(), &exclude).and_then(
-        |warmed| {
+    let filled =
+        fill_tmp(golden, &common, layout, choice.backend.as_ref(), &exclude).and_then(|warmed| {
             let (after, entries) = ignored_listing(golden, &exclude)?;
             let meta = Meta {
                 version: VERSION,
@@ -516,8 +516,7 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
                 layout.tmp.display(),
                 layout.dir.display()
             )))
-        },
-    );
+        });
     if let Err(err) = filled {
         if let Err(cleanup) = remove_tree(&layout.tmp) {
             eprintln!("klon: {cleanup}");

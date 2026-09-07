@@ -1211,9 +1211,12 @@ fn klon_no_splice(cwd: &Path, args: &[&str]) -> std::process::Output {
 /// The index file of a klon.
 fn index_path(klon: &Path) -> PathBuf {
     PathBuf::from(
-        git_ok(klon, &["rev-parse", "--path-format=absolute", "--git-path", "index"])
-            .trim()
-            .to_string(),
+        git_ok(
+            klon,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .trim()
+        .to_string(),
     )
 }
 
@@ -1224,8 +1227,14 @@ fn index_path(klon: &Path) -> PathBuf {
 fn index_facts(klon: &Path) -> Vec<String> {
     let bytes = fs::read(index_path(klon)).expect("read the index");
     let mut facts = vec![
-        format!("version {}", u32::from_be_bytes(bytes[4..8].try_into().unwrap())),
-        format!("entries {}", u32::from_be_bytes(bytes[8..12].try_into().unwrap())),
+        format!(
+            "version {}",
+            u32::from_be_bytes(bytes[4..8].try_into().unwrap())
+        ),
+        format!(
+            "entries {}",
+            u32::from_be_bytes(bytes[8..12].try_into().unwrap())
+        ),
         // Every entry: its mode, its object id, its stage, and its path.
         format!("stage\n{}", git_ok(klon, &["ls-files", "--stage"])),
         // The tree the index makes, which is what `git commit` would write.

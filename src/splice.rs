@@ -267,6 +267,7 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
                 .as_ref()
                 .ok_or("the branch drops a path the index does not hold")?;
             flush(&mut out, &mut run, bytes);
+            let block_start = offsets.len() % BLOCK == 0;
             offsets.push(out.len() as u32);
             stat_at[i] = Some(emit(
                 &mut out,
@@ -274,6 +275,7 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
                 &prev_new,
                 &changes[i].path,
                 target,
+                block_start,
             ));
             prev_new.clear();
             prev_new.extend_from_slice(&changes[i].path);
@@ -282,6 +284,10 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
             in_sync = false;
             next += 1;
         }
+        // The first entry of a block spells its whole path, whatever stands
+        // before it, so the copied bytes of the old index will not do.
+        let block_start = offsets.len() % BLOCK == 0;
+        in_sync = in_sync && !(layout.version == 4 && block_start);
 
         let change = (next < order.len() && changes[order[next]].path == path).then(|| {
             let i = order[next];
@@ -299,7 +305,14 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
                 flush(&mut out, &mut run, bytes);
                 let target = changes[i].to.as_ref().expect("matched above");
                 offsets.push(out.len() as u32);
-                stat_at[i] = Some(emit(&mut out, layout.version, &prev_new, &path, target));
+                stat_at[i] = Some(emit(
+                    &mut out,
+                    layout.version,
+                    &prev_new,
+                    &path,
+                    target,
+                    block_start,
+                ));
             }
             // The branch leaves the path alone, and the entry before it is the
             // one it was, so the old bytes still say the same thing.
@@ -326,7 +339,14 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
                     mode,
                     oid: bytes[start + 40..start + 40 + hash_len].to_vec(),
                 };
-                let stat = emit(&mut out, layout.version, &prev_new, &path, &target);
+                let stat = emit(
+                    &mut out,
+                    layout.version,
+                    &prev_new,
+                    &path,
+                    &target,
+                    block_start,
+                );
                 out[stat..stat + 40].copy_from_slice(&bytes[start..start + 40]);
             }
         }
@@ -341,6 +361,7 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
             .to
             .as_ref()
             .ok_or("the branch drops a path the index does not hold")?;
+        let block_start = offsets.len() % BLOCK == 0;
         offsets.push(out.len() as u32);
         stat_at[i] = Some(emit(
             &mut out,
@@ -348,6 +369,7 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
             &prev_new,
             &changes[i].path,
             target,
+            block_start,
         ));
         prev_new.clear();
         prev_new.extend_from_slice(&changes[i].path);
@@ -378,7 +400,9 @@ pub fn plan(bytes: &[u8], changes: &[Change], worktree: &Path) -> Result<Spliced
     }
     if layout.exts.iter().any(|e| &e.sig == b"EOIE") {
         let mut data = Vec::with_capacity(4 + hash_len);
-        data.extend_from_slice(&(u32::try_from(extensions_at).map_err(|_| "index too large")?).to_be_bytes());
+        data.extend_from_slice(
+            &(u32::try_from(extensions_at).map_err(|_| "index too large")?).to_be_bytes(),
+        );
         // The hash covers the signature and the size of every extension before
         // this one, and nothing else.
         let mut hasher = sha1::Sha1::new();
@@ -439,7 +463,14 @@ fn flush(out: &mut Vec<u8>, run: &mut Option<Run>, bytes: &[u8]) {
 
 /// Write one entry. The answer is the offset of its 40-byte stat block, which
 /// the caller fills once it has written the file.
-fn emit(out: &mut Vec<u8>, version: u32, prev: &[u8], path: &[u8], target: &Target) -> usize {
+fn emit(
+    out: &mut Vec<u8>,
+    version: u32,
+    prev: &[u8],
+    path: &[u8],
+    target: &Target,
+    block_start: bool,
+) -> usize {
     let start = out.len();
     out.extend(std::iter::repeat_n(0u8, 40));
     out[start + 24..start + 28].copy_from_slice(&target.mode.to_be_bytes());
@@ -449,11 +480,18 @@ fn emit(out: &mut Vec<u8>, version: u32, prev: &[u8], path: &[u8], target: &Targ
     if version == 4 {
         // Strip what the previous path holds past the common prefix, then
         // spell the rest, the way `ce_write_entry` does.
-        let common = prev
-            .iter()
-            .zip(path)
-            .take_while(|(a, b)| a == b)
-            .count();
+        //
+        // The first entry of an `IEOT` block shares nothing with the previous
+        // path, because git's threaded reader starts each block with no
+        // previous name at all (`load_cache_entries_thread` passes NULL).
+        // git's writer forces the same by breaking the first byte of the
+        // previous name, which makes the common prefix empty; the entry then
+        // strips the whole previous path and spells its own. Both readers get
+        // the same name from that, and only from that.
+        let common = match block_start {
+            true => 0,
+            false => prev.iter().zip(path).take_while(|(a, b)| a == b).count(),
+        };
         out.extend_from_slice(&untracked::encode_varint(prev.len() - common));
         out.extend_from_slice(&path[common..]);
         out.push(0);
@@ -474,18 +512,17 @@ fn push_ext(out: &mut Vec<u8>, sig: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-/// The `IEOT` body: a version word, then one (offset, count) pair per block.
-/// git reads the entries of each block on its own thread, so any partition
-/// that covers every entry in order is a correct table; this one keeps the
-/// block count git chose and spreads the entries evenly over it.
+/// The `IEOT` body: a version word, then one (offset, count) pair per block of
+/// `BLOCK` entries. git reads the entries of each block on its own thread and
+/// starts every block with no previous name, so the blocks here must be the
+/// ones the emit forced a whole path at: `BLOCK` entries each, and the rest in
+/// the last one.
 fn ieot(offsets: &[u32]) -> Vec<u8> {
-    let blocks = offsets.len().div_ceil(BLOCK).max(1);
-    let per = offsets.len().div_ceil(blocks);
-    let mut data = Vec::with_capacity(4 + blocks * 8);
+    let mut data = Vec::with_capacity(4 + offsets.len().div_ceil(BLOCK) * 8);
     data.extend_from_slice(&1u32.to_be_bytes());
     let mut at = 0;
     while at < offsets.len() {
-        let n = per.min(offsets.len() - at);
+        let n = BLOCK.min(offsets.len() - at);
         data.extend_from_slice(&offsets[at].to_be_bytes());
         data.extend_from_slice(&(n as u32).to_be_bytes());
         at += n;
@@ -493,9 +530,10 @@ fn ieot(offsets: &[u32]) -> Vec<u8> {
     data
 }
 
-/// The entries per `IEOT` block. git uses `THREAD_COST` of 500 entries as the
-/// smallest block worth a thread (`read-cache.c`), so a block of that size
-/// keeps every thread busy on an index big enough to matter.
+/// The entries per `IEOT` block. Any partition works for git's reader, which
+/// hands whole blocks to threads; this one is small enough to keep every
+/// thread of a big index busy and big enough that the whole-path entry at each
+/// boundary costs nothing worth counting.
 const BLOCK: usize = 500;
 
 // --- The checkout ---------------------------------------------------------
@@ -552,10 +590,12 @@ pub fn checkout(
             return Ok(Done::Refused("the diff names a submodule"));
         }
     }
+    let mut step = Step::new();
     let mut spliced = match plan(index, changes, real) {
         Ok(spliced) => spliced,
         Err(why) => return Ok(Done::Refused(why)),
     };
+    step.mark("plan");
 
     // Job 1a: the paths the branch holds, written by git itself.
     let small = admin_dir.join(SMALL);
@@ -575,6 +615,7 @@ pub fn checkout(
     for change in changes.iter().filter(|c| c.to.is_none()) {
         remove(klon, &change.path)?;
     }
+    step.mark("files");
 
     // Job 2: the stat data of what job 1 wrote, then the index.
     for (i, change) in changes.iter().enumerate() {
@@ -584,12 +625,14 @@ pub fn checkout(
             .map_err(crate::Error::io(format!("read {}", file.display())))?;
         spliced.set_stat(i, &Stat::of(&meta));
     }
+    let bytes = spliced.finish();
+    step.mark("checksum");
     let target = admin_dir.join("index");
     let temp = admin_dir.join("index.klon-tmp");
-    std::fs::write(&temp, spliced.finish())
-        .map_err(crate::Error::io(format!("write {}", temp.display())))?;
+    std::fs::write(&temp, bytes).map_err(crate::Error::io(format!("write {}", temp.display())))?;
     std::fs::rename(&temp, &target)
         .map_err(crate::Error::io(format!("move {}", temp.display())))?;
+    step.mark("write");
 
     // Job 3: `HEAD`. The message is the one `git checkout` writes, so `git
     // checkout -` and `@{-1}` read the reflog of this klon the same way.
@@ -599,7 +642,34 @@ pub fn checkout(
     let message = format!("checkout: moving from {was} to {branch}");
     let reference = format!("refs/heads/{branch}");
     crate::git::run(klon, &["symbolic-ref", "-m", &message, "HEAD", &reference])?;
+    step.mark("head");
     Ok(Done::Spliced)
+}
+
+/// The `KLON_DEBUG=1` timing lines inside the splice, so a reader of the
+/// per-step lines of `add` can see which part of it costs what.
+struct Step {
+    on: bool,
+    last: std::time::Instant,
+}
+
+impl Step {
+    fn new() -> Step {
+        Step {
+            on: crate::debug(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn mark(&mut self, name: &str) {
+        if self.on {
+            eprintln!(
+                "klon: debug: add splice-{name} {:.1} ms",
+                self.last.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        self.last = std::time::Instant::now();
+    }
 }
 
 /// Every path that differs between the two commits, with the mode and object
@@ -609,8 +679,16 @@ pub fn checkout(
 pub fn diff(klon: &Path, from: &str, reference: &str) -> Result<Vec<Change>, Refused> {
     let out = crate::git::run_bytes_env(
         klon,
-        &["diff-tree", "-r", "-z", "--raw", "--no-renames", from, reference]
-            .map(std::ffi::OsStr::new),
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--raw",
+            "--no-renames",
+            from,
+            reference,
+        ]
+        .map(std::ffi::OsStr::new),
         &[],
     )
     .map_err(|_| "the two commits do not diff")?;
@@ -621,7 +699,9 @@ pub fn diff(klon: &Path, from: &str, reference: &str) -> Result<Vec<Change>, Ref
     while let Some(meta) = fields.next() {
         let path = fields.next().ok_or("a diff record without a path")?;
         let meta = std::str::from_utf8(meta).map_err(|_| "a diff record that is not text")?;
-        let meta = meta.strip_prefix(':').ok_or("a diff record without a mode")?;
+        let meta = meta
+            .strip_prefix(':')
+            .ok_or("a diff record without a mode")?;
         let mut parts = meta.split(' ');
         let mut next = || parts.next().ok_or("a short diff record");
         let src = next()?;
@@ -659,7 +739,7 @@ fn small_index(changes: &[&Change]) -> Vec<u8> {
     out.extend_from_slice(&(order.len() as u32).to_be_bytes());
     for change in &order {
         let target = change.to.as_ref().expect("the caller filtered");
-        emit(&mut out, 2, b"", &change.path, target);
+        emit(&mut out, 2, b"", &change.path, target, true);
     }
     let digest = sha1::Sha1::digest(&out);
     out.extend_from_slice(&digest);
@@ -720,9 +800,16 @@ mod tests {
             offsets.push(out.len() as u32);
             let target = Target {
                 mode: 0o100_644,
-                oid: oid(i as u8 + 1),
+                oid: oid((i % 250) as u8 + 1),
             };
-            let at = emit(&mut out, version, prev, path.as_bytes(), &target);
+            let at = emit(
+                &mut out,
+                version,
+                prev,
+                path.as_bytes(),
+                &target,
+                i % BLOCK == 0,
+            );
             // A plausible stat block, so a copied entry is visibly copied.
             Stat {
                 ctime: (100 + i as u32, 0),
@@ -796,6 +883,59 @@ mod tests {
         out
     }
 
+    /// The paths an index holds, read the way `load_cache_entries_thread`
+    /// reads them: every `IEOT` block starts with no previous name, so the
+    /// first entry of a block must spell its whole path. A block table that
+    /// does not match the entries desynchronises git's reader, which then
+    /// dies with `malformed name field` or `unknown index entry format`.
+    fn paths_of_threaded(bytes: &[u8]) -> Vec<String> {
+        let layout = untracked::parse(bytes).expect("parses");
+        let ext = layout
+            .exts
+            .iter()
+            .find(|e| &e.sig == b"IEOT")
+            .expect("IEOT is present");
+        let data = &bytes[ext.at..ext.at + ext.size];
+        assert_eq!(u32::from_be_bytes(data[..4].try_into().unwrap()), 1);
+        let end = bytes.len() - layout.hash_len;
+        let mut out = Vec::new();
+        let mut walk = 4;
+        while walk < data.len() {
+            let mut at = u32::from_be_bytes(data[walk..walk + 4].try_into().unwrap()) as usize;
+            let nr = u32::from_be_bytes(data[walk + 4..walk + 8].try_into().unwrap()) as usize;
+            walk += 8;
+            // The block starts with an empty previous name, as git does.
+            let mut prev: Vec<u8> = Vec::new();
+            for _ in 0..nr {
+                let start = at;
+                let (_, flags, name_at) = read_head(bytes, start, 20, layout.version, end).unwrap();
+                at = name_at;
+                let mut path = Vec::new();
+                if layout.version == 4 {
+                    let (strip, n) = untracked::decode_varint(&bytes[at..end]).unwrap();
+                    at += n;
+                    // git's threaded reader has no previous name at a block
+                    // start, so it copies nothing however big the strip is.
+                    let copy = prev.len().saturating_sub(strip);
+                    path.extend_from_slice(&prev[..copy]);
+                    let nul = bytes[at..end].iter().position(|b| *b == 0).unwrap();
+                    path.extend_from_slice(&bytes[at..at + nul]);
+                    at += nul + 1;
+                } else {
+                    let nul = bytes[at..end].iter().position(|b| *b == 0).unwrap();
+                    path.extend_from_slice(&bytes[at..at + nul]);
+                    at += nul + 1;
+                    at = start + (at - start).div_ceil(8) * 8;
+                }
+                // git reads the whole length from the flags, so it must agree.
+                assert_eq!((flags & 0x0fff) as usize, path.len());
+                prev.clone_from(&path);
+                out.push(String::from_utf8(path).unwrap());
+            }
+        }
+        out
+    }
+
     fn change(path: &str, to: Option<u8>) -> Change {
         Change {
             path: path.as_bytes().to_vec(),
@@ -821,7 +961,12 @@ mod tests {
     #[test]
     fn a_modified_path_keeps_every_other_entry_byte_for_byte() {
         for version in [2u32, 3, 4] {
-            let before = index(version, &["a.txt", "b/c.txt", "b/d.txt", "z.txt"], true, true);
+            let before = index(
+                version,
+                &["a.txt", "b/c.txt", "b/d.txt", "z.txt"],
+                true,
+                true,
+            );
             let changes = [change("b/c.txt", Some(0x77))];
             let mut spliced = plan(&before, &changes, Path::new("/new")).expect("splices");
             spliced.set_stat(
@@ -893,7 +1038,12 @@ mod tests {
     #[test]
     fn a_dropped_path_goes_and_the_next_entry_is_respelled() {
         for version in [2u32, 3, 4] {
-            let before = index(version, &["a.txt", "b/c.txt", "b/d.txt", "z.txt"], true, true);
+            let before = index(
+                version,
+                &["a.txt", "b/c.txt", "b/d.txt", "z.txt"],
+                true,
+                true,
+            );
             let changes = [change("b/c.txt", None)];
             let spliced = plan(&before, &changes, Path::new("/new")).expect("splices");
             let after = spliced.finish();
@@ -926,6 +1076,47 @@ mod tests {
                 paths_of(&after),
                 vec!["0.txt", "m.txt", "z.txt"],
                 "version {version}"
+            );
+        }
+    }
+
+    /// An index big enough for more than one `IEOT` block. git's threaded
+    /// reader starts every block with no previous name, so a version 4 index
+    /// whose block boundaries carry a prefix reads as nonsense on a 100k tree
+    /// and reads correctly on a small one. The 100k fixture caught that; this
+    /// test catches it in a second.
+    #[test]
+    fn every_block_of_a_version_4_index_reads_on_its_own() {
+        let names: Vec<String> = (0..BLOCK * 3 + 7)
+            .map(|i| format!("d{:03}/f{i:06}.txt", i % 97))
+            .collect();
+        let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        for version in [2u32, 4] {
+            let before = index(version, &sorted, true, true);
+            // A modify, a drop, and an insert, spread over the blocks.
+            let changes = [
+                change(sorted[BLOCK], Some(0x31)),
+                change(sorted[BLOCK * 2 - 1], None),
+                change("aaa-first.txt", Some(0x32)),
+                change("zzz-last.txt", Some(0x33)),
+            ];
+            let mut spliced = plan(&before, &changes, Path::new("/new")).expect("splices");
+            for i in 0..changes.len() {
+                spliced.set_stat(i, &Stat::default());
+            }
+            let after = spliced.finish();
+            check(&after);
+            let mut want: Vec<String> = sorted.iter().map(|s| (*s).to_string()).collect();
+            want.retain(|p| p != sorted[BLOCK * 2 - 1]);
+            want.push("aaa-first.txt".into());
+            want.push("zzz-last.txt".into());
+            want.sort();
+            assert_eq!(paths_of(&after), want, "version {version}: one reader");
+            assert_eq!(
+                paths_of_threaded(&after),
+                want,
+                "version {version}: the threaded reader"
             );
         }
     }
@@ -992,7 +1183,10 @@ mod tests {
             let size = u32::from_be_bytes(after[walk + 4..walk + 8].try_into().unwrap()) as usize;
             walk += 8 + size;
         }
-        assert_eq!(&after[eoie.at + 4..eoie.at + 24], hasher.finalize().as_slice());
+        assert_eq!(
+            &after[eoie.at + 4..eoie.at + 24],
+            hasher.finalize().as_slice()
+        );
     }
 
     #[test]

@@ -797,7 +797,10 @@ fn fill(
             let entries = meta.ignored_entries.as_ref()?;
             Some((
                 entries,
-                touched.iter().map(|change| change.path.as_slice()).collect(),
+                touched
+                    .iter()
+                    .map(|change| change.path.as_slice())
+                    .collect(),
             ))
         },
     );
@@ -1064,7 +1067,9 @@ fn checkout_branch(
     if let (Some(mut bytes), Some(real)) = (held, real) {
         let outcome = crate::untracked::relocate(&mut bytes, real);
         if outcome != crate::untracked::Relocated::Patched {
-            debug(&format!("the untracked cache was not relocated: {outcome:?}"));
+            debug(&format!(
+                "the untracked cache was not relocated: {outcome:?}"
+            ));
         }
         spare::write_index(&bytes, admin_dir)?;
         fs::File::open(admin_dir.join("index"))
