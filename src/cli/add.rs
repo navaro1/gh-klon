@@ -715,7 +715,9 @@ fn fill(
     // once. When the splice then refuses, `checkout_branch` writes the same
     // bytes relocated, as step 6 would have.
     let index = admin_dir.join("index");
-    let hold = spare_meta.as_ref().is_some_and(splice_ready);
+    let hold = spare_meta
+        .as_ref()
+        .is_some_and(|meta| splice_ready(golden, meta));
     let taken = match used_spare {
         true => spare::take_index(path, &admin_dir, hold)?,
         false => spare::Taken::Missing,
@@ -1029,9 +1031,20 @@ const NO_SPLICE: &str = "KLON_NO_SPLICE";
 ///   splice writes only tracked paths, so this guards the recorded lists
 ///   beside it, not the splice itself; it costs nothing and it keeps the two
 ///   shortcuts under one rule.
-fn splice_ready(meta: &spare::Meta) -> bool {
+///
+/// One more thing must be true, and it is about the repository, not the spare:
+/// `git checkout` runs the `post-checkout` hook and the splice runs no hook at
+/// all, so a repository that has one keeps the real checkout.
+fn splice_ready(golden: &Path, meta: &spare::Meta) -> bool {
     let off = std::env::var(NO_SPLICE).is_ok_and(|value| !value.is_empty() && value != "0");
-    !off && meta.index_matches_head == Some(true) && meta.tracked_clean == Some(true)
+    if off || meta.index_matches_head != Some(true) || meta.tracked_clean != Some(true) {
+        return false;
+    }
+    if hooks::exists(golden, "post-checkout") {
+        debug("the index splice stands aside: the repository has a post-checkout hook");
+        return false;
+    }
+    true
 }
 
 /// Step 8: put the tracked files, the index, and `HEAD` of `branch` in the

@@ -1476,3 +1476,135 @@ fn a_split_index_falls_back_to_git_checkout() {
     );
     assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
 }
+
+/// G4, review finding 1: a branch that replaces a tracked directory with a
+/// symbolic link to somewhere outside the klon must not make the splice delete
+/// through that link. The removals run before the writes for exactly this
+/// case: afterwards the path `keep/outside.txt` would resolve into the target
+/// of the new link.
+#[test]
+fn a_branch_that_replaces_a_tracked_directory_with_a_symlink_deletes_nothing_outside() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    // A directory outside the klon, with a file the branch must not touch.
+    let outside = fx.golden.parent().unwrap().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "not the klon's to delete\n").unwrap();
+
+    // On main: a tracked directory `keep` with one tracked file in it.
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    fs::create_dir_all(fx.golden.join("keep")).unwrap();
+    fs::write(fx.golden.join("keep").join("keep.txt"), "tracked\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a tracked directory"]);
+    // On feature: the same name is a symbolic link to the outside directory.
+    git_ok(&fx.golden, &["checkout", "-q", "feature"]);
+    git_ok(&fx.golden, &["merge", "-q", "main", "-m", "take main"]);
+    fs::remove_dir_all(fx.golden.join("keep")).unwrap();
+    std::os::unix::fs::symlink(&outside, fx.golden.join("keep")).unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a symlink instead"]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+
+    build_spare(&fx.golden);
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon = fx.default_klon_path();
+    assert!(
+        outside.join("keep.txt").is_file(),
+        "the file outside the klon must survive: {}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read_link(klon.join("keep")).unwrap(),
+        outside,
+        "the klon holds the link the branch names"
+    );
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert_eq!(
+        git_ok(&klon, &["fsck", "--no-dangling", "--no-progress"]),
+        ""
+    );
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4, review finding 1 again, the other way round: a branch that turns a
+/// tracked file into a directory, and a directory into a file. Both need the
+/// removals to run before the writes, or git meets `ENOTDIR` and `EISDIR`.
+#[test]
+fn a_branch_that_swaps_a_file_and_a_directory_is_checked_out_whole() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+    fs::write(fx.golden.join("swap"), "a file on main\n").unwrap();
+    fs::create_dir_all(fx.golden.join("other")).unwrap();
+    fs::write(fx.golden.join("other").join("inner.txt"), "inner\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "a file and a directory"]);
+
+    git_ok(&fx.golden, &["checkout", "-q", "feature"]);
+    git_ok(&fx.golden, &["merge", "-q", "main", "-m", "take main"]);
+    fs::remove_file(fx.golden.join("swap")).unwrap();
+    fs::create_dir_all(fx.golden.join("swap")).unwrap();
+    fs::write(
+        fx.golden.join("swap").join("inner.txt"),
+        "now a directory\n",
+    )
+    .unwrap();
+    fs::remove_dir_all(fx.golden.join("other")).unwrap();
+    fs::write(fx.golden.join("other"), "now a file\n").unwrap();
+    git_ok(&fx.golden, &["add", "-A"]);
+    git_ok(&fx.golden, &["commit", "-qm", "swap them"]);
+    git_ok(&fx.golden, &["checkout", "-q", "main"]);
+
+    build_spare(&fx.golden);
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let klon = fx.default_klon_path();
+    assert_eq!(
+        fs::read_to_string(klon.join("swap").join("inner.txt")).unwrap(),
+        "now a directory\n"
+    );
+    assert_eq!(
+        fs::read_to_string(klon.join("other")).unwrap(),
+        "now a file\n"
+    );
+    assert_spare_klon(&fx, &klon, "feature");
+    assert_eq!(git_ok(&klon, &["status", "--porcelain"]), "");
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}
+
+/// G4, review finding 2: `git checkout` runs the `post-checkout` hook and the
+/// splice runs no hook, so a repository that has one keeps the real checkout
+/// and the hook still runs.
+#[test]
+fn a_post_checkout_hook_keeps_the_real_checkout_and_still_runs() {
+    let fx = Fixture::generate(SEED, 30, 3, 4, 2);
+    let hooks = fx.golden.join(".git").join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("post-checkout");
+    // The marker lands outside the klon: `git clean` removes an untracked file
+    // that a hook made inside it, which is what `add` has always done and is
+    // not what this test is about.
+    let marker = fx.golden.parent().unwrap().join("post-checkout-ran");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch {}\n", marker.to_str().unwrap()),
+    )
+    .unwrap();
+    let mut mode = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o755);
+    fs::set_permissions(&hook, mode).unwrap();
+    build_spare(&fx.golden);
+    assert!(!marker.exists(), "the builder runs no checkout");
+
+    let out = klon_loud(&fx.golden, &["add", "feature"]);
+    assert!(out.status.success(), "add failed: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("the repository has a post-checkout hook"),
+        "the splice must name why it stood aside: {log}"
+    );
+    assert!(marker.is_file(), "the hook must still run: {log}");
+    let klon = fx.default_klon_path();
+    assert_spare_klon(&fx, &klon, "feature");
+    assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+}

@@ -597,7 +597,21 @@ pub fn checkout(
     };
     step.mark("plan");
 
-    // Job 1a: the paths the branch holds, written by git itself.
+    // Job 1a: the paths the branch drops, and every parent they leave empty.
+    //
+    // The removals go first, and the order is load bearing. The working tree
+    // is still the one the spare's index describes, so every path resolves
+    // through the real directories that index names. Afterwards it is not: a
+    // branch that replaces the tracked `dir/child` with a symbolic link `dir`
+    // to somewhere outside the klon would have `checkout-index` install that
+    // link first, and a removal of `dir/child` would then follow it and delete
+    // a file in golden or anywhere else. Removing first also settles every
+    // file-against-directory swap, because git creates what it needs after the
+    // old shape is gone.
+    for change in changes.iter().filter(|c| c.to.is_none()) {
+        remove(klon, &change.path)?;
+    }
+    // Job 1b: the paths the branch holds, written by git itself.
     let small = admin_dir.join(SMALL);
     let written: Vec<&Change> = changes.iter().filter(|c| c.to.is_some()).collect();
     if !written.is_empty() {
@@ -610,10 +624,6 @@ pub fn checkout(
         );
         let _ = std::fs::remove_file(&small);
         out?;
-    }
-    // Job 1b: the paths the branch drops, and every parent they leave empty.
-    for change in changes.iter().filter(|c| c.to.is_none()) {
-        remove(klon, &change.path)?;
     }
     step.mark("files");
 
