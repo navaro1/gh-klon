@@ -787,10 +787,10 @@ fn fill(
     // A spare from an older builder has neither list, and a direct clone has
     // no record at all; both take the git-asked paths below.
     //
-    // One `git diff-tree --raw` answers both shortcuts and the splice, which
-    // is 43 ms on the 100k fixture and was worth running twice for nothing
-    // (G4). The record names the modes and object ids too, so the splice
-    // needs no second call to say what it writes.
+    // One `git diff-tree --raw` answers both shortcuts and the splice (G4).
+    // The call costs 29 to 43 ms on the 100k fixture, which is not a price to
+    // pay twice, and its record names the modes and the object ids too, so the
+    // splice needs no second call to say what it writes.
     let touched = spare_meta.as_ref().and_then(|meta| {
         crate::splice::diff(path, &meta.head, &format!("refs/heads/{branch}")).ok()
     });
