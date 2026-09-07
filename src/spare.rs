@@ -143,6 +143,14 @@ pub struct Meta {
     /// record from an older builder.
     #[serde(default)]
     pub shared_ignore_hash: Option<String>,
+    /// True when the status inside the spare named no tracked path: the files
+    /// of the spare match the index it carries (G4). The index splice keeps
+    /// the entry bytes of every path the branch leaves alone, so those files
+    /// must already match those entries. A `git checkout --force` needs no
+    /// such promise, because it rewrites every path that differs. None in a
+    /// record from an older builder; `add` then runs the checkout.
+    #[serde(default)]
+    pub tracked_clean: Option<bool>,
 }
 
 /// What the builder did.
@@ -482,7 +490,7 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
     let choice = backend::select(golden, &common, Some(&layout.tmp), None)?;
     fs::create_dir(&layout.tmp).map_err(Error::io(format!("create {}", layout.tmp.display())))?;
     let filled = fill_tmp(golden, &common, layout, choice.backend.as_ref(), &exclude).and_then(
-        |untracked| {
+        |warmed| {
             let (after, entries) = ignored_listing(golden, &exclude)?;
             let meta = Meta {
                 version: VERSION,
@@ -493,10 +501,11 @@ fn build_locked(golden: &Path, layout: &Layout) -> Result<()> {
                 exclusions_hash: exclusions_hash(golden),
                 backend: choice.backend.name().to_string(),
                 created: time::now_rfc3339(),
-                untracked,
+                untracked: warmed.untracked,
                 ignored_entries: Some(entries),
                 index_matches_head,
                 shared_ignore_hash,
+                tracked_clean: warmed.tracked_clean,
             };
             let text = serde_json::to_string_pretty(&meta)
                 .map_err(|err| Error::klon(format!("serialize spare.json: {err}")))?;
@@ -527,7 +536,7 @@ fn fill_tmp(
     layout: &Layout,
     backend: &dyn backend::Backend,
     exclude: &Exclusions,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Warmed> {
     backend.clone(golden, &layout.tmp, exclude)?;
     // The index goes in after the clone, so it describes every file that the
     // clone holds, and it gets a fresh mtime, so no entry is racy for git.
@@ -547,11 +556,11 @@ fn fill_tmp(
             .ok_or_else(|| Error::klon("invalid shared index path"))?;
         fs::copy(shared, klon_dir.join(name)).map_err(Error::io("copy the shared index"))?;
     }
-    let untracked = warm_untracked_cache(golden, common, &layout.tmp, &index);
+    let warmed = warm_untracked_cache(golden, common, &layout.tmp, &index);
     File::open(&index)
         .and_then(|f| f.set_modified(SystemTime::now()))
         .map_err(Error::io("touch the index"))?;
-    Ok(untracked)
+    Ok(warmed)
 }
 
 /// Build the untracked cache of the spare's index now, in the background,
@@ -572,12 +581,7 @@ fn fill_tmp(
 /// The list is None, and `add` walks, when a name is not UTF-8 (the record
 /// is JSON) or when a `.gitignore` in golden was dirty: the list then follows
 /// rules that no commit holds, and `add` compares rules between commits.
-fn warm_untracked_cache(
-    golden: &Path,
-    common: &Path,
-    tmp: &Path,
-    index: &Path,
-) -> Option<Vec<String>> {
+fn warm_untracked_cache(golden: &Path, common: &Path, tmp: &Path, index: &Path) -> Warmed {
     let prepared = crate::cli::add::ensure_config(golden)
         .and_then(|()| crate::cli::add::exclude_klon_dir(common));
     let warmed = prepared.and_then(|()| {
@@ -596,18 +600,37 @@ fn warm_untracked_cache(
         Ok(status) => status,
         Err(err) => {
             eprintln!("klon: the spare has no untracked cache: {err}");
-            return None;
+            return Warmed::default();
         }
     };
     let scan = crate::untracked::scan_porcelain(&status);
+    let tracked_clean = Some(!scan.tracked_dirty);
     if scan.rules_dirty {
         debug("a .gitignore is dirty in golden; the untracked list is not recorded");
-        return None;
+        return Warmed {
+            untracked: None,
+            tracked_clean,
+        };
     }
-    scan.untracked
-        .into_iter()
-        .map(|path| String::from_utf8(path).ok())
-        .collect()
+    Warmed {
+        untracked: scan
+            .untracked
+            .into_iter()
+            .map(|path| String::from_utf8(path).ok())
+            .collect(),
+        tracked_clean,
+    }
+}
+
+/// What the status inside the spare told the builder.
+#[derive(Default)]
+struct Warmed {
+    /// The untracked path list of the spare, when every name is UTF-8 and no
+    /// `.gitignore` is dirty.
+    untracked: Option<Vec<String>>,
+    /// Whether that status named no tracked path at all. None when the status
+    /// did not run.
+    tracked_clean: Option<bool>,
 }
 
 /// The top-level ignored entries of golden that the clone includes, as `git
@@ -757,50 +780,72 @@ pub fn claim(golden: &Path, path: &Path, admin_dir: &Path, wanted: Option<&str>)
     Ok(Claim::Used(meta))
 }
 
+/// What `take_index` did with the spare's index.
+pub enum Taken {
+    /// The spare brought no index, so the caller copies golden's instead.
+    Missing,
+    /// The index sits in the admin entry, with its untracked cache relocated.
+    Written,
+    /// The bytes of the index, neither relocated nor written. The caller
+    /// splices them and writes the answer once, so the 10 MB file is read once
+    /// and written once instead of twice (G4).
+    Held(Vec<u8>),
+}
+
 /// Move the spare's index files into the admin entry: `.klon/index` and any
-/// `.klon/sharedindex.*` of a split index. The answer is false when the spare
-/// brought no index, so the caller copies golden's instead.
+/// `.klon/sharedindex.*` of a split index.
 ///
 /// The untracked cache inside the index names the place the builder ran in,
 /// so it is pointed at `path` on the way (G1, `untracked::relocate`). An index
 /// that the patch cannot read moves as it is: the first `git status` then
 /// rebuilds the cache, which is slower and never wrong.
-pub fn take_index(path: &Path, admin_dir: &Path) -> Result<bool> {
+///
+/// `hold` asks for the bytes instead of the write, for a caller that is about
+/// to splice them (G4). Such a caller relocates the cache itself, or writes
+/// the bytes as they are when the splice refuses.
+pub fn take_index(path: &Path, admin_dir: &Path, hold: bool) -> Result<Taken> {
     let klon_dir = path.join(crate::envelope::env::DIR);
     let index = klon_dir.join("index");
     if !index.is_file() {
-        return Ok(false);
+        return Ok(Taken::Missing);
     }
     let target = admin_dir.join("index");
-    let relocated = fs::read(&index)
-        .map_err(Error::io(format!("read {}", index.display())))
-        .and_then(|mut bytes| {
-            // git compares the real path of the worktree.
-            let real = path
-                .canonicalize()
-                .map_err(Error::io(format!("resolve {}", path.display())))?;
-            Ok((crate::untracked::relocate(&mut bytes, &real), bytes))
-        });
-    match relocated {
-        Ok((crate::untracked::Relocated::Patched, bytes)) => {
-            // Through a sibling temporary file and one rename, so the admin
-            // entry never holds a half-written index.
-            let temp = admin_dir.join("index.klon-tmp");
-            fs::write(&temp, bytes).map_err(Error::io(format!("write {}", temp.display())))?;
-            fs::rename(&temp, &target).map_err(Error::io(format!("move {}", temp.display())))?;
+    let taken = match hold {
+        true => {
+            let bytes = fs::read(&index).map_err(Error::io(format!("read {}", index.display())))?;
             fs::remove_file(&index).map_err(Error::io(format!("remove {}", index.display())))?;
+            Taken::Held(bytes)
         }
-        Ok((outcome, _)) => {
-            debug(&format!(
-                "the untracked cache was not relocated: {outcome:?}"
-            ));
-            move_file(&index, &target)?;
+        false => {
+            let relocated = fs::read(&index)
+                .map_err(Error::io(format!("read {}", index.display())))
+                .and_then(|mut bytes| {
+                    // git compares the real path of the worktree.
+                    let real = path
+                        .canonicalize()
+                        .map_err(Error::io(format!("resolve {}", path.display())))?;
+                    Ok((crate::untracked::relocate(&mut bytes, &real), bytes))
+                });
+            match relocated {
+                Ok((crate::untracked::Relocated::Patched, bytes)) => {
+                    write_index(&bytes, admin_dir)?;
+                    fs::remove_file(&index)
+                        .map_err(Error::io(format!("remove {}", index.display())))?;
+                }
+                Ok((outcome, _)) => {
+                    debug(&format!(
+                        "the untracked cache was not relocated: {outcome:?}"
+                    ));
+                    move_file(&index, &target)?;
+                }
+                Err(err) => {
+                    debug(&format!("the untracked cache was not relocated: {err}"));
+                    move_file(&index, &target)?;
+                }
+            }
+            Taken::Written
         }
-        Err(err) => {
-            debug(&format!("the untracked cache was not relocated: {err}"));
-            move_file(&index, &target)?;
-        }
-    }
+    };
     let entries =
         fs::read_dir(&klon_dir).map_err(Error::io(format!("read {}", klon_dir.display())))?;
     for entry in entries {
@@ -810,7 +855,16 @@ pub fn take_index(path: &Path, admin_dir: &Path) -> Result<bool> {
             move_file(&entry.path(), &admin_dir.join(&name))?;
         }
     }
-    Ok(true)
+    Ok(taken)
+}
+
+/// Put `bytes` at `<admin_dir>/index` through a sibling temporary file and one
+/// rename, so the admin entry never holds a half-written index.
+pub fn write_index(bytes: &[u8], admin_dir: &Path) -> Result<()> {
+    let temp = admin_dir.join("index.klon-tmp");
+    fs::write(&temp, bytes).map_err(Error::io(format!("write {}", temp.display())))?;
+    fs::rename(&temp, admin_dir.join("index"))
+        .map_err(Error::io(format!("move {}", temp.display())))
 }
 
 /// Delete `<klon>/.klon`, which holds only what the builder and the claim left
@@ -1042,6 +1096,7 @@ mod tests {
             ignored_entries: Some(vec!["build/".to_string(), "CMakeCache.txt".to_string()]),
             index_matches_head: Some(true),
             shared_ignore_hash: Some("0".repeat(64)),
+            tracked_clean: Some(true),
         };
         let text = serde_json::to_string(&meta).unwrap();
         let read: Meta = serde_json::from_str(&text).unwrap();

@@ -41,26 +41,10 @@ pub fn relocate(bytes: &mut Vec<u8>, worktree: &Path) -> Relocated {
     let Some((untr_at, untr_len)) = layout.untr else {
         return Relocated::NoCache;
     };
-    // The identity: a varint length, then the string.
     let data = &bytes[untr_at..untr_at + untr_len];
-    let Some((ident_len, varint_len)) = decode_varint(data) else {
+    let Some((head, old_head_len)) = retarget_head(data, worktree) else {
         return Relocated::Unreadable;
     };
-    if varint_len + ident_len > data.len() {
-        return Relocated::Unreadable;
-    }
-    let old_ident = &data[varint_len..varint_len + ident_len];
-    // Keep git's own system suffix; only the location changes.
-    let Some(comma) = find(old_ident, b", system ") else {
-        return Relocated::Unreadable;
-    };
-    let mut ident = Vec::with_capacity(ident_len + 64);
-    ident.extend_from_slice(b"Location ");
-    ident.extend_from_slice(worktree.as_os_str().as_encoded_bytes());
-    ident.extend_from_slice(&old_ident[comma..]);
-    let mut head = encode_varint(ident.len());
-    head.extend_from_slice(&ident);
-    let old_head_len = varint_len + ident_len;
     let delta = head.len() as i64 - old_head_len as i64;
 
     // Splice the new identity in and fix the extension size.
@@ -99,21 +83,70 @@ pub fn relocate(bytes: &mut Vec<u8>, worktree: &Path) -> Relocated {
     Relocated::Patched
 }
 
+/// The new head of an `UNTR` body that names `worktree`, and the length of
+/// the head it replaces. The head is the varint length of the identity string
+/// and the string itself; the cache follows it and stays as it is.
+///
+/// None when the body is not one this code reads, so a caller leaves the bytes
+/// alone rather than guessing.
+fn retarget_head(data: &[u8], worktree: &Path) -> Option<(Vec<u8>, usize)> {
+    // The identity: a varint length, then the string.
+    let (ident_len, varint_len) = decode_varint(data)?;
+    if varint_len + ident_len > data.len() {
+        return None;
+    }
+    let old_ident = &data[varint_len..varint_len + ident_len];
+    // Keep git's own system suffix; only the location changes.
+    let comma = find(old_ident, b", system ")?;
+    let mut ident = Vec::with_capacity(ident_len + 64);
+    ident.extend_from_slice(b"Location ");
+    ident.extend_from_slice(worktree.as_os_str().as_encoded_bytes());
+    ident.extend_from_slice(&old_ident[comma..]);
+    let mut head = encode_varint(ident.len());
+    head.extend_from_slice(&ident);
+    Some((head, varint_len + ident_len))
+}
+
+/// A whole `UNTR` body that names `worktree`, for a caller that rebuilds the
+/// extension region instead of patching it in place (G4). None when the body
+/// is not one this code reads.
+pub(crate) fn retarget(data: &[u8], worktree: &Path) -> Option<Vec<u8>> {
+    let (head, old_head_len) = retarget_head(data, worktree)?;
+    let mut out = head;
+    out.extend_from_slice(&data[old_head_len..]);
+    Some(out)
+}
+
+/// One extension header: its four-byte signature, the start of its data, and
+/// the size the header declares.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ext {
+    pub(crate) sig: [u8; 4],
+    pub(crate) at: usize,
+    pub(crate) size: usize,
+}
+
 /// Where the parts of an index sit.
-struct Layout {
+pub(crate) struct Layout {
+    /// 2, 3, or 4.
+    pub(crate) version: u32,
+    /// The number of entries the header declares.
+    pub(crate) count: usize,
     /// The first byte after the last entry.
-    extensions_at: usize,
+    pub(crate) extensions_at: usize,
+    /// Every extension header, in the order the file holds them.
+    pub(crate) exts: Vec<Ext>,
     /// The `UNTR` data: its start and length.
     untr: Option<(usize, usize)>,
     /// The start of the `EOIE` data, when the extension is present.
     eoie: Option<usize>,
     /// 20 for SHA-1, 32 for SHA-256.
-    hash_len: usize,
+    pub(crate) hash_len: usize,
 }
 
 /// Walk the entries and the extension headers. SHA-1 is tried first; a
 /// SHA-256 index leaves the SHA-1 walk off the end and is tried second.
-fn parse(bytes: &[u8]) -> Option<Layout> {
+pub(crate) fn parse(bytes: &[u8]) -> Option<Layout> {
     parse_with(bytes, 20).or_else(|| parse_with(bytes, 32))
 }
 
@@ -160,27 +193,37 @@ fn parse_with(bytes: &[u8], hash_len: usize) -> Option<Layout> {
     let extensions_at = at;
     let mut untr = None;
     let mut eoie = None;
+    let mut exts = Vec::new();
     while at + 8 <= end {
         let sig = &bytes[at..at + 4];
         if !sig.iter().all(|b| b.is_ascii_uppercase()) {
             return None;
         }
+        let sig: [u8; 4] = sig.try_into().ok()?;
         let size = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
         if at + 8 + size > end {
             return None;
         }
-        match sig {
+        match &sig {
             b"UNTR" => untr = Some((at + 8, size)),
             b"EOIE" => eoie = Some(at + 8),
             _ => {}
         }
+        exts.push(Ext {
+            sig,
+            at: at + 8,
+            size,
+        });
         at += 8 + size;
     }
     if at != end {
         return None;
     }
     Some(Layout {
+        version,
+        count,
         extensions_at,
+        exts,
         untr,
         eoie,
         hash_len,
@@ -190,7 +233,7 @@ fn parse_with(bytes: &[u8], hash_len: usize) -> Option<Layout> {
 /// git's varint (`varint.c`): seven bits per byte, high bit set on every byte
 /// but the last, and each continuation adds one. The answer is the value and
 /// the number of bytes read.
-fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut at = 0;
     let mut c = *bytes.get(at)?;
     at += 1;
@@ -207,7 +250,7 @@ fn decode_varint(bytes: &[u8]) -> Option<(usize, usize)> {
     Some((value, at))
 }
 
-fn encode_varint(mut value: usize) -> Vec<u8> {
+pub(crate) fn encode_varint(mut value: usize) -> Vec<u8> {
     let mut out = vec![(value & 127) as u8];
     value >>= 7;
     while value != 0 {
@@ -235,6 +278,11 @@ pub struct Scan {
     /// ignore rules of that tree differ from its commit, so a list of its
     /// untracked paths says nothing about another commit's rules.
     pub rules_dirty: bool,
+    /// True when the document names a tracked path at all: modified, staged,
+    /// deleted, or unmerged. The index splice keeps the entry bytes of every
+    /// path the branch leaves alone, so it needs the working tree of those
+    /// paths to match those entries already (G4).
+    pub tracked_dirty: bool,
 }
 
 /// Read a `-z` porcelain document. A rename or copy entry carries a second
@@ -252,7 +300,14 @@ pub fn scan_porcelain(status: &[u8]) -> Scan {
         }
         if code == b"?? " {
             scan.untracked.push(path.to_vec());
-        } else if path.ends_with(b"/.gitignore") || path == b".gitignore" {
+            continue;
+        }
+        // `!! ` is an ignored path, which `--untracked-files=normal` without
+        // `--ignored` never prints; every other code names a tracked path.
+        if code != b"!! " {
+            scan.tracked_dirty = true;
+        }
+        if path.ends_with(b"/.gitignore") || path == b".gitignore" {
             scan.rules_dirty = true;
         }
     }
@@ -347,7 +402,12 @@ mod tests {
         let scan = scan_porcelain(status);
         assert_eq!(scan.untracked, vec![b"new.txt".to_vec(), b"dir/".to_vec()]);
         assert!(!scan.rules_dirty);
+        assert!(scan.tracked_dirty, "the document names three tracked paths");
         assert_eq!(scan_porcelain(b""), Scan::default());
+        // Untracked paths alone leave the tracked paths clean.
+        assert!(!scan_porcelain(b"?? a\0?? b/\0").tracked_dirty);
+        assert!(scan_porcelain(b" M a\0").tracked_dirty);
+        assert!(scan_porcelain(b"UU a\0").tracked_dirty);
         // A non-UTF-8 name survives as bytes.
         assert_eq!(
             scan_porcelain(b"?? a\xffb\0").untracked,
