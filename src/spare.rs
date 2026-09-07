@@ -860,10 +860,28 @@ pub fn take_index(path: &Path, admin_dir: &Path, hold: bool) -> Result<Taken> {
 /// Put `bytes` at `<admin_dir>/index` through a sibling temporary file and one
 /// rename, so the admin entry never holds a half-written index.
 pub fn write_index(bytes: &[u8], admin_dir: &Path) -> Result<()> {
-    let temp = admin_dir.join("index.klon-tmp");
-    fs::write(&temp, bytes).map_err(Error::io(format!("write {}", temp.display())))?;
-    fs::rename(&temp, admin_dir.join("index"))
-        .map_err(Error::io(format!("move {}", temp.display())))
+    // git's own protocol: create `index.lock` and no other name, write the new
+    // index into it, then rename it over `index`. klon owns the worktree while
+    // it writes — the entry is locked and no builder has started — so the
+    // exclusive create never has to wait. Taking the lock anyway is free, and
+    // it means a git that did run beside this one fails loudly on the lock
+    // instead of losing its own write to a rename it cannot see.
+    let lock = admin_dir.join("index.lock");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+        .map_err(Error::io(format!("create {}", lock.display())))?;
+    let written = std::io::Write::write_all(&mut file, bytes);
+    drop(file);
+    if let Err(err) = written {
+        let _ = fs::remove_file(&lock);
+        return Err(Error::io(format!("write {}", lock.display()))(err));
+    }
+    fs::rename(&lock, admin_dir.join("index")).map_err(|err| {
+        let _ = fs::remove_file(&lock);
+        Error::io(format!("move {}", lock.display()))(err)
+    })
 }
 
 /// Delete `<klon>/.klon`, which holds only what the builder and the claim left

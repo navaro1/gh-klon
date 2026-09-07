@@ -1296,6 +1296,11 @@ fn the_index_splice_serves_add_and_git_agrees_with_the_klon() {
             log.contains("the index splice served feature"),
             "version {version}: the splice must serve this add: {log}"
         );
+        // The builder that `add` started warms the new klon with a forced
+        // `git status`, which takes the index lock; the `write-tree` and the
+        // `commit` below would fail on it. The record appears only after that
+        // warm and the clone that follows it, so waiting for it settles both.
+        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
         let klon = fx.default_klon_path();
 
         // The correctness gate of the goal, line by line.
@@ -1345,7 +1350,6 @@ fn the_index_splice_serves_add_and_git_agrees_with_the_klon() {
             "",
             "version {version}: fsck after a commit"
         );
-        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
     }
 }
 
@@ -1378,6 +1382,13 @@ fn the_spliced_index_says_what_git_checkout_writes() {
             "version {version}: KLON_NO_SPLICE must turn the splice off"
         );
 
+        // The builder that the second `add` started runs a forced `git status`
+        // in the new klon before it clones, and that status takes the index
+        // lock. A `write-tree` beside it fails on the lock, which is git
+        // behaving correctly and this test racing it, so the comparison waits
+        // for the spare: the record appears only after the warm and the clone.
+        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
+
         // One status in each, so both indexes are as settled as git makes them.
         git_ok(&spliced, &["status", "--porcelain"]);
         git_ok(&checked_out, &["status", "--porcelain"]);
@@ -1391,7 +1402,6 @@ fn the_spliced_index_says_what_git_checkout_writes() {
             assert_eq!(left, right, "version {version}: the two indexes differ");
         }
         assert_eq!(a.len(), b.len());
-        assert!(wait_for_spare(&fx.golden, Duration::from_secs(60)));
     }
 }
 

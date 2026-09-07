@@ -638,11 +638,9 @@ pub fn checkout(
     }
     let bytes = spliced.finish();
     step.mark("checksum");
-    let target = admin_dir.join("index");
-    let temp = admin_dir.join("index.klon-tmp");
-    std::fs::write(&temp, bytes).map_err(crate::Error::io(format!("write {}", temp.display())))?;
-    std::fs::rename(&temp, &target)
-        .map_err(crate::Error::io(format!("move {}", temp.display())))?;
+    // Through `index.lock`, which is git's own protocol, so a git that ran
+    // beside this one would fail on the lock instead of losing its write.
+    crate::spare::write_index(&bytes, admin_dir)?;
     step.mark("write");
 
     // Job 3: `HEAD`. The message is the one `git checkout` writes, so `git
